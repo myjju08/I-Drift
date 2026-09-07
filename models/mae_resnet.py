@@ -488,6 +488,8 @@ class MAEResNet(nn.Module):
         return_stage_features: bool = False,
         return_all_stage_features: bool = False,
         active_stages: Optional[List[str]] = None,
+        with_norm_x: bool = True,
+        exclude_terminal_block: bool = False,
     ) -> Dict[str, torch.Tensor] | Tuple[
         Dict[str, torch.Tensor], Dict[str, torch.Tensor]
     ]:
@@ -553,9 +555,10 @@ class MAEResNet(nn.Module):
             )
             block_outs = {}
 
-        # Match official behavior: norm_x is computed on patched input.
-        # Keep epsilon to avoid sqrt(0) -> inf gradient at exactly-zero activations.
-        out["norm_x"] = safe_rms(x_patched, dim=(2, 3)).unsqueeze(1)
+        if with_norm_x:
+            # Match official behavior: norm_x is computed on patched input.
+            # Keep epsilon to avoid sqrt(0) -> inf gradient at exactly-zero activations.
+            out["norm_x"] = safe_rms(x_patched, dim=(2, 3)).unsqueeze(1)
 
         if return_all_stage_features and not return_stage_features:
             raise ValueError(
@@ -601,8 +604,12 @@ class MAEResNet(nn.Module):
             k = int(every_k_block)
             for i in range(1, 5):
                 lname = f"layer{i}"
-                for blk_idx, feat_i in enumerate(block_outs.get(lname, []), start=1):
-                    if blk_idx % k == 0:
+                stage_block_outputs = block_outs.get(lname, [])
+                for blk_idx, feat_i in enumerate(stage_block_outputs, start=1):
+                    is_terminal = blk_idx == len(stage_block_outputs)
+                    if blk_idx % k == 0 and not (
+                        exclude_terminal_block and is_terminal
+                    ):
                         process_feat(f"{lname}_blk{blk_idx}", feat_i)
 
         if return_stage_features:
