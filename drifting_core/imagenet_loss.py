@@ -727,148 +727,331 @@ def _record_column_top_k_support(
             )
 
 
-def detached_reverse_drift_scale(
-    query: torch.Tensor,
-    target_banks: Tuple[torch.Tensor, ...],
+def _accumulate_differentiable_weighted_targets(
+    weights: torch.Tensor,
+    indices: Optional[torch.Tensor],
+    target0: torch.Tensor,
+    target1: Optional[torch.Tensor] = None,
     *,
-    global_scale_stats: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Compute one detached distance scale shared by comparable raw fields."""
-    if query.ndim != 3 or not target_banks:
-        raise ValueError("query and at least one target bank are required")
-    batch, _, feature_dim = query.shape
-    for bank in target_banks:
-        if bank.ndim != 3 or bank.shape[0] != batch or bank.shape[2] != feature_dim:
-            raise ValueError("every target bank must match query batch/features")
-        if bank.shape[1] <= 0:
-            raise ValueError("shared drift scale target banks must be non-empty")
-    query_f = query.detach().float()
-    targets = torch.cat([bank.detach().float() for bank in target_banks], dim=1)
-    distances = _cdist_batched(query_f, targets)
-    target_weights = query_f.new_ones(batch, targets.shape[1])
+    """Autograd-preserving variant used only by raw-field optimization.
+
+    The optimized CUDA indexed-reduction kernel intentionally has no autograd
+    wrapper because the generator loss detaches its force target.  Adapter
+    training needs gradients through both compact weights and selected target
+    features, so compact top-k uses a native PyTorch gather here.  Dense and
+    top-p execution keeps the exact baseline bmm implementation.
+    """
+    if indices is None:
+        return _accumulate_weighted_targets(
+            weights,
+            indices,
+            target0,
+            target1,
+            out=out,
+        )
+
+    targets = target0 if target1 is None else torch.cat([target0, target1], dim=1)
+    batch, n_gen, top_k = indices.shape
+    n_features = targets.shape[2]
+    selected = torch.gather(
+        targets.unsqueeze(1).expand(-1, n_gen, -1, -1),
+        dim=2,
+        index=indices.unsqueeze(-1).expand(
+            batch, n_gen, top_k, n_features
+        ),
+    )
+    result = (weights.unsqueeze(-1) * selected).sum(dim=2)
+    if out is not None:
+        result = result + out
+    return result
+
+
+def reverse_drift_distance_scale(
+    query: torch.Tensor,
+    supports: torch.Tensor,
+    *,
+    global_scale_stats: bool = True,
+) -> torch.Tensor:
+    """Return the detached mean query/support distance used by raw fields.
+
+    Version-2 adapter training shares one activation-wise scale across its
+    Pa/Pb/Qa/Qb support partitions.  Keeping this helper beside the baseline
+    implementation guarantees identical FP32 distance arithmetic and
+    distributed ratio-of-means semantics.
+    """
+    if query.ndim != 3 or supports.ndim != 3:
+        raise ValueError("raw drift query/support tensors must be [B,C,D]")
+    if query.shape[0] != supports.shape[0] or query.shape[2] != supports.shape[2]:
+        raise ValueError(
+            "raw drift query/support batch and feature dimensions must match"
+        )
+    if query.shape[1] <= 0 or supports.shape[1] <= 0:
+        raise ValueError("raw drift query/support sets must be non-empty")
+    query_fp32 = query.float()
+    supports_fp32 = supports.float()
+    distances = _cdist_batched(query_fp32, supports_fp32)
+    support_weights = distances.new_ones(
+        distances.shape[0], distances.shape[2]
+    )
     return _ratio_of_means(
         distances,
-        target_weights,
+        support_weights,
         use_global_stats=bool(global_scale_stats),
-    )
+    ).detach()
 
 
-def raw_reverse_drift_fields(
-    query: torch.Tensor,
-    fixed_pos: torch.Tensor,
-    fixed_neg: torch.Tensor,
-    *,
+def reverse_drift_raw_fields(
+    gen: torch.Tensor,                    # [B, C_g, S]
+    fixed_pos: torch.Tensor,              # [B, C_p, S]
+    fixed_neg: Optional[torch.Tensor] = None,  # [B, C_n, S]
+    weight_gen: Optional[torch.Tensor] = None,  # [B, C_g]
+    weight_pos: Optional[torch.Tensor] = None,  # [B, C_p]
+    weight_neg: Optional[torch.Tensor] = None,  # [B, C_n]
     R_list: Tuple[float, ...] = (0.02, 0.05, 0.2),
-    invalid_pos_mask: Optional[torch.Tensor] = None,
-    invalid_neg_mask: Optional[torch.Tensor] = None,
-    global_scale_stats: bool = False,
-    distance_scale: Optional[torch.Tensor] = None,
+    active_mask_pos: Optional[torch.Tensor] = None,  # [B, C_p] 1=active
+    active_mask_neg: Optional[torch.Tensor] = None,  # [B, C_n] 1=active
+    global_scale_stats: bool = True,
     top_p: float = 1.0,
     top_p_min_keep: int = 1,
     top_k_pos: int = 0,
     top_k_neg: int = 0,
     affinity_kernel: str = "exponential",
     kernel_shape: float = 1.0,
+    kernel_adaptive_k_pos: int = 0,
+    kernel_adaptive_k_neg: int = 0,
+    kernel_adaptive_margin: float = 1.05,
     kernel_mix_weight: float = 0.5,
     kernel_temperature_mix: Tuple[float, ...] = (),
     kernel_temperature_mix_weights: Tuple[float, ...] = (),
-) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
+    historical_gen: Optional[torch.Tensor] = None,  # [B, C_h, S]
+    weight_history: Optional[torch.Tensor] = None,  # [B, C_h]
+    include_query_targets: bool = True,
+    repulsion_coefficient: float = 1.0,
+    distance_scale: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, ...]:
     """Return differentiable reverse-drift fields before RMS normalization.
 
-    ``query``, ``fixed_pos``, and ``fixed_neg`` are all adapter-dependent here;
-    unlike :func:`drift_loss_imagenet`, no feature tensor is detached. The
-    distance scale retains the official detached calibration, while each force
-    is returned after division by ``scale / sqrt(feature_dim)`` and *before*
-    feature-wise force RMS normalization. Passing ``distance_scale`` lets all
-    cross and null fields share the same coordinate/bandwidth calibration.
+    Each returned tensor is the corresponding ``total_force_R`` from
+    :func:`drift_loss_imagenet` *after* division by the detached input scale
+    and *before* the per-temperature ``f_norm`` division.  Consequently,
+    ``field.square().mean()`` is numerically the same quantity recorded as
+    ``loss_{R}`` by the baseline reverse loss.
 
-    Optional masks have shape ``[B, C_query, C_bank]`` and exclude a query
-    from a bank containing the exact same generated sample.
+    Unlike the generator training loss, this function does not detach the
+    query or target features.  Gradients therefore flow through the complete
+    field estimator into ``gen``, ``fixed_pos``, and ``fixed_neg``; this is
+    required when learning a feature adapter from field energy.  Scale and
+    adaptive-bandwidth statistics remain detached, matching the baseline's
+    temperature calibration and preventing the adapter from changing the
+    objective merely by differentiating through its normalization statistic.
+
+    ``historical_gen`` is retained for parity with the reverse-loss target
+    layout.  It is deliberately detached, just as it is in
+    :func:`drift_loss_imagenet`.
+
+    ``include_query_targets=False`` is the support-only estimator used by the
+    counterfactual adapter objective.  It removes the query set from the
+    repulsive target bank, so the same detached queries can be evaluated
+    against two genuinely disjoint generated-support sets without a shared
+    query-query force making the two fields agree trivially.  The default is
+    unchanged and remains exactly equivalent to the generator's reverse
+    drift implementation.
+
+    ``repulsion_coefficient`` multiplies only the repulsive displacement term
+    after affinities have been constructed.  It is therefore the explicit
+    :math:`\rho` in ``attraction - rho * repulsion``.  This is deliberately
+    different from ``weight_neg``, which changes target mass (and hence both
+    affinity normalization and the detached input scale).  Its unit default
+    preserves every existing caller bit for bit.
+
+    ``distance_scale`` optionally supplies one already-detached common scale.
+    The default computes the original per-call scale and is bit-for-bit
+    unchanged; Version-2 adapter fields pass a shared Pa/Pb/Qa/Qb scale.
     """
-    if query.ndim != 3 or fixed_pos.ndim != 3 or fixed_neg.ndim != 3:
-        raise ValueError("raw drift inputs must all have shape [B, C, S]")
-    batch, query_count, feature_dim = query.shape
-    if fixed_pos.shape[0] != batch or fixed_pos.shape[2] != feature_dim:
-        raise ValueError("fixed_pos must match query batch and feature dimensions")
-    if fixed_neg.shape[0] != batch or fixed_neg.shape[2] != feature_dim:
-        raise ValueError("fixed_neg must match query batch and feature dimensions")
-    pos_count = fixed_pos.shape[1]
-    neg_count = fixed_neg.shape[1]
-    if query_count <= 0 or pos_count <= 0 or neg_count <= 0:
-        raise ValueError("raw drift requires non-empty query, positive, and negative banks")
-    if not R_list or any(
-        not math.isfinite(float(R)) or float(R) <= 0.0 for R in R_list
-    ):
-        raise ValueError(f"R_list must contain finite positive values, got {R_list!r}")
-
-    affinity_kernel, kernel_shape, _, _, _ = _validate_reverse_affinity_kernel(
-        affinity_kernel, kernel_shape, 0, 0, 1.0
+    B, C_g, S = gen.shape
+    C_p = fixed_pos.shape[1]
+    (
+        affinity_kernel,
+        kernel_shape,
+        kernel_adaptive_k_pos,
+        kernel_adaptive_k_neg,
+        kernel_adaptive_margin,
+    ) = _validate_reverse_affinity_kernel(
+        affinity_kernel,
+        kernel_shape,
+        kernel_adaptive_k_pos,
+        kernel_adaptive_k_neg,
+        kernel_adaptive_margin,
     )
     kernel_mix_weight = float(kernel_mix_weight)
     if not math.isfinite(kernel_mix_weight) or not 0.0 <= kernel_mix_weight <= 1.0:
-        raise ValueError("kernel_mix_weight must be finite and in [0, 1]")
+        raise ValueError(
+            "reverse kernel mix weight must be finite and in [0, 1], got "
+            f"{kernel_mix_weight!r}"
+        )
 
-    query_f = query.float()
-    pos_f = fixed_pos.float()
-    neg_f = fixed_neg.float()
-    distances = _cdist_batched(query_f, torch.cat([neg_f, pos_f], dim=1))
+    if fixed_neg is None:
+        fixed_neg = gen.new_zeros(B, 0, S)
+    C_n = fixed_neg.shape[1]
+    if historical_gen is None:
+        historical_gen = gen.new_zeros(B, 0, S)
+    if (
+        historical_gen.ndim != 3
+        or historical_gen.shape[0] != B
+        or historical_gen.shape[2] != S
+    ):
+        raise ValueError(
+            "historical_gen must have shape [B, C_h, S] matching gen; got "
+            f"{tuple(historical_gen.shape)} for gen {tuple(gen.shape)}"
+        )
+    C_h = historical_gen.shape[1]
+
+    if weight_gen is None:
+        weight_gen = gen.new_ones(B, C_g)
+    if weight_pos is None:
+        weight_pos = gen.new_ones(B, C_p)
+    if weight_neg is None:
+        weight_neg = gen.new_ones(B, C_n)
+    if weight_history is None:
+        weight_history = gen.new_ones(B, C_h)
+
+    if active_mask_pos is None:
+        active_mask_pos = gen.new_ones(B, C_p)
+    else:
+        active_mask_pos = active_mask_pos.to(gen.device).float()
+    if active_mask_neg is None:
+        active_mask_neg = gen.new_ones(B, C_n)
+    else:
+        active_mask_neg = active_mask_neg.to(gen.device).float()
+    include_query_targets = bool(include_query_targets)
+    repulsion_coefficient = float(repulsion_coefficient)
+    if (
+        not math.isfinite(repulsion_coefficient)
+        or repulsion_coefficient < 0.0
+    ):
+        raise ValueError(
+            "raw-field repulsion_coefficient must be finite and non-negative, "
+            f"got {repulsion_coefficient!r}"
+        )
+    active_mask_gen = gen.new_ones(B, C_g)
+    active_mask_history = gen.new_ones(B, C_h)
+    active_parts = [active_mask_neg, active_mask_history, active_mask_pos]
+    if include_query_targets:
+        active_parts.insert(0, active_mask_gen)
+    targets_active = torch.cat(active_parts, dim=1)
+
+    # Keep the baseline FP32 arithmetic, but intentionally retain autograd on
+    # all current query/positive/negative feature tensors.
+    query = gen.float()
+    fixed_pos = fixed_pos.float()
+    fixed_neg = fixed_neg.float()
+    historical_gen = historical_gen.detach().float()
+    weight_gen = weight_gen.float()
+    weight_pos = weight_pos.float()
+    weight_neg = weight_neg.float()
+    weight_history = weight_history.float()
+
+    target_weight_parts = [weight_neg, weight_history, weight_pos]
+    if include_query_targets:
+        target_weight_parts.insert(0, weight_gen)
+    targets_w = torch.cat(target_weight_parts, dim=1) * targets_active
+
+    # This deliberately mirrors drift_loss_imagenet.  In particular, replay
+    # targets and non-unit current-gen force weights do not recalibrate scale.
+    scale_weight_parts = [weight_neg, weight_pos]
+    if include_query_targets:
+        scale_weight_parts.insert(0, torch.ones_like(weight_gen))
+    scale_targets_w = torch.cat(scale_weight_parts, dim=1)
+    if C_h == 0:
+        target_parts = [fixed_neg, fixed_pos]
+        if include_query_targets:
+            target_parts.insert(0, query)
+        targets = torch.cat(target_parts, dim=1)
+        dist = _cdist_batched(query, targets)
+        weighted_dist = dist * scale_targets_w.unsqueeze(1)
+    else:
+        base_parts = [fixed_neg, fixed_pos]
+        if include_query_targets:
+            base_parts.insert(0, query)
+        base_targets = torch.cat(base_parts, dim=1)
+        dist_base = _cdist_batched(query, base_targets)
+        base_split_idx = (C_g if include_query_targets else 0) + C_n
+        dist_history = _cdist_batched(query, historical_gen)
+        dist = torch.cat(
+            [
+                dist_base[:, :, :base_split_idx],
+                dist_history,
+                dist_base[:, :, base_split_idx:],
+            ],
+            dim=2,
+        )
+        weighted_dist = dist_base * scale_targets_w.unsqueeze(1)
+
+    # _ratio_of_means detaches both inputs (and all-reduces when requested).
     if distance_scale is None:
-        target_weights = query_f.new_ones(batch, neg_count + pos_count)
         scale = _ratio_of_means(
-            distances,
-            target_weights,
-            use_global_stats=bool(global_scale_stats),
+            weighted_dist,
+            scale_targets_w,
+            use_global_stats=global_scale_stats,
         )
     else:
-        if distance_scale.numel() != 1:
-            raise ValueError("distance_scale must be a scalar tensor")
-        scale = distance_scale.detach().to(device=query.device, dtype=torch.float32)
-    scale_inputs = (scale / math.sqrt(feature_dim)).clamp_min(1.0e-3)
-    distances_normed = distances / scale.clamp_min(1.0e-3)
+        scale = torch.as_tensor(
+            distance_scale, device=query.device, dtype=torch.float32
+        ).detach()
+        if scale.numel() != 1:
+            raise ValueError("raw drift distance_scale must be scalar")
+    scale_inputs = (scale / (S ** 0.5)).clamp(min=1e-3)
+    dist_normed_clean = dist / scale.clamp(min=1e-3)
 
-    def _validated_mask(
-        value: Optional[torch.Tensor], count: int, name: str
-    ) -> torch.Tensor:
-        if value is None:
-            return torch.zeros(
-                batch,
-                query_count,
-                count,
-                dtype=torch.bool,
-                device=query.device,
-            )
-        expected = (batch, query_count, count)
-        if tuple(value.shape) != expected:
+    if include_query_targets:
+        diag = torch.eye(C_g, dtype=torch.float32, device=query.device)
+        block_mask = F.pad(diag, (0, C_n + C_h + C_p)).unsqueeze(0)
+    else:
+        block_mask = query.new_zeros(B, C_g, C_n + C_h + C_p)
+    split_idx = (C_g if include_query_targets else 0) + C_n + C_h
+    local_bandwidth = None
+    if kernel_adaptive_k_pos > 0:
+        if not include_query_targets:
             raise ValueError(
-                f"{name} has shape {tuple(value.shape)}, expected {expected}"
+                "support-only raw fields do not yet support adaptive bandwidth"
             )
-        return value.to(device=query.device, dtype=torch.bool)
+        if C_h > 0:
+            bandwidth_dist = dist_base / scale.clamp(min=1e-3)
+            bandwidth_mask = F.pad(diag, (0, C_n + C_p)).unsqueeze(0)
+            bandwidth_split_idx = C_g + C_n
+        else:
+            bandwidth_dist = dist_normed_clean
+            bandwidth_mask = block_mask
+            bandwidth_split_idx = split_idx
+        local_bandwidth = _adaptive_reverse_bandwidth(
+            bandwidth_dist,
+            split_idx=bandwidth_split_idx,
+            self_mask=bandwidth_mask,
+            k_pos=kernel_adaptive_k_pos,
+            k_neg=kernel_adaptive_k_neg,
+            margin=kernel_adaptive_margin,
+        )
+    dist_normed = dist_normed_clean + block_mask * 100.0
 
-    neg_mask = _validated_mask(invalid_neg_mask, neg_count, "invalid_neg_mask")
-    pos_mask = _validated_mask(invalid_pos_mask, pos_count, "invalid_pos_mask")
-    target_mask = torch.cat([neg_mask, pos_mask], dim=2)
-    # Preserve the official exponential two-softmax implementation while
-    # extending its generated diagonal mask to arbitrary bank subsets.
-    distances_for_affinity = distances_normed + target_mask.to(
-        distances_normed.dtype
-    ) * 100.0
-
-    raw_fields = []
+    fields = []
     for R in R_list:
         affinity = _reverse_mutual_affinity(
-            distances_for_affinity,
-            bandwidth=float(R),
+            dist_normed,
+            bandwidth=R,
             kernel=affinity_kernel,
             shape=kernel_shape,
-            local_bandwidth=None,
-            self_mask=target_mask,
+            local_bandwidth=local_bandwidth,
+            self_mask=block_mask,
             mix_weight=kernel_mix_weight,
             temperature_mix=kernel_temperature_mix,
             temperature_mix_weights=kernel_temperature_mix_weights,
         )
-        affinity = affinity.masked_fill(target_mask, 0.0)
-        aff_neg = affinity[:, :, :neg_count]
-        aff_pos = affinity[:, :, neg_count:]
+        affinity = affinity * targets_w.unsqueeze(1)
+
+        aff_neg = affinity[:, :, :split_idx]
+        aff_pos = affinity[:, :, split_idx:]
         aff_pos, pos_indices = _truncate_force_group(
             aff_pos,
             top_p=top_p,
@@ -884,24 +1067,53 @@ def raw_reverse_drift_fields(
 
         sum_pos = aff_pos.sum(dim=2, keepdim=True)
         r_coeff_neg = -aff_neg * sum_pos
+        if repulsion_coefficient != 1.0:
+            r_coeff_neg = r_coeff_neg * repulsion_coefficient
         sum_neg = aff_neg.sum(dim=2, keepdim=True)
         r_coeff_pos = aff_pos * sum_neg
-        total_force = _accumulate_weighted_targets(
-            r_coeff_neg,
-            neg_indices,
-            neg_f,
-        )
-        _accumulate_weighted_targets(
+
+        if C_h > 0:
+            fixed_repulsive = (
+                torch.cat([fixed_neg, historical_gen], dim=1)
+                if C_n > 0
+                else historical_gen
+            )
+        else:
+            fixed_repulsive = fixed_neg if C_n > 0 else None
+        if include_query_targets:
+            total_force_R = _accumulate_differentiable_weighted_targets(
+                r_coeff_neg,
+                neg_indices,
+                query,
+                fixed_repulsive,
+            )
+        else:
+            if fixed_repulsive is None:
+                raise ValueError(
+                    "support-only raw fields require a non-empty repulsive bank"
+                )
+            total_force_R = _accumulate_differentiable_weighted_targets(
+                r_coeff_neg,
+                neg_indices,
+                fixed_repulsive,
+                None,
+            )
+        total_force_R = _accumulate_differentiable_weighted_targets(
             r_coeff_pos,
             pos_indices,
-            pos_f,
-            out=total_force,
+            fixed_pos,
+            out=total_force_R,
         )
-        total_coefficients = r_coeff_neg.sum(dim=2) + r_coeff_pos.sum(dim=2)
-        total_force = total_force - query_f * total_coefficients.unsqueeze(-1)
-        raw_fields.append(total_force / scale_inputs)
+        total_coeffs = r_coeff_neg.sum(dim=2) + r_coeff_pos.sum(dim=2)
+        total_force_R.addcmul_(
+            query,
+            total_coeffs.unsqueeze(-1),
+            value=-1.0,
+        )
+        total_force_R.div_(scale_inputs)
+        fields.append(total_force_R)
 
-    return tuple(raw_fields), scale
+    return tuple(fields)
 
 
 def drift_loss_imagenet(
@@ -2287,10 +2499,8 @@ def compute_raw_winner_stats(dist_pos: torch.Tensor) -> Dict[str, float]:
 
 
 __all__ = [
-    "detached_reverse_drift_scale",
     "drift_loss_imagenet",
     "drift_loss_imagenet_colwise",
     "drift_loss_imagenet_mixed",
-    "raw_reverse_drift_fields",
     "compute_raw_winner_stats",
 ]

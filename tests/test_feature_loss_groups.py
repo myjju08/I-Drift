@@ -1,5 +1,4 @@
 import unittest
-from pathlib import Path
 
 from train_imagenet_gen import (
     _crosses_generated_epoch_interval,
@@ -9,12 +8,20 @@ from train_imagenet_gen import (
     _resolve_feature_loss_group_weights,
     _steps_for_generated_epochs,
     _top_k_for_feature,
-    load_yaml_config,
 )
 
 
-ROOT = Path(__file__).resolve().parents[1]
-CONFIG = ROOT / "configs/gen/B4_rev-drift_mae256.yaml"
+def metric_config():
+    profiles = {"all": {"default": 1.0}, "global_x8": {"default": 1.0, "global": 8.0}}
+    for group in ("global", "norm_x", "stage1", "stage2", "stage3", "stage4"):
+        profiles["no_" + group] = {"default": 1.0, group: 0.0}
+    profiles.update({
+        "no_stage1_norm_x2": {"norm_x": 2.0, "stage1": 0.0},
+        "no_stage2_norm_x2": {"norm_x": 2.0, "stage2": 0.0},
+        "no_stage12": {"stage1": 0.0, "stage2": 0.0},
+        "no_stage12_norm_x2": {"norm_x": 2.0, "stage1": 0.0, "stage2": 0.0},
+    })
+    return {"feature_loss_profiles": profiles}
 
 
 class FeatureLossGroupsTest(unittest.TestCase):
@@ -46,7 +53,7 @@ class FeatureLossGroupsTest(unittest.TestCase):
         self.assertAlmostEqual(weights["global"], 5.0 / 3.0)
 
     def test_all_leave_one_out_profiles_resolve(self):
-        cfg = load_yaml_config(str(CONFIG))
+        cfg = metric_config()
         for profile in (
             "all",
             "no_global",
@@ -70,7 +77,7 @@ class FeatureLossGroupsTest(unittest.TestCase):
                 {"feature_loss_group_weights": {"stage2": -0.1}}
             )
 
-    def test_top_k_can_be_restricted_to_selected_mae_stages(self):
+    def test_top_k_can_be_restricted_to_selected_encoder_stages(self):
         groups = _resolve_drift_top_k_groups(
             {"drift_top_k_groups": "stage2,stage3,stage4"}
         )
@@ -91,7 +98,7 @@ class FeatureLossGroupsTest(unittest.TestCase):
             _resolve_drift_top_k_groups({"drift_top_k_groups": "stage5"})
 
     def test_global_x8_profile_preserves_eight_to_one_relative_weight(self):
-        cfg = load_yaml_config(str(CONFIG))
+        cfg = metric_config()
         cfg["feature_loss_profile"] = "global_x8"
         group_weights = _resolve_feature_loss_group_weights(cfg)
         names = ("global", "norm_x", "layer1", "layer2")
@@ -102,7 +109,7 @@ class FeatureLossGroupsTest(unittest.TestCase):
         self.assertAlmostEqual(sum(weights.values()), len(names))
 
     def test_efficiency_profiles_resolve_requested_groups(self):
-        cfg = load_yaml_config(str(CONFIG))
+        cfg = metric_config()
         expected = {
             "no_stage1_norm_x2": {"norm_x": 2.0, "stage1": 0.0},
             "no_stage2_norm_x2": {"norm_x": 2.0, "stage2": 0.0},
@@ -120,7 +127,7 @@ class FeatureLossGroupsTest(unittest.TestCase):
                 for group, value in requested.items():
                     self.assertEqual(group_weights[group], value)
 
-                # The real 86-objective layout: raw/global=2, stages=21/21/28/14.
+                # A synthetic 86-objective layout: raw/global=2, stages=21/21/28/14.
                 names = ["global", "norm_x"]
                 for stage, count in ((1, 21), (2, 21), (3, 28), (4, 14)):
                     names.extend(f"layer{stage}_objective_{i}" for i in range(count))

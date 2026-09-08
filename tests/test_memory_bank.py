@@ -1,7 +1,6 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import numpy as np
 import torch
@@ -144,21 +143,15 @@ class ArrayMemoryBankPixelStorageTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "pixel_bank.npz"
-            metadata = {"rank": 0, "generated_epoch": 14, "step": 70100}
-            bank.save_npz(path, metadata=metadata)
+            bank.save_npz(path)
             restored = ArrayMemoryBank(
                 num_classes=1,
                 max_size=1,
                 storage_mode="pixel_uint8",
             )
-            self.assertEqual(
-                restored.load_npz(path, expected_metadata=metadata), metadata
-            )
-            with self.assertRaisesRegex(ValueError, "metadata mismatch"):
-                restored.load_npz(path, expected_metadata={"rank": 1})
+            restored.load_npz(path)
             with self.assertRaisesRegex(ValueError, "storage_mode"):
                 ArrayMemoryBank(num_classes=1, max_size=1).load_npz(path)
-            self.assertEqual(list(Path(tmpdir).iterdir()), [path])
 
         self.assertEqual(restored.bank.dtype, np.dtype(np.uint8))
         self.assertTrue(
@@ -167,34 +160,6 @@ class ArrayMemoryBankPixelStorageTest(unittest.TestCase):
                 normalized.reshape(1, 1, 3, 2, 2),
             )
         )
-
-    def test_legacy_raw_snapshot_without_storage_mode_preserves_float16(self):
-        values = np.arange(12, dtype=np.float16).reshape(2, 3, 2)
-        pointers = np.array([1, 2], dtype=np.int32)
-        counts = np.array([3, 2], dtype=np.int32)
-        restored = ArrayMemoryBank(num_classes=2, max_size=3, dtype=np.float16)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "legacy_bank.npz"
-            np.savez(path, bank=values, ptr=pointers, count=counts)
-            self.assertEqual(restored.load_npz(path), {})
-        self.assertEqual(restored.bank.dtype, np.dtype(np.float16))
-        np.testing.assert_array_equal(restored.bank, values)
-        np.testing.assert_array_equal(restored.ptr, pointers)
-        np.testing.assert_array_equal(restored.count, counts)
-
-    def test_failed_snapshot_publish_preserves_previous_archive(self):
-        bank = ArrayMemoryBank(num_classes=1, max_size=1, storage_mode="pixel_uint8")
-        bank.add(np.zeros((1, 3, 2, 2), dtype=np.uint8), np.array([0]))
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "pixel_bank.npz"
-            bank.save_npz(path, metadata={"step": 1})
-            previous_archive = path.read_bytes()
-            bank.add(np.full((1, 3, 2, 2), 255, dtype=np.uint8), np.array([0]))
-            with mock.patch("memory_bank.os.replace", side_effect=OSError("interrupted")):
-                with self.assertRaisesRegex(OSError, "interrupted"):
-                    bank.save_npz(path, metadata={"step": 2})
-            self.assertEqual(path.read_bytes(), previous_archive)
-            self.assertEqual(list(Path(tmpdir).iterdir()), [path])
 
     def test_pixel_storage_is_four_times_smaller_than_float32(self):
         sample = torch.zeros(1, 3, 8, 8)

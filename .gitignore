@@ -5,6 +5,7 @@ wandb/
 runs/
 outputs/
 results/
+reports/
 artifacts/
 samples/
 checkpoints/
@@ -61,6 +62,16 @@ data/
 *.tar.gz
 *.tgz
 *.zip
+*.jpeg
+*.JPEG
+*.jpg
+*.png
+*.webp
+*.bin
+*.onnx
+*.pkl
+*.pickle
+*.jsonl
 .cache/
 huggingface/
 .huggingface/
@@ -89,6 +100,10 @@ env/
 *.pem
 *.key
 credentials.json
+.netrc
+.ssh/
+id_rsa*
+id_ed25519*
 
 # Build artifacts
 *.egg-info/

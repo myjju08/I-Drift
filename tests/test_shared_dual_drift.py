@@ -86,10 +86,13 @@ class SharedDualDriftDistanceTest(unittest.TestCase):
         self.assertEqual(set(shared_info), set(reference_info))
         for key in reference_info:
             with self.subTest(metric=key):
-                self.assertAlmostEqual(
+                # Both paths reorder FP32 arithmetic. Apply the same
+                # scale-aware tolerance used for their loss and gradients.
+                torch.testing.assert_close(
                     float(shared_info[key]),
                     float(reference_info[key]),
-                    places=5,
+                    rtol=2e-5,
+                    atol=2e-6,
                 )
 
     def test_shared_path_halves_pairwise_distance_calls(self):

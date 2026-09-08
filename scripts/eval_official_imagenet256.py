@@ -35,7 +35,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.imagenet_generator import build_ditgen_from_config  # noqa: E402
 from train_imagenet_gen import _amp_ctx, _gen_use_bf16, load_yaml_config  # noqa: E402
 from utils import EMA  # noqa: E402
-from vae_imagenet import _load_vae  # noqa: E402
 
 
 def _softmax_np(logits: np.ndarray) -> np.ndarray:
@@ -186,13 +185,15 @@ class NpzArrayReader:
         self.close()
 
 
-class VaeDecodeModule(nn.Module):
-    def __init__(self, device: torch.device) -> None:
-        super().__init__()
-        self.vae = _load_vae(device)
+class PixelDecodeModule(nn.Module):
+    """Map direct RGB generator outputs from training space to [0, 1]."""
 
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        images = self.vae.decode(latents.float() / 0.18215).sample
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError(
+                "Pixel-space evaluation expects BCHW RGB generator outputs, "
+                f"got {tuple(images.shape)}"
+            )
         return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
 
 
@@ -291,14 +292,8 @@ def _load_imagenet_val_labels(cfg: dict) -> np.ndarray:
         ) from exc
 
     imagenet_path = str(cfg.get("imagenet_path") or os.environ.get("IMAGENET_PATH", ""))
-    cache_path = str(cfg.get("cache_path") or os.environ.get("IMAGENET_CACHE_PATH", ""))
-    use_cache = bool(cfg.get("use_cache", False))
-
-    if use_cache and cache_path:
-        split_root = os.path.join(cache_path, "val")
-        if os.path.isdir(split_root):
-            ds = datasets.DatasetFolder(root=split_root, loader=str, extensions=(".pt",))
-            return np.asarray([target for _, target in ds.samples], dtype=np.int64)
+    if bool(cfg.get("use_latent", False)) or bool(cfg.get("use_cache", False)):
+        raise ValueError("Evaluation supports direct RGB ImageNet inputs only")
 
     split_root = os.path.join(imagenet_path, "val")
     if not os.path.isdir(split_root):
@@ -411,8 +406,8 @@ def _sample_and_extract(
             labels = torch.from_numpy(labels_np[start:end]).long().to(device, non_blocking=True)
             with _amp_ctx(use_bf16):
                 out = generator(labels, cfg_scale=cfg_scale, train=False)
-            latents = out["samples"]
-            pixels = decoder(latents)
+            generated_pixels = out["samples"]
+            pixels = decoder(generated_pixels)
             # Match official Drifting _to_uint8: nan_to_num, multiply by 255,
             # clip, then cast to uint8 (truncate/floor for non-negative values).
             pixels = torch.nan_to_num(pixels, nan=0.0, posinf=1.0, neginf=0.0)
@@ -438,7 +433,7 @@ def _sample_and_extract(
             logits_chunks.append(logits_np.copy())
             pool3_stats.update(pool3_np)
 
-            del labels, out, latents, pixels, images_t, pool3_t, logits_t
+            del labels, out, generated_pixels, pixels, images_t, pool3_t, logits_t
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -721,7 +716,11 @@ def main() -> None:
 
     generator, step_loaded = _build_generator(cfg, args.ckpt, device)
     generator = _maybe_dataparallel(generator)
-    decoder = _maybe_dataparallel(VaeDecodeModule(device).to(device).eval())
+    if bool(cfg.get("use_latent", False)) or bool(cfg.get("use_cache", False)):
+        raise ValueError("Evaluation supports direct RGB generator outputs only")
+    decoder_module = PixelDecodeModule()
+    print("[eval] generator_output=direct_pixel")
+    decoder = _maybe_dataparallel(decoder_module.to(device).eval())
     feature_model = InceptionFeatureBundle(device).to(device).eval()
     ref_stats = _load_ref_stats(fid_ref_npz)
 

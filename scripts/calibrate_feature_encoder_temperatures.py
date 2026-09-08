@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Match DINO/MoCo reverse-kernel temperatures to an MAE reference.
+"""Capture DINO kernel statistics and verify an existing calibrated profile.
 
-The training loss first divides every feature's L2 distances by that feature's
-weighted mean distance.  Consequently, raw activation norms are not a valid
-temperature calibration signal.  This tool captures the *normalized* distance
-grid from an otherwise-real first S4 training batch and fits stage-wise
-temperature multipliers by matching the actual exponential mutual-affinity
-ESS at every configured R.
+The training loss normalizes each feature's L2 distances by its weighted mean
+before applying temperature. Capture reports those normalized distances and
+mutual-affinity ESS from a fresh generator's first batch; it does not fit or
+approve new production temperatures. Existing DINO profiles retain their pinned
+historical calibration artifact, verified by the same guard as training.
+
+Both commands require an already calibrated direct-RGB DINO config. Outputs
+must be outside this checkout. No encoder other than DINO is instantiated.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import gc
 import hashlib
 import json
 import math
-import statistics
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -36,7 +38,6 @@ from drifting_core.imagenet_loss import _cdist_batched, _ratio_of_means  # noqa:
 
 
 _STAGES = ("stage3", "stage4")
-_ESS_METRICS = ("pos_row", "pos_col", "repulsive_row", "repulsive_col")
 
 
 class _CalibrationComplete(RuntimeError):
@@ -67,7 +68,7 @@ def _sha256_file(path: Path) -> str:
 
 def _feature_checkpoint_provenance(cfg: Dict[str, Any]) -> Dict[str, Any]:
     extractor = train_module.resolve_feature_extractor_name(cfg)
-    checkpoint_value = cfg.get("feature_checkpoint") or cfg.get("mae_checkpoint")
+    checkpoint_value = cfg.get("feature_checkpoint")
     if not checkpoint_value:
         raise ValueError(f"{extractor} calibration requires a feature checkpoint")
     checkpoint = Path(str(checkpoint_value)).resolve()
@@ -275,6 +276,8 @@ def _capture_curves(
         }
         del distances, normalized, targets, gen_bt, pos_bt, neg_bt
 
+    if {value["stage"] for value in features.values()} != set(_STAGES):
+        raise ValueError("DINO capture requires nonempty stage3 and stage4 statistics")
     return {
         "definition": (
             "actual mutual affinity sqrt(softmax_target(-d/(scale*R*m)) * "
@@ -289,7 +292,13 @@ def _capture_curves(
 def _run_capture(args: argparse.Namespace) -> None:
     config_path = Path(args.config).resolve()
     config_bytes = config_path.read_bytes()
-    cfg = train_module.load_yaml_config(str(config_path))
+    cfg = _load_verified_dino_config(config_path)
+    if (not math.isfinite(args.grid_min) or not math.isfinite(args.grid_max)
+            or args.grid_min <= 0 or args.grid_max < args.grid_min
+            or args.grid_steps < 1 or args.max_token_rows < 1):
+        raise ValueError("Capture requires 0 < grid-min <= grid-max and positive counts")
+    output_path = _external_output_path(args.output)
+    workdir_path = _external_output_path(args.workdir)
     cfg.update(
         {
             "use_wandb": False,
@@ -301,13 +310,11 @@ def _run_capture(args: argparse.Namespace) -> None:
             "save_per_generated_epochs": 0.0,
             "total_generated_epochs": 0.0,
             "train_max_step_exclusive": 1,
-            "feature_adapter": False,
-            "feature_gan": False,
+            "adversarial_mode": "none",
+            "historical_gen_replay": False,
             "feature_use_remat": False,
-            "mae_use_remat": False,
-            # A production raw-pixel config remains launch-locked until the
-            # resulting multi-seed fit is applied. Captures themselves must be
-            # able to execute with the pending unit profile.
+            # Verify the unmodified production config first, then collect
+            # statistics without a training update or evaluation.
             "temperature_calibration_status": "calibration_capture",
             # Populate a representative class bank instead of calibrating on
             # the first 128 cached samples (which yields almost all repeated
@@ -318,21 +325,17 @@ def _run_capture(args: argparse.Namespace) -> None:
     )
     if args.seed is not None:
         cfg["seed"] = int(args.seed)
-    output_path = Path(args.output).resolve()
     if output_path.exists():
         raise RuntimeError(f"Refusing to overwrite an existing capture: {output_path}")
-    workdir_path = Path(args.workdir).resolve()
     if workdir_path.exists() and (
         not workdir_path.is_dir() or any(workdir_path.iterdir())
     ):
         raise RuntimeError(
             f"Temperature capture workdir must be new or empty: {workdir_path}"
         )
-    # Preserve the exact pre-tau input config beside every capture. Production
-    # YAMLs are intentionally updated after the fit, so their live path is not
-    # a stable reproducibility record.
+    # Preserve the exact input config independently of its mutable source path.
     config_snapshot_path = output_path.with_name(
-        f"{output_path.stem}_config_pre_tau.yaml"
+        f"{output_path.stem}_config.yaml"
     )
     if config_snapshot_path.exists():
         if config_snapshot_path.read_bytes() != config_bytes:
@@ -383,7 +386,7 @@ def _run_capture(args: argparse.Namespace) -> None:
             device,
         )
         raw_generator = generator.module if hasattr(generator, "module") else generator
-        amp_feature = train_module._mae_use_bf16(feature_extractor)
+        amp_feature = train_module._feature_use_bf16(feature_extractor)
         amp_generator = train_module._gen_use_bf16(generator)
         activation_kwargs = step_cfg["activation_kwargs"]
 
@@ -436,6 +439,17 @@ def _run_capture(args: argparse.Namespace) -> None:
         )
         payload.update(
             {
+                "diagnostic_only": True,
+                "production_temperatures_fitted": False,
+                "profile_verification": "training_guard_passed_before_capture_overrides",
+                "inherited_layer_temperature_multipliers": (
+                    train_module._resolve_layer_temperature_multipliers(step_cfg)
+                ),
+                "capture_overrides": {
+                    "adversarial_mode": "none", "historical_gen_replay": False,
+                    "push_per_step": 8192, "loader_batch_size": 512,
+                    "feature_use_remat": False,
+                },
                 "config": str(config_snapshot_path),
                 "source_config": str(config_path),
                 "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
@@ -472,13 +486,16 @@ def _run_capture(args: argparse.Namespace) -> None:
         print(f"[feature-temperature] captured {payload['feature_extractor']} -> {output_path}", flush=True)
         raise _CalibrationComplete
 
-    train_module.train_step = calibration_step
-    rank, world_size, device = train_module.setup_distributed()
-    if world_size != 1:
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise RuntimeError("temperature capture must run as a single process")
-    workdir_path.mkdir(parents=True, exist_ok=True)
+    train_module.train_step = calibration_step
     try:
-        train_module.train_gen(cfg, args.workdir, rank, world_size, device)
+        rank, world_size, device = train_module.setup_distributed()
+        if world_size != 1:
+            raise RuntimeError("temperature capture must run as a single process")
+        workdir_path.mkdir(parents=True, exist_ok=True)
+        train_module.train_gen(cfg, str(workdir_path), rank, world_size, device)
+        raise RuntimeError("Training returned without completing the diagnostic capture")
     except _CalibrationComplete:
         pass
     finally:
@@ -490,553 +507,11 @@ def _run_capture(args: argparse.Namespace) -> None:
             dist.destroy_process_group()
 
 
-def _matched_error(
-    reference: Dict[str, Any],
-    candidate: Dict[str, Any],
-    *,
-    stage: str,
-    multiplier_key: str,
-) -> tuple[float, int]:
-    differences = []
-    reference_features = reference["features"]
-    candidate_features = candidate["features"]
-    for name in sorted(set(reference_features) & set(candidate_features)):
-        ref_feature = reference_features[name]
-        candidate_feature = candidate_features[name]
-        if ref_feature["stage"] != stage or candidate_feature["stage"] != stage:
-            continue
-        ref_curves = ref_feature["curves"]
-        ref_one_key = min(ref_curves, key=lambda value: abs(float(value) - 1.0))
-        for r_key, ref_metrics in ref_curves[ref_one_key].items():
-            candidate_metrics = candidate_feature["curves"][multiplier_key][r_key]
-            for metric_name in _ESS_METRICS:
-                ref_value = max(float(ref_metrics[metric_name]), 1e-12)
-                candidate_value = max(float(candidate_metrics[metric_name]), 1e-12)
-                differences.append(math.log(candidate_value / ref_value))
-    if not differences:
-        raise ValueError(f"No matched {stage} feature/R/ESS statistics")
-    rmse = math.sqrt(sum(value * value for value in differences) / len(differences))
-    return rmse, len(differences)
-
-
-def _run_fit(args: argparse.Namespace) -> None:
-    reference = json.loads(Path(args.reference).read_text())
-    fitted: Dict[str, Any] = {}
-    for raw_candidate in args.candidate:
-        if "=" not in raw_candidate:
-            raise ValueError("--candidate must use NAME=JSON_PATH")
-        name, raw_path = raw_candidate.split("=", 1)
-        candidate = json.loads(Path(raw_path).read_text())
-        stage_results: Dict[str, Any] = {}
-        for stage in _STAGES:
-            choices = []
-            first_feature = next(iter(candidate["features"].values()))
-            for multiplier_key in first_feature["curves"]:
-                error, terms = _matched_error(
-                    reference,
-                    candidate,
-                    stage=stage,
-                    multiplier_key=multiplier_key,
-                )
-                choices.append(
-                    {
-                        "multiplier": float(multiplier_key),
-                        "log_ess_rmse": error,
-                        "matched_terms": terms,
-                    }
-                )
-            best = min(choices, key=lambda item: item["log_ess_rmse"])
-            stage_results[stage] = {"selected": best, "grid": choices}
-            print(
-                f"[feature-temperature] {name} {stage} multiplier="
-                f"{best['multiplier']:.8g} log_ess_rmse={best['log_ess_rmse']:.6f}",
-                flush=True,
-            )
-        fitted[name] = {
-            "capture": str(Path(raw_path).resolve()),
-            "stages": stage_results,
-        }
-    payload = {
-        "reference": str(Path(args.reference).resolve()),
-        "objective": "matched feature-key/R positive+repulsive row+column mutual-affinity log-ESS RMSE",
-        "candidates": fitted,
-    }
-    output_path = Path(args.output).resolve()
-    _atomic_write_bytes(
-        output_path, (json.dumps(payload, indent=2) + "\n").encode("utf-8")
-    )
-    print(f"[feature-temperature] fit -> {output_path}", flush=True)
-
-
-def _distance_log_ratios(
-    reference: Dict[str, Any],
-    candidate: Dict[str, Any],
-    *,
-    stage: str,
-    min_distance: float,
-) -> list[float]:
-    """Return log ratios of the actual normalized kernel-distance quantiles."""
-    ratios: list[float] = []
-    reference_features = reference["features"]
-    candidate_features = candidate["features"]
-    for name in sorted(set(reference_features) & set(candidate_features)):
-        ref_feature = reference_features[name]
-        candidate_feature = candidate_features[name]
-        if ref_feature["stage"] != stage or candidate_feature["stage"] != stage:
-            continue
-        ref_distributions = ref_feature["normalized_distance_quantiles"]
-        candidate_distributions = candidate_feature["normalized_distance_quantiles"]
-        for group in ("positive", "repulsive_nonself"):
-            for quantile in ("p25", "p50", "p75", "p90"):
-                reference_value = float(ref_distributions[group][quantile])
-                candidate_value = float(candidate_distributions[group][quantile])
-                # Very small generated-to-generated distances are numerical
-                # near-ties, not a useful scale signal for d/tau.
-                if reference_value <= min_distance or candidate_value <= min_distance:
-                    continue
-                ratios.append(math.log(candidate_value / reference_value))
-    if not ratios:
-        raise ValueError(f"No matched normalized-distance statistics for {stage}")
-    return ratios
-
-
-def _run_fit_distance(args: argparse.Namespace) -> None:
-    references = [json.loads(Path(path).read_text()) for path in args.reference]
-    grouped_candidates: Dict[str, list[tuple[str, Dict[str, Any]]]] = {}
-    for raw_candidate in args.candidate:
-        if "=" not in raw_candidate:
-            raise ValueError("--candidate must use NAME=JSON_PATH")
-        name, raw_path = raw_candidate.split("=", 1)
-        grouped_candidates.setdefault(name, []).append(
-            (raw_path, json.loads(Path(raw_path).read_text()))
-        )
-
-    fitted: Dict[str, Any] = {}
-    for name, candidate_entries in grouped_candidates.items():
-        if len(candidate_entries) != len(references):
-            raise ValueError(
-                f"{name} has {len(candidate_entries)} captures but "
-                f"{len(references)} references were supplied"
-            )
-        stage_results: Dict[str, Any] = {}
-        for stage in _STAGES:
-            all_ratios: list[float] = []
-            per_capture = []
-            for reference, (candidate_path, candidate) in zip(
-                references, candidate_entries
-            ):
-                ratios = _distance_log_ratios(
-                    reference,
-                    candidate,
-                    stage=stage,
-                    min_distance=float(args.min_distance),
-                )
-                capture_log_multiplier = sum(ratios) / len(ratios)
-                per_capture.append(
-                    {
-                        "candidate": str(Path(candidate_path).resolve()),
-                        "multiplier": math.exp(capture_log_multiplier),
-                        "matched_terms": len(ratios),
-                    }
-                )
-                all_ratios.extend(ratios)
-            log_multiplier = sum(all_ratios) / len(all_ratios)
-            multiplier = math.exp(log_multiplier)
-            postfit_rmse = math.sqrt(
-                sum((value - log_multiplier) ** 2 for value in all_ratios)
-                / len(all_ratios)
-            )
-            stage_results[stage] = {
-                "selected_multiplier": multiplier,
-                "postfit_log_ratio_rmse": postfit_rmse,
-                "matched_terms": len(all_ratios),
-                "per_capture": per_capture,
-            }
-            print(
-                f"[feature-distance-temperature] {name} {stage} "
-                f"multiplier={multiplier:.10g} "
-                f"postfit_log_rmse={postfit_rmse:.6f}",
-                flush=True,
-            )
-        fitted[name] = {"stages": stage_results}
-
-    payload = {
-        "definition": (
-            "Fit m so matched quantiles of the actual pre-kernel exponent "
-            "input (d/weighted_mean_d)/(R*m) have the same scale as MAE. "
-            "R cancels in the ratio; the geometric least-squares optimum is used."
-        ),
-        "references": [str(Path(path).resolve()) for path in args.reference],
-        "quantiles": ["p25", "p50", "p75", "p90"],
-        "groups": ["positive", "repulsive_nonself"],
-        "min_distance": float(args.min_distance),
-        "candidates": fitted,
-    }
-    output_path = Path(args.output).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2) + "\n")
-    print(f"[feature-distance-temperature] fit -> {output_path}", flush=True)
-
-
-def _huber_log_location(values: list[float], tuning: float = 1.5) -> tuple[float, float]:
-    """Robust center and MAD scale for log distance ratios."""
-    if not values:
-        raise ValueError("Cannot fit an empty set of log ratios")
-    location = statistics.median(values)
-    scale = 0.0
-    for _ in range(50):
-        scale = max(
-            1.4826 * statistics.median(abs(value - location) for value in values),
-            1e-6,
-        )
-        cap = float(tuning) * scale
-        weights = [
-            min(1.0, cap / max(abs(value - location), 1e-12))
-            for value in values
-        ]
-        updated = sum(
-            weight * value for weight, value in zip(weights, values)
-        ) / sum(weights)
-        if abs(updated - location) < 1e-12:
-            location = updated
-            break
-        location = updated
-    return location, scale
-
-
-def _run_fit_distance_robust(args: argparse.Namespace) -> None:
-    """Fit d/tau while rejecting numerically degenerate generated near-ties."""
-    quantiles = ("p10", "p25", "p50", "p75", "p90")
-    groups = ("positive", "generated_nonself", "real_negative")
-
-    references: Dict[int, tuple[str, Dict[str, Any]]] = {}
-    for path in args.reference:
-        capture = json.loads(Path(path).read_text())
-        seed = int(capture["effective_seed"])
-        if seed in references:
-            raise ValueError(f"Duplicate reference seed: {seed}")
-        references[seed] = (path, capture)
-
-    def capture_protocol(capture: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "generator_geometry": capture.get("generator_geometry"),
-            "batch": capture.get("batch"),
-            "R_list": capture.get("R_list"),
-            "max_token_rows_per_feature": capture.get(
-                "max_token_rows_per_feature"
-            ),
-            "feature_layout": {
-                name: {
-                    key: feature.get(key)
-                    for key in ("stage", "tokens", "dimension")
-                }
-                for name, feature in sorted((capture.get("features") or {}).items())
-            },
-        }
-
-    reference_protocols = {
-        json.dumps(
-            capture_protocol(capture), sort_keys=True, separators=(",", ":")
-        )
-        for _, capture in references.values()
-    }
-    if len(reference_protocols) != 1:
-        raise ValueError("Reference capture protocol changed between seeds")
-    reference_capture_protocol = capture_protocol(next(iter(references.values()))[1])
-
-    dataset_provenance: Optional[Dict[str, Any]] = None
-    provenance_payloads = [
-        capture.get("dataset_provenance") for _, capture in references.values()
-    ]
-    if any(value is not None for value in provenance_payloads):
-        if any(value is None for value in provenance_payloads):
-            raise ValueError("Reference captures mix datasets with/without provenance")
-        canonical = {
-            json.dumps(value, sort_keys=True, separators=(",", ":"))
-            for value in provenance_payloads
-        }
-        if len(canonical) != 1:
-            raise ValueError("Reference captures use different dataset provenance")
-        dataset_provenance = provenance_payloads[0]
-
-    grouped_candidates: Dict[str, Dict[int, tuple[str, Dict[str, Any]]]] = {}
-    for raw_candidate in args.candidate:
-        if "=" not in raw_candidate:
-            raise ValueError("--candidate must use NAME=JSON_PATH")
-        name, path = raw_candidate.split("=", 1)
-        capture = json.loads(Path(path).read_text())
-        seed = int(capture["effective_seed"])
-        if seed in grouped_candidates.setdefault(name, {}):
-            raise ValueError(f"Duplicate {name} seed: {seed}")
-        grouped_candidates[name][seed] = (path, capture)
-
-    fitted: Dict[str, Any] = {}
-    for name, candidates in grouped_candidates.items():
-        if set(candidates) != set(references):
-            raise ValueError(
-                f"{name} seeds {sorted(candidates)} do not match references "
-                f"{sorted(references)}"
-            )
-        for seed, (_, candidate) in candidates.items():
-            if candidate.get("dataset_provenance") != dataset_provenance:
-                raise ValueError(
-                    f"{name} seed {seed}: dataset provenance differs from reference"
-                )
-            if capture_protocol(candidate) != reference_capture_protocol:
-                raise ValueError(
-                    f"{name} seed {seed}: capture batch/R/feature layout differs"
-                )
-        hash_validation: Dict[str, Any] = {}
-        for seed, (_, reference) in references.items():
-            _, candidate = candidates[seed]
-            if candidate["batch"] != reference["batch"]:
-                raise ValueError(f"{name} seed {seed}: batch settings differ")
-            matched_hashes = {}
-            for hash_name, reference_hash in reference["tensor_sha256"].items():
-                candidate_hash = candidate["tensor_sha256"].get(hash_name)
-                matched_hashes[hash_name] = candidate_hash == reference_hash
-                if candidate_hash != reference_hash:
-                    raise ValueError(
-                        f"{name} seed {seed}: {hash_name} tensor hash differs"
-                    )
-            hash_validation[str(seed)] = matched_hashes
-
-        stage_results: Dict[str, Any] = {}
-        for stage in _STAGES:
-            accepted: list[Dict[str, Any]] = []
-            counts = {
-                group: {"accepted": 0, "excluded_below_min_distance": 0}
-                for group in groups
-            }
-            for seed, (_, reference) in references.items():
-                _, candidate = candidates[seed]
-                for feature_name in sorted(
-                    set(reference["features"]) & set(candidate["features"])
-                ):
-                    ref_feature = reference["features"][feature_name]
-                    candidate_feature = candidate["features"][feature_name]
-                    if (
-                        ref_feature["stage"] != stage
-                        or candidate_feature["stage"] != stage
-                    ):
-                        continue
-                    ref_distributions = ref_feature["normalized_distance_quantiles"]
-                    candidate_distributions = candidate_feature[
-                        "normalized_distance_quantiles"
-                    ]
-                    for group in groups:
-                        for quantile in quantiles:
-                            reference_value = float(ref_distributions[group][quantile])
-                            candidate_value = float(
-                                candidate_distributions[group][quantile]
-                            )
-                            if min(reference_value, candidate_value) < float(
-                                args.min_distance
-                            ):
-                                counts[group]["excluded_below_min_distance"] += 1
-                                continue
-                            counts[group]["accepted"] += 1
-                            accepted.append(
-                                {
-                                    "seed": seed,
-                                    "feature": feature_name,
-                                    "group": group,
-                                    "quantile": quantile,
-                                    "log_ratio": math.log(
-                                        candidate_value / reference_value
-                                    ),
-                                }
-                            )
-
-            log_ratios = [entry["log_ratio"] for entry in accepted]
-            location, mad_scale = _huber_log_location(
-                log_ratios, tuning=float(args.huber_tuning)
-            )
-            sorted_ratios = sorted(log_ratios)
-            trim_count = int(float(args.trim_fraction) * len(sorted_ratios))
-            trimmed = (
-                sorted_ratios[trim_count:-trim_count]
-                if trim_count > 0
-                else sorted_ratios
-            )
-            group_results = {}
-            for group in groups:
-                values = [
-                    entry["log_ratio"]
-                    for entry in accepted
-                    if entry["group"] == group
-                ]
-                if values:
-                    group_location, group_scale = _huber_log_location(
-                        values, tuning=float(args.huber_tuning)
-                    )
-                    group_results[group] = {
-                        "huber_multiplier": math.exp(group_location),
-                        "median_multiplier": math.exp(statistics.median(values)),
-                        "log_mad_scale": group_scale,
-                        **counts[group],
-                    }
-                else:
-                    group_results[group] = {**counts[group], "status": "all_excluded"}
-
-            per_seed = {}
-            for seed in sorted(references):
-                values = [
-                    entry["log_ratio"]
-                    for entry in accepted
-                    if entry["seed"] == seed
-                ]
-                seed_location, _ = _huber_log_location(
-                    values, tuning=float(args.huber_tuning)
-                )
-                per_seed[str(seed)] = math.exp(seed_location)
-
-            multiplier = math.exp(location)
-            r_values = [float(value) for value in next(iter(references.values()))[1]["R_list"]]
-            stage_results[stage] = {
-                "selected_multiplier": multiplier,
-                "effective_tau": [value * multiplier for value in r_values],
-                "huber_tuning": float(args.huber_tuning),
-                "log_mad_scale": mad_scale,
-                "median_multiplier": math.exp(statistics.median(log_ratios)),
-                "trimmed_geometric_mean_multiplier": math.exp(
-                    statistics.fmean(trimmed)
-                ),
-                "accepted_terms": len(log_ratios),
-                "per_seed_multiplier": per_seed,
-                "groups": group_results,
-            }
-            print(
-                f"[feature-distance-robust] {name} {stage} "
-                f"multiplier={multiplier:.10g} accepted={len(log_ratios)}",
-                flush=True,
-            )
-
-        fitted[name] = {
-            "captures": {
-                str(seed): str(Path(path).resolve())
-                for seed, (path, _) in candidates.items()
-            },
-            "input_hash_validation": hash_validation,
-            "stages": stage_results,
-        }
-
-    payload = {
-        "schema_version": 2,
-        "definition": (
-            "Robust Huber location of log(candidate/reference) for the actual "
-            "normalized kernel distance d/weighted_mean_d. Values below the "
-            "minimum distance are excluded before fitting because their d/(R*m) "
-            "is a generated near-tie rather than a stable temperature signal."
-        ),
-        "references": {
-            str(seed): str(Path(path).resolve())
-            for seed, (path, _) in references.items()
-        },
-        "groups_considered": list(groups),
-        "quantiles": list(quantiles),
-        "min_distance": float(args.min_distance),
-        "huber_tuning": float(args.huber_tuning),
-        "trim_fraction": float(args.trim_fraction),
-        "capture_protocol": reference_capture_protocol,
-        "dataset_provenance": dataset_provenance,
-        "candidates": fitted,
-    }
-    symmetric_reference_name = str(
-        getattr(args, "symmetric_reference_name", "") or ""
-    ).strip()
-    if symmetric_reference_name:
-        if len(fitted) != 1:
-            raise ValueError(
-                "--symmetric-reference-name requires exactly one candidate name"
-            )
-        candidate_name = next(iter(fitted))
-        if candidate_name == symmetric_reference_name:
-            raise ValueError("Symmetric reference and candidate names must differ")
-        reference_profile = {"default": 1.0}
-        candidate_profile = {"default": 1.0}
-        for stage in _STAGES:
-            ratio = float(
-                fitted[candidate_name]["stages"][stage]["selected_multiplier"]
-            )
-            reference_profile[stage] = ratio ** -0.5
-            candidate_profile[stage] = ratio ** 0.5
-        reference_feature_provenance = {
-            json.dumps(
-                capture.get("feature_provenance"),
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            for _, capture in references.values()
-        }
-        candidate_entries = grouped_candidates[candidate_name]
-        candidate_feature_provenance = {
-            json.dumps(
-                capture.get("feature_provenance"),
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            for _, capture in candidate_entries.values()
-        }
-        if len(reference_feature_provenance) != 1 or len(
-            candidate_feature_provenance
-        ) != 1:
-            raise ValueError("Feature checkpoint provenance changed between seeds")
-        reference_provenance = next(iter(references.values()))[1].get(
-            "feature_provenance"
-        )
-        candidate_provenance = next(iter(candidate_entries.values()))[1].get(
-            "feature_provenance"
-        )
-        payload.update(
-            {
-                "calibration_kind": "symmetric_raw_imagenet_dino_moco",
-                "required_seeds": sorted(references),
-                "centering": "geometric_mean_one",
-                "fixed_input_feature_multipliers": {
-                    "global": 1.0,
-                    "norm_x": 1.0,
-                    "reason": (
-                        "global and norm_x are computed directly from the same raw "
-                        "RGB input tensor before either frozen encoder"
-                    ),
-                },
-                "encoder_provenance": {
-                    symmetric_reference_name: reference_provenance,
-                    candidate_name: candidate_provenance,
-                },
-                "symmetric_profiles": {
-                    symmetric_reference_name: reference_profile,
-                    candidate_name: candidate_profile,
-                },
-                "capture_validation": {
-                    symmetric_reference_name: {
-                        str(seed): {
-                            "capture": str(Path(path).resolve()),
-                            "config_sha256": capture.get("config_sha256"),
-                            "tensor_sha256": capture.get("tensor_sha256"),
-                        }
-                        for seed, (path, capture) in references.items()
-                    },
-                    candidate_name: {
-                        str(seed): {
-                            "capture": str(Path(path).resolve()),
-                            "config_sha256": capture.get("config_sha256"),
-                            "tensor_sha256": capture.get("tensor_sha256"),
-                        }
-                        for seed, (path, capture) in candidate_entries.items()
-                    },
-                },
-            }
-        )
-    output_path = Path(args.output).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2) + "\n")
-    print(f"[feature-distance-robust] fit -> {output_path}", flush=True)
-
-
 def _run_finalize_symmetric(args: argparse.Namespace) -> None:
-    """Pin the forward fit only after a reverse-fit reciprocity check."""
+    """Legacy JSON-only finalizer retained for historical provenance tests.
+
+    This is not a CLI mode and does not run a reference encoder or refit taus.
+    """
     forward_path = Path(args.forward).resolve()
     reverse_path = Path(args.reverse).resolve()
     forward = json.loads(forward_path.read_text(encoding="utf-8"))
@@ -1127,60 +602,79 @@ def _run_finalize_symmetric(args: argparse.Namespace) -> None:
     print(f"[feature-distance-symmetric] finalized -> {output_path}", flush=True)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="command", required=True)
+def _external_output_path(value: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if path == ROOT or ROOT in path.parents:
+        raise ValueError("Calibration outputs must be outside the code checkout")
+    return path
 
-    capture = subparsers.add_parser("capture")
+
+def _load_verified_dino_config(config_path: Path) -> Dict[str, Any]:
+    cfg = train_module.load_yaml_config(str(config_path))
+    train_module._validate_dino_only_config(cfg)
+    if not bool(cfg.get("require_raw_temperature_calibration", False)):
+        raise ValueError("A pinned raw-ImageNet DINO temperature profile is required")
+    if cfg.get("temperature_calibration_status") != "ready":
+        raise ValueError("An already calibrated ready DINO config is required")
+    train_module._validate_raw_temperature_calibration(cfg)
+    return cfg
+
+
+def _run_verify_artifact(args: argparse.Namespace) -> None:
+    config_path = Path(args.config).resolve()
+    output_path = _external_output_path(args.output) if args.output else None
+    if output_path is not None and output_path.exists():
+        raise RuntimeError(f"Refusing to overwrite verification: {output_path}")
+    cfg = _load_verified_dino_config(config_path)
+    payload = {
+        "verified": True,
+        "verification": "unchanged_production_training_guard",
+        "config": str(config_path),
+        "config_sha256": _sha256_file(config_path),
+        "feature_extractor": train_module.resolve_feature_extractor_name(cfg),
+        "feature_checkpoint": cfg["feature_checkpoint"],
+        "calibration_artifact": cfg["temperature_calibration_artifact"],
+        "calibration_artifact_sha256": cfg["temperature_calibration_artifact_sha256"],
+        "layer_temperature_profile": cfg["layer_temperature_profile"],
+        "layer_temperature_multipliers": (
+            train_module._resolve_layer_temperature_multipliers(cfg)
+        ),
+        "temperature_calibration_inheritance_manifest": cfg.get(
+            "temperature_calibration_inheritance_manifest"
+        ),
+        "temperature_calibration_inheritance_manifest_sha256": cfg.get(
+            "temperature_calibration_inheritance_manifest_sha256"
+        ),
+        "production_temperatures_fitted": False,
+    }
+    encoded = json.dumps(payload, indent=2) + "\n"
+    if output_path is not None:
+        _atomic_write_bytes(output_path, encoded.encode("utf-8"))
+    print(encoded, end="", flush=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    verify = subparsers.add_parser(
+        "verify-artifact", help="Verify and reuse the pinned DINO profile without GPU work"
+    )
+    verify.add_argument("--config", required=True)
+    verify.add_argument("--output", help="Optional new JSON report outside the checkout")
+    verify.set_defaults(func=_run_verify_artifact)
+
+    capture = subparsers.add_parser(
+        "capture", help="Capture DINO-only diagnostic statistics; no new production fit"
+    )
     capture.add_argument("--config", required=True)
-    capture.add_argument("--workdir", required=True)
-    capture.add_argument("--output", required=True)
+    capture.add_argument("--workdir", required=True, help="New directory outside the checkout")
+    capture.add_argument("--output", required=True, help="New JSON outside the checkout")
     capture.add_argument("--max-token-rows", type=int, default=64)
     capture.add_argument("--seed", type=int, default=None)
     capture.add_argument("--grid-min", type=float, default=0.25)
     capture.add_argument("--grid-max", type=float, default=4.0)
     capture.add_argument("--grid-steps", type=int, default=81)
     capture.set_defaults(func=_run_capture)
-
-    fit = subparsers.add_parser("fit")
-    fit.add_argument("--reference", required=True)
-    fit.add_argument("--candidate", action="append", required=True)
-    fit.add_argument("--output", required=True)
-    fit.set_defaults(func=_run_fit)
-
-    fit_distance = subparsers.add_parser("fit-distance")
-    fit_distance.add_argument("--reference", action="append", required=True)
-    fit_distance.add_argument("--candidate", action="append", required=True)
-    fit_distance.add_argument("--min-distance", type=float, default=1e-4)
-    fit_distance.add_argument("--output", required=True)
-    fit_distance.set_defaults(func=_run_fit_distance)
-
-    fit_distance_robust = subparsers.add_parser("fit-distance-robust")
-    fit_distance_robust.add_argument("--reference", action="append", required=True)
-    fit_distance_robust.add_argument("--candidate", action="append", required=True)
-    fit_distance_robust.add_argument("--min-distance", type=float, default=0.02)
-    fit_distance_robust.add_argument("--huber-tuning", type=float, default=1.5)
-    fit_distance_robust.add_argument("--trim-fraction", type=float, default=0.1)
-    fit_distance_robust.add_argument(
-        "--symmetric-reference-name",
-        default="",
-        help=(
-            "When set, require one candidate and emit geometric-center profiles "
-            "for this reference name and the candidate name."
-        ),
-    )
-    fit_distance_robust.add_argument("--output", required=True)
-    fit_distance_robust.set_defaults(func=_run_fit_distance_robust)
-
-    finalize_symmetric = subparsers.add_parser("finalize-symmetric")
-    finalize_symmetric.add_argument("--forward", required=True)
-    finalize_symmetric.add_argument("--reverse", required=True)
-    finalize_symmetric.add_argument("--output", required=True)
-    finalize_symmetric.add_argument(
-        "--max-log-reciprocity-error", type=float, default=1e-10
-    )
-    finalize_symmetric.set_defaults(func=_run_finalize_symmetric)
-
     args = parser.parse_args()
     args.func(args)
 

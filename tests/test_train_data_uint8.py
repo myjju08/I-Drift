@@ -10,7 +10,6 @@ from train.train_data import (
     _build_transforms,
     create_imagenet_split,
     create_raw_image_io_semaphore,
-    infer_latent_cache_format,
 )
 
 
@@ -219,10 +218,9 @@ class RawTrainUint8LoaderTest(unittest.TestCase):
     def test_io_gate_rejects_invalid_modes(self):
         with self.assertRaisesRegex(ValueError, "must be non-negative"):
             create_raw_image_io_semaphore(-1)
-        with self.assertRaisesRegex(ValueError, "only valid for direct raw"):
+        with self.assertRaisesRegex(ValueError, "supports direct raw RGB inputs only"):
             create_imagenet_split(
                 imagenet_path="",
-                cache_path="",
                 split="train",
                 use_cache=True,
                 raw_image_io_concurrency=2,
@@ -236,51 +234,13 @@ class RawTrainUint8LoaderTest(unittest.TestCase):
         )
         for options in invalid_options:
             with self.subTest(options=options), self.assertRaisesRegex(
-                ValueError, "only valid for a direct raw training split"
+                ValueError, "direct raw"
             ):
                 create_imagenet_split(
                     imagenet_path="",
-                    cache_path="",
                     return_uint8=True,
                     **options,
                 )
-
-    def test_raw_loader_extensions_preserve_pt_cache_controls(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            class_dir = Path(tmpdir) / "train" / "class0"
-            class_dir.mkdir(parents=True)
-            moments = torch.arange(4 * 32 * 32, dtype=torch.float32).reshape(4, 32, 32)
-            torch.save(
-                {"moments": moments, "moments_flip": -moments},
-                class_dir / "sample.pt",
-            )
-            self.assertEqual(infer_latent_cache_format(tmpdir), "pt_imagefolder")
-            loader, preprocess, _ = create_imagenet_split(
-                imagenet_path="",
-                cache_path=tmpdir,
-                cache_format="auto",
-                use_cache=True,
-                random_flip=False,
-                shuffle=False,
-                drop_last=False,
-                batch_size=2,
-                num_workers=0,
-                pin_memory=False,
-                persistent_workers=False,
-            )
-            batches = list(loader)
-            self.assertEqual(len(batches), 1)
-            processed = preprocess(batches[0])
-            self.assertTrue(torch.equal(processed["images"], moments.unsqueeze(0)))
-            self.assertEqual(processed["labels"].tolist(), [0])
-
-    def test_validation_reference_does_not_change_with_flip_rng(self):
-        transform = _build_transforms(12, use_aug=False, split="val")
-        outputs = []
-        for seed in range(8):
-            torch.manual_seed(seed)
-            outputs.append(transform(self._image()))
-        self.assertTrue(all(torch.equal(outputs[0], output) for output in outputs[1:]))
 
 
 if __name__ == "__main__":

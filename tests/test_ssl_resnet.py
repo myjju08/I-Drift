@@ -6,22 +6,10 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from models.mae_resnet import safe_mean_std, safe_rms
+from models.feature_statistics import safe_mean_std, safe_rms
 from models.ssl_resnet import SSLResNetFeatureExtractor
 
 
-class _DummyVAE(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.gradient_checkpointing_enabled = False
-        self.gradient_checkpointing_disable_calls = 0
-
-    def enable_gradient_checkpointing(self):
-        self.gradient_checkpointing_enabled = True
-
-    def disable_gradient_checkpointing(self):
-        self.gradient_checkpointing_enabled = False
-        self.gradient_checkpointing_disable_calls += 1
 
 
 def _empty_backbone():
@@ -100,7 +88,6 @@ def _chunked_reference(extractor, x):
                 patch_std_size=[2, 4],
                 use_std=True,
                 use_mean=True,
-                stage_adapters=None,
             )
             for key, value in processed.items():
                 parts[key].append(value)
@@ -114,59 +101,55 @@ def _chunked_reference(extractor, x):
 
 
 class SSLResNetConfigTest(unittest.TestCase):
-    def _build(self, *, use_remat, vae_gradient_checkpointing=None, vae=None):
-        vae = _DummyVAE() if vae is None else vae
+    def _build(self, **kwargs):
         with (
             patch("models.ssl_resnet.resnet50", return_value=_empty_backbone()),
             patch("models.ssl_resnet._load_backbone_state", return_value={}),
-            patch("models.ssl_resnet.load_vae", return_value=vae),
         ):
-            model = SSLResNetFeatureExtractor(
-                "dino_resnet50",
-                "/unused/checkpoint.pth",
-                use_remat=use_remat,
-                vae_gradient_checkpointing=vae_gradient_checkpointing,
-                device=torch.device("cpu"),
-            )
-        return model, vae
+            return SSLResNetFeatureExtractor("dino", "dummy.pth", **kwargs)
 
-    def test_vae_checkpointing_defaults_to_outer_remat_for_backward_compatibility(self):
-        enabled_model, enabled_vae = self._build(use_remat=True)
-        disabled_model, disabled_vae = self._build(use_remat=False)
+    def test_dino_defaults_to_raw_rgb_and_preserves_normalization(self):
+        model = self._build(use_remat=False)
+        values = torch.tensor([-1.3, -1.0, 0.0, 1.0, 1.3]).reshape(1, 1, 1, 5).repeat(2, 3, 4, 1)
+        values.requires_grad_()
+        expected = ((values + 1.0) * 0.5 - model.imagenet_mean) / model.imagenet_std
+        actual = model._decode_and_normalize(values)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        left, = torch.autograd.grad(actual.square().sum(), values, retain_graph=True)
+        right, = torch.autograd.grad(expected.square().sum(), values)
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+        self.assertFalse(model.use_latent)
+        self.assertFalse(model.training)
 
-        self.assertTrue(enabled_model.vae_gradient_checkpointing)
-        self.assertTrue(enabled_vae.gradient_checkpointing_enabled)
-        self.assertFalse(disabled_model.vae_gradient_checkpointing)
-        self.assertFalse(disabled_vae.gradient_checkpointing_enabled)
+    def test_rejects_removed_backbones_and_latent_inputs(self):
+        from models.ssl_resnet import canonical_ssl_backbone
+        for name in ("moco", "moco_v2_resnet50", "mae", "dino_latent_bridge"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                canonical_ssl_backbone(name)
+        with self.assertRaisesRegex(ValueError, "direct RGB"):
+            self._build(use_latent=True)
 
-    def test_vae_checkpointing_can_stay_enabled_without_outer_remat(self):
-        model, vae = self._build(
-            use_remat=False,
-            vae_gradient_checkpointing=True,
-        )
 
-        self.assertFalse(model.use_remat)
-        self.assertTrue(model.vae_gradient_checkpointing)
-        self.assertTrue(vae.gradient_checkpointing_enabled)
-
-    def test_explicit_false_disables_checkpointing_on_cached_vae(self):
-        vae = _DummyVAE()
-        self._build(use_remat=True, vae=vae)
-        self.assertTrue(vae.gradient_checkpointing_enabled)
-
-        model, cached_vae = self._build(
-            use_remat=True,
-            vae_gradient_checkpointing=False,
-            vae=vae,
-        )
-
-        self.assertIs(cached_vae, vae)
-        self.assertFalse(model.vae_gradient_checkpointing)
-        self.assertFalse(vae.gradient_checkpointing_enabled)
-        self.assertEqual(vae.gradient_checkpointing_disable_calls, 1)
 
 
 class SSLResNetActivationOptimizationTest(unittest.TestCase):
+    def test_terminal_stage_maps_are_preserved_for_adversarial_structure(self):
+        extractor = _TinySSLExtractor(generated_microbatch_size=2)
+        values = torch.randn(5, 3, 4, 4, requires_grad=True)
+        features, maps = extractor.get_activations(
+            values,
+            active_stages=["stage3", "stage4"],
+            return_stage_features=True,
+        )
+        self.assertEqual(set(maps), {"layer3", "layer4"})
+        expected = extractor._forward_selected_maps(values, ("layer3", "layer4"))
+        for name, reference in zip(("layer3", "layer4"), expected):
+            torch.testing.assert_close(maps[name], reference, rtol=0, atol=0)
+            torch.testing.assert_close(
+                features[name], rearrange(maps[name], "b c h w -> b (h w) c"),
+                rtol=0, atol=0,
+            )
+
     def test_routes_real_and_generated_paths_to_separate_microbatch_sizes(self):
         extractor = _TinySSLExtractor(
             real_microbatch_size=4,
@@ -269,7 +252,6 @@ class SSLResNetActivationOptimizationTest(unittest.TestCase):
             patch_std_size=[4],
             use_std=True,
             use_mean=True,
-            stage_adapters=None,
         )
 
         self.assertTrue(torch.equal(optimized["layer4_mean"], spatial_mean))

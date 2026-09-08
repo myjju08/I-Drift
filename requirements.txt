@@ -1,16 +1,14 @@
+# Install a PyTorch build compatible with your GPU before these dependencies.
 torch>=2.0.0
 torchvision>=0.15.0
 einops>=0.6.0
 numpy>=1.24.0
-msgpack>=1.0.0
-Pillow>=10.0.0        # PIL.Image.Resampling (needed by recent transformers/diffusers)
+Pillow>=10.0.0
 tqdm>=4.64.0
 PyYAML>=6.0
-scipy>=1.10.0           # for ImageNet devkit meta.mat parsing (val layout prep)
-diffusers>=0.20.0       # for SD-VAE (vae_imagenet.py)
-transformers>=4.30.0    # required by diffusers
-accelerate>=0.20.0      # required by diffusers
-torchmetrics[image]     # optional: for FID evaluation
-torch-fidelity          # torchmetrics FID backend dependency
-wandb                   # optional: for W&B logging
-zstandard>=0.23,<0.24   # lossless random-access pixel memory bank
+scipy>=1.10.0
+torchmetrics[image]
+torch-fidelity
+wandb
+zstandard>=0.23,<0.24
+pytest>=7.0

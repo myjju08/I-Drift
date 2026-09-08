@@ -1,5 +1,4 @@
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -8,12 +7,16 @@ from train_imagenet_gen import (
     _feature_temperature_multiplier,
     _resolve_layer_temperature_multipliers,
     compute_drift_loss_from_features,
-    load_yaml_config,
 )
 
 
-ROOT = Path(__file__).resolve().parents[1]
-CONFIG = ROOT / "configs/gen/B4_rev-drift_mae256.yaml"
+def metric_config():
+    return {"layer_temperature_profiles": {
+        "uniform": {"stage1": 1.0, "stage2": 1.0, "stage3": 1.0, "stage4": 1.0},
+        "shallow_hot": {"stage1": 1.5, "stage2": 1.0, "stage3": 1.0, "stage4": 1.0},
+        "deep_sharp": {"stage1": 1.0, "stage2": 1.0, "stage3": 1.0, "stage4": 0.75},
+        "depth_profile": {"stage1": 1.5, "stage2": 1.25, "stage3": 1.0, "stage4": 0.75},
+    }}
 
 
 class LayerTemperatureTest(unittest.TestCase):
@@ -45,8 +48,8 @@ class LayerTemperatureTest(unittest.TestCase):
             _feature_temperature_multiplier("norm_x", multipliers), 1.0
         )
 
-    def test_all_four_b4_profiles_resolve(self):
-        cfg = load_yaml_config(str(CONFIG))
+    def test_all_four_metric_profiles_resolve(self):
+        cfg = metric_config()
         expected = {
             "uniform": (1.0, 1.0, 1.0, 1.0),
             "shallow_hot": (1.5, 1.0, 1.0, 1.0),

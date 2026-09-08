@@ -63,12 +63,7 @@ def main() -> None:
             "scripts/benchmark_s4_mixed_adversarial.py",
         )
     }
-    numpy_core = getattr(np, "_core", None)
-    if numpy_core is None:  # NumPy 1.x exposes the module as np.core.
-        numpy_core = np.core
-    get_madvise_hugepage = getattr(
-        numpy_core.multiarray, "_get_madvise_hugepage", None
-    )
+    get_madvise_hugepage = getattr(np._core.multiarray, "_get_madvise_hugepage", None)
     runtime_metadata = {
         "numpy_version": np.__version__,
         "torch_version": torch.__version__,

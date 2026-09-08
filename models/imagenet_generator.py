@@ -1,7 +1,7 @@
 """PyTorch DitGen / LightningDiT — port of the official JAX generator for ImageNet.
 
 Key differences from the existing model.py DriftDiT_Small:
-  - Works for 256×256 pixel-space (patch_size=16) or 32×32 latent-space (patch_size=2)
+  - Direct RGB generation; the S4/DINO configs use 256×256 pixels and patch_size=32
   - Noise conditioning: noise_classes + noise_coords for sample diversity
   - n_cls_tokens: class tokens prepended to the sequence
   - CFG scale conditioning via TimestepEmbedder + RMSNorm
@@ -85,45 +85,20 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([-x[..., h:], x[..., :h]], dim=-1)
 
 
-def _build_rope_cache(
-    sequence_length: int,
-    head_dim: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Create graph-free RoPE cos/sin tables for a sequence shape."""
-    half = head_dim // 2
-    with torch.no_grad():
-        freqs = 1.0 / (
-            10000
-            ** (torch.arange(half, device=device, dtype=dtype) / half)
-        )
-        positions = torch.arange(sequence_length, device=device, dtype=dtype)
-        freqs = torch.outer(positions, freqs)
-        emb = torch.cat([freqs, freqs], dim=-1)
-        cos = emb.cos()[None, :, None, :]
-        sin = emb.sin()[None, :, None, :]
-    return cos, sin
-
-
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     rope_dtype: torch.dtype = torch.float32,
-    rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """RoPE for q, k: (B, N, H, D)."""
-    _, N, _, D = q.shape
-    if rope_cache is None:
-        cos, sin = _build_rope_cache(
-            N,
-            D,
-            device=q.device,
-            dtype=rope_dtype,
-        )
-    else:
-        cos, sin = rope_cache
+    B, N, H, D = q.shape
+    half = D // 2
+    freqs = 1.0 / (10000 ** (torch.arange(half, device=q.device, dtype=rope_dtype) / half))
+    t = torch.arange(N, device=q.device, dtype=rope_dtype)
+    freqs = torch.outer(t, freqs)
+    emb = torch.cat([freqs, freqs], dim=-1)          # (N, D)
+    cos = emb.cos()[None, :, None, :]                 # (1, N, 1, D)
+    sin = emb.sin()[None, :, None, :]
     q_out = q * cos + rotate_half(q) * sin
     k_out = k * cos + rotate_half(k) * sin
     return q_out, k_out
@@ -151,13 +126,6 @@ class Attention(nn.Module):
         self.use_rope  = use_rope
         self.attn_fp32 = attn_fp32
         self.use_sdpa  = use_sdpa
-        # Plain tensor attributes intentionally stay out of state_dict and DDP
-        # buffer broadcasts. _apply clears them on device/dtype transitions.
-        self._rope_cache_key: Optional[
-            Tuple[str, Optional[int], torch.dtype, int, int]
-        ] = None
-        self._rope_cos_cache: Optional[torch.Tensor] = None
-        self._rope_sin_cache: Optional[torch.Tensor] = None
 
         self.qkv  = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
@@ -171,56 +139,6 @@ class Attention(nn.Module):
         else:
             self.q_norm = self.k_norm = nn.Identity()
 
-    def _clear_rope_cache(self) -> None:
-        self._rope_cache_key = None
-        self._rope_cos_cache = None
-        self._rope_sin_cache = None
-
-    def _apply(self, fn: Any, *args: Any, **kwargs: Any) -> "Attention":
-        module = super()._apply(fn, *args, **kwargs)
-        self._clear_rope_cache()
-        return module
-
-    def _get_rope_cache(
-        self,
-        q: torch.Tensor,
-        rope_dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        sequence_length = q.shape[1]
-        head_dim = q.shape[-1]
-        key = (
-            q.device.type,
-            q.device.index,
-            rope_dtype,
-            sequence_length,
-            head_dim,
-        )
-        expected_shape = (1, sequence_length, 1, head_dim)
-        cos = self._rope_cos_cache
-        sin = self._rope_sin_cache
-        cache_is_valid = (
-            self._rope_cache_key == key
-            and cos is not None
-            and sin is not None
-            and cos.device == q.device
-            and sin.device == q.device
-            and cos.dtype == rope_dtype
-            and sin.dtype == rope_dtype
-            and tuple(cos.shape) == expected_shape
-            and tuple(sin.shape) == expected_shape
-        )
-        if not cache_is_valid:
-            cos, sin = _build_rope_cache(
-                sequence_length,
-                head_dim,
-                device=q.device,
-                dtype=rope_dtype,
-            )
-            self._rope_cache_key = key
-            self._rope_cos_cache = cos
-            self._rope_sin_cache = sin
-        return cos, sin
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
@@ -231,13 +149,7 @@ class Attention(nn.Module):
 
         if self.use_rope:
             rope_dtype = torch.float32 if self.attn_fp32 else q.dtype
-            rope_cache = self._get_rope_cache(q, rope_dtype)
-            q, k = apply_rope(
-                q,
-                k,
-                rope_dtype=rope_dtype,
-                rope_cache=rope_cache,
-            )
+            q, k = apply_rope(q, k, rope_dtype=rope_dtype)
 
         if self.attn_fp32:
             q = q.transpose(1, 2).float() * self.scale  # (B, H, N, D)

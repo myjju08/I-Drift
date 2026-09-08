@@ -5,21 +5,19 @@ Stores samples as numpy arrays (CPU); returns torch tensors on demand.
 """
 from __future__ import annotations
 
-import json
-import os
 import threading
 import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 
 
 class ArrayMemoryBank:
-    """Per-class ring buffer that stores image/latent samples.
+    """Per-class ring buffer that stores image samples.
 
     Used during generator training to maintain a pool of real images
     (positive bank) and unconditioned images (negative bank).
@@ -218,75 +216,36 @@ class ArrayMemoryBank:
         """True if every class has at least `min_per_class` samples."""
         return bool((self.count >= min_per_class).all())
 
-    def save_npz(
-        self,
-        path: str | Path,
-        *,
-        metadata: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+    def save_npz(self, path: str | Path) -> None:
         """Persist the bank without Python pickles.
 
         Historical generated replay uses one frozen per-rank snapshot.  Keeping
         it outside the model checkpoint avoids inflating every EMA checkpoint.
-        The temporary-file rename prevents a preemption from exposing a partial
-        archive as a valid replay state.
         """
         if self.bank is None or self.feature_shape is None:
             raise RuntimeError("Cannot save an empty MemoryBank.")
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "bank": self.bank,
-            "ptr": self.ptr,
-            "count": self.count,
-            "storage_mode": np.asarray(self.storage_mode),
-        }
-        if metadata is not None:
-            payload["metadata_json"] = np.asarray(
-                json.dumps(dict(metadata), sort_keys=True)
-            )
-        temporary_path = path.with_name(
-            f".{path.name}.{os.getpid()}.tmp.npz"
+        np.savez(
+            path,
+            bank=self.bank,
+            ptr=self.ptr,
+            count=self.count,
+            storage_mode=np.asarray(self.storage_mode),
         )
-        try:
-            np.savez(temporary_path, **payload)
-            os.replace(temporary_path, path)
-        finally:
-            temporary_path.unlink(missing_ok=True)
 
-    def load_npz(
-        self,
-        path: str | Path,
-        *,
-        expected_metadata: Optional[Mapping[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Restore a snapshot and optionally verify its runtime identity."""
+    def load_npz(self, path: str | Path) -> None:
+        """Restore a snapshot written by :meth:`save_npz`."""
         path = Path(path)
         with np.load(path, allow_pickle=False) as state:
             bank = np.asarray(state["bank"])
             ptr = np.asarray(state["ptr"], dtype=np.int32)
             count = np.asarray(state["count"], dtype=np.int32)
-            metadata = (
-                json.loads(str(state["metadata_json"].item()))
-                if "metadata_json" in state
-                else {}
-            )
             stored_mode = (
                 str(state["storage_mode"].item())
                 if "storage_mode" in state
                 else "raw"
             )
-        if expected_metadata is not None:
-            expected = dict(expected_metadata)
-            mismatches = {
-                key: (metadata.get(key), value)
-                for key, value in expected.items()
-                if metadata.get(key) != value
-            }
-            if mismatches:
-                raise ValueError(
-                    f"Snapshot metadata mismatch for {path}: {mismatches}"
-                )
         if stored_mode != self.storage_mode:
             raise ValueError(
                 f"Snapshot storage_mode {stored_mode!r} does not match bank "
@@ -303,7 +262,6 @@ class ArrayMemoryBank:
         self.feature_shape = tuple(self.bank.shape[2:])
         self.ptr = ptr.copy()
         self.count = count.copy()
-        return metadata
 
 
 class CompressedPixelMemoryBank(ArrayMemoryBank):

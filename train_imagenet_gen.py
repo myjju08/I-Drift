@@ -1,14 +1,14 @@
 """Generator training for ImageNet — PyTorch port of the official JAX train.py.
 
-Requires a pre-trained MAE checkpoint (--mae_checkpoint or set in config).
+Requires a frozen DINO ResNet-50 checkpoint and direct RGB images.
 
 Usage (single GPU):
-    python train_imagenet_gen.py --config configs/gen/latent_sota_B.yaml \
-        --workdir runs/gen_latent_B
+    python train_imagenet_gen.py --config configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched.yaml \
+        --workdir runs/dino
 
 Usage (multi-GPU, torchrun):
     torchrun --nproc_per_node=8 train_imagenet_gen.py \
-        --config configs/gen/latent_sota_B.yaml --workdir runs/gen_latent_B
+        --config configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched.yaml --workdir runs/dino
 """
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def _gen_use_bf16(generator: nn.Module) -> bool:
     return bool(getattr(raw, "use_bf16", True))
 
 
-def _mae_use_bf16(feature_extractor: nn.Module) -> bool:
+def _feature_use_bf16(feature_extractor: nn.Module) -> bool:
     raw = feature_extractor.module if hasattr(feature_extractor, "module") else feature_extractor
     return bool(getattr(raw, "use_bf16", False))
 
@@ -188,7 +188,7 @@ _FEATURE_LOSS_GROUPS = ("global", "norm_x", *_STOCHASTIC_FEATURE_STAGES)
 
 
 def _feature_stage_group(name: str) -> Optional[str]:
-    """Map an MAE activation key to one of four stochastic loss groups.
+    """Map a DINO activation key to one of four stochastic loss groups.
 
     The encoder stem (``conv1*``) is grouped with stage 1. Global/raw-input
     features and unknown future feature keys return ``None`` and remain active
@@ -216,7 +216,7 @@ def _resolve_drift_top_k_groups(cfg: dict) -> Optional[Tuple[str, ...]]:
     ``None`` means every feature, preserving the behavior of configs that
     predate group-scoped top-k.  A comma-separated string or sequence selects
     explicit groups, e.g. ``stage2,stage3,stage4`` keeps the inexpensive and
-    critical ``norm_x`` objective dense while truncating MAE-stage forces.
+    critical ``norm_x`` objective dense while truncating feature-stage forces.
     """
     raw = cfg.get("drift_top_k_groups", "all")
     if raw is None:
@@ -315,14 +315,12 @@ def _feature_loss_weights_for_groups(
     group_weights: Dict[str, float],
     *,
     normalize: bool,
-    normalization_reference_count: Optional[int] = None,
 ) -> Dict[str, float]:
     """Expand group coefficients to features, optionally preserving mass.
 
-    Mass normalization normally keeps ``sum(feature weights) == feature
-    count``. ``normalization_reference_count`` can preserve the coefficient
-    mass of a larger reference feature set when inactive stages are omitted
-    before activation materialization.
+    Mass normalization keeps ``sum(feature weights) == feature count``. This
+    prevents a leave-one-stage-out run from silently reducing the mean loss
+    coefficient merely because that stage emits many derived objectives.
     """
     names = tuple(feature_names)
     default = float(group_weights.get("default", 1.0))
@@ -337,14 +335,7 @@ def _feature_loss_weights_for_groups(
             raise ValueError(
                 "feature_loss_group_normalize requires at least one active feature"
             )
-        target_mass = len(weights)
-        if normalization_reference_count is not None:
-            target_mass = int(normalization_reference_count)
-            if target_mass <= 0:
-                raise ValueError(
-                    "feature_loss_normalization_reference_count must be positive"
-                )
-        scale = target_mass / coefficient_mass
+        scale = len(weights) / coefficient_mass
         weights = {name: value * scale for name, value in weights.items()}
     return weights
 
@@ -353,7 +344,7 @@ def _feature_temperature_multiplier(
     name: str,
     multipliers: Optional[Dict[str, float]],
 ) -> float:
-    """Return the static temperature multiplier for one MAE feature.
+    """Return the static temperature multiplier for one DINO feature.
 
     Exact feature-name entries take precedence over the four encoder-stage
     entries.  Raw-input/global features do not belong to an encoder stage and
@@ -469,33 +460,15 @@ from tqdm import tqdm
 from drifting_core.imagenet_loss import (
     _cdist_batched,
     compute_raw_winner_stats,
-    detached_reverse_drift_scale,
     drift_loss_imagenet,
     drift_loss_imagenet_colwise,
     drift_loss_imagenet_mixed,
-    raw_reverse_drift_fields,
 )
 from drifting_core.topk_diagnostics import diagnose_reverse_topk_heterogeneity
 from memory_bank import ArrayMemoryBank, CompressedPixelMemoryBank
 from models.adversarial_drift import AdversarialDriftSystem
-from models.feature_adapter import (
-    FeatureAdapterSystem,
-    canonical_adapter_stages,
-    update_adapter_ema,
-)
-from models.feature_gan import (
-    FrozenFeatureDiscriminator,
-    canonical_feature_gan_stages,
-    discriminator_hinge_loss,
-    generator_hinge_loss,
-)
 from models.imagenet_generator import DitGen, build_ditgen_from_config
 from models.ssl_resnet import build_ssl_resnet_from_config, canonical_ssl_backbone
-from models.mae_resnet import (
-    MAEResNet,
-    activations_from_feature_map,
-    build_mae_from_config,
-)
 from train.train_data import (
     create_imagenet_split,
     create_raw_image_io_semaphore,
@@ -724,7 +697,7 @@ class MixAlphaTracker:
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers (same as train_imagenet_mae.py)
+# Shared training helpers
 # ---------------------------------------------------------------------------
 
 def load_yaml_config(path: str) -> dict:
@@ -829,158 +802,6 @@ def _crosses_generated_epoch_interval(
     )
 
 
-def _generated_epoch_index(
-    *,
-    completed_steps: int,
-    generated_per_step: int,
-    dataset_size: int,
-) -> int:
-    """Zero-based generated epoch containing the next training step."""
-    if completed_steps < 0:
-        raise ValueError(
-            f"completed_steps must be non-negative, got {completed_steps}"
-        )
-    if generated_per_step <= 0:
-        raise ValueError(
-            f"generated_per_step must be positive, got {generated_per_step}"
-        )
-    if dataset_size <= 0:
-        raise ValueError(f"dataset_size must be positive, got {dataset_size}")
-    return int(
-        (int(completed_steps) * int(generated_per_step)) // int(dataset_size)
-    )
-
-
-def _rolling_replay_target_epoch(
-    *,
-    completed_steps: int,
-    generated_per_step: int,
-    dataset_size: int,
-    lag_epochs: int,
-) -> Optional[int]:
-    """Return the exact integer-epoch snapshot used by lagged replay.
-
-    A run in generated epoch 24 with ``lag_epochs=10`` therefore reads the
-    snapshot collected in generated epoch 14. Before epoch 10 there is no
-    eligible historical target.
-    """
-    if int(lag_epochs) <= 0:
-        raise ValueError(f"lag_epochs must be positive, got {lag_epochs}")
-    current_epoch = _generated_epoch_index(
-        completed_steps=completed_steps,
-        generated_per_step=generated_per_step,
-        dataset_size=dataset_size,
-    )
-    target_epoch = current_epoch - int(lag_epochs)
-    return target_epoch if target_epoch >= 0 else None
-
-
-def _rolling_snapshot_epoch_after_step(
-    *,
-    step: int,
-    generated_per_step: int,
-    dataset_size: int,
-) -> Optional[int]:
-    """Epoch bucket to freeze after ``step`` crosses an integer boundary."""
-    before = _generated_epoch_index(
-        completed_steps=step,
-        generated_per_step=generated_per_step,
-        dataset_size=dataset_size,
-    )
-    after = _generated_epoch_index(
-        completed_steps=step + 1,
-        generated_per_step=generated_per_step,
-        dataset_size=dataset_size,
-    )
-    if after <= before:
-        return None
-    return after - 1
-
-
-def _rolling_replay_snapshot_path(
-    workdir: str | Path,
-    *,
-    rank: int,
-    epoch: int,
-) -> Path:
-    if int(epoch) < 0:
-        raise ValueError(f"epoch must be non-negative, got {epoch}")
-    return (
-        Path(workdir)
-        / f"historical_gen_replay_epoch{int(epoch):04d}_rank{int(rank):02d}.npz"
-    )
-
-
-def _rolling_replay_capture_path(
-    workdir: str | Path,
-    *,
-    rank: int,
-    step: int,
-) -> Path:
-    if int(step) <= 0:
-        raise ValueError(f"step must be positive, got {step}")
-    return (
-        Path(workdir)
-        / f"historical_gen_replay_capture_step{int(step):07d}_rank{int(rank):02d}.npz"
-    )
-
-
-def _rolling_replay_metadata(
-    *,
-    kind: str,
-    rank: int,
-    world_size: int,
-    num_classes: int,
-    bank_count: int,
-    storage_dtype: str,
-    lag_epochs: int,
-    dataset_size: int,
-    generated_per_step: int,
-    epoch: Optional[int] = None,
-    step: Optional[int] = None,
-) -> Dict[str, Any]:
-    metadata: Dict[str, Any] = {
-        "kind": str(kind),
-        "rank": int(rank),
-        "world_size": int(world_size),
-        "num_classes": int(num_classes),
-        "bank_count": int(bank_count),
-        "storage_dtype": str(storage_dtype),
-        "lag_epochs": int(lag_epochs),
-        "dataset_size": int(dataset_size),
-        "generated_per_step": int(generated_per_step),
-    }
-    if epoch is not None:
-        metadata["epoch"] = int(epoch)
-    if step is not None:
-        metadata["step"] = int(step)
-    return metadata
-
-
-def _save_rolling_epoch_snapshot_and_reset(
-    capture_bank: ArrayMemoryBank,
-    path: str | Path,
-    *,
-    metadata: Dict[str, Any],
-    min_per_class: int,
-) -> ArrayMemoryBank:
-    """Freeze one epoch-local bank and return a fresh capture bank."""
-    if not capture_bank.is_ready(min_per_class):
-        missing_classes = np.flatnonzero(
-            capture_bank.count < int(min_per_class)
-        )
-        raise RuntimeError(
-            "Rolling historical replay epoch snapshot missed classes at "
-            f"epoch {metadata.get('epoch')}: {missing_classes[:20].tolist()}"
-        )
-    capture_bank.save_npz(path, metadata=metadata)
-    return ArrayMemoryBank(
-        num_classes=capture_bank.num_classes,
-        max_size=capture_bank.max_size,
-        dtype=capture_bank.dtype,
-    )
-
-
 def _split_bank_stream(
     samples: np.ndarray,
     labels: np.ndarray,
@@ -1042,11 +863,6 @@ def save_checkpoint(
     keep_last: int = 2,
     keep_every: int = 50000,
     mix_alpha_tracker: Optional[MixAlphaTracker] = None,
-    feature_adapter: Optional[nn.Module] = None,
-    feature_adapter_target: Optional[FeatureAdapterSystem] = None,
-    feature_adapter_optimizer: Optional[torch.optim.Optimizer] = None,
-    feature_discriminator: Optional[nn.Module] = None,
-    feature_discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
     adversarial_system: Optional[AdversarialDriftSystem] = None,
 ) -> None:
     ckpt_dir = Path(workdir) / "checkpoints"
@@ -1062,28 +878,6 @@ def save_checkpoint(
     }
     if mix_alpha_tracker is not None:
         payload["mix_alpha_tracker"] = mix_alpha_tracker.state_dict()
-    if feature_adapter is not None:
-        raw_adapter = (
-            feature_adapter.module
-            if hasattr(feature_adapter, "module")
-            else feature_adapter
-        )
-        payload["feature_adapter"] = raw_adapter.state_dict()
-    if feature_adapter_target is not None:
-        payload["feature_adapter_target"] = feature_adapter_target.state_dict()
-    if feature_adapter_optimizer is not None:
-        payload["feature_adapter_optimizer"] = feature_adapter_optimizer.state_dict()
-    if feature_discriminator is not None:
-        raw_discriminator = (
-            feature_discriminator.module
-            if hasattr(feature_discriminator, "module")
-            else feature_discriminator
-        )
-        payload["feature_discriminator"] = raw_discriminator.state_dict()
-    if feature_discriminator_optimizer is not None:
-        payload["feature_discriminator_optimizer"] = (
-            feature_discriminator_optimizer.state_dict()
-        )
     if adversarial_system is not None:
         payload["adversarial_system"] = adversarial_system.state_dict()
     latest = ckpt_dir / "ckpt_latest.pt"
@@ -1126,17 +920,15 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     mix_alpha_tracker: Optional[MixAlphaTracker] = None,
-    feature_adapter: Optional[nn.Module] = None,
-    feature_adapter_target: Optional[FeatureAdapterSystem] = None,
-    feature_adapter_optimizer: Optional[torch.optim.Optimizer] = None,
-    feature_discriminator: Optional[nn.Module] = None,
-    feature_discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
     adversarial_system: Optional[AdversarialDriftSystem] = None,
 ) -> int:
     latest = Path(workdir) / "checkpoints" / "ckpt_latest.pt"
     if not latest.exists():
         return 0
     state = torch.load(latest, map_location=device, weights_only=False)
+    retired_state = [key for key in state if key.startswith(("feature_adapter", "feature_discriminator"))]
+    if retired_state:
+        raise ValueError("Checkpoint contains a removed trainable feature system: " + ", ".join(sorted(retired_state)))
     if (adversarial_system is None) != ("adversarial_system" not in state):
         raise ValueError(
             "Checkpoint adversarial state does not match the requested experiment; "
@@ -1150,47 +942,6 @@ def load_checkpoint(
     optimizer.load_state_dict(state["optimizer"])
     if mix_alpha_tracker is not None and "mix_alpha_tracker" in state:
         mix_alpha_tracker.load_state_dict(state["mix_alpha_tracker"])
-    adapter_state_keys = {
-        "feature_adapter",
-        "feature_adapter_target",
-        "feature_adapter_optimizer",
-    }
-    if feature_adapter is not None:
-        present_adapter_keys = adapter_state_keys.intersection(state)
-        if present_adapter_keys != adapter_state_keys:
-            missing = sorted(adapter_state_keys.difference(present_adapter_keys))
-            raise RuntimeError(
-                "Adapter-enabled resume requires a complete adapter checkpoint; "
-                f"missing keys: {missing}"
-            )
-    if feature_adapter is not None and "feature_adapter" in state:
-        raw_adapter = (
-            feature_adapter.module
-            if hasattr(feature_adapter, "module")
-            else feature_adapter
-        )
-        raw_adapter.load_state_dict(state["feature_adapter"])
-    if feature_adapter_target is not None and "feature_adapter_target" in state:
-        feature_adapter_target.load_state_dict(state["feature_adapter_target"])
-    if (
-        feature_adapter_optimizer is not None
-        and "feature_adapter_optimizer" in state
-    ):
-        feature_adapter_optimizer.load_state_dict(state["feature_adapter_optimizer"])
-    if feature_discriminator is not None and "feature_discriminator" in state:
-        raw_discriminator = (
-            feature_discriminator.module
-            if hasattr(feature_discriminator, "module")
-            else feature_discriminator
-        )
-        raw_discriminator.load_state_dict(state["feature_discriminator"])
-    if (
-        feature_discriminator_optimizer is not None
-        and "feature_discriminator_optimizer" in state
-    ):
-        feature_discriminator_optimizer.load_state_dict(
-            state["feature_discriminator_optimizer"]
-        )
     return int(state.get("step", 0))
 
 
@@ -1251,6 +1002,9 @@ class Logger:
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.use_wandb = bool(cfg.get("use_wandb", False)) and rank == 0
         self.console_log = bool(cfg.get("console_log", True)) and rank == 0
+        self.wandb_log_min_step = int(cfg.get("wandb_log_min_step", 0) or 0)
+        if self.wandb_log_min_step < 0:
+            raise ValueError("wandb_log_min_step must be non-negative")
         self._step = 0
         if self.use_wandb:
             try:
@@ -1334,6 +1088,11 @@ class Logger:
                 if forked or not run_id_file.exists():
                     run_id_file.write_text(wandb.run.id)
                 self._wandb = wandb
+                if self.wandb_log_min_step > 0:
+                    print(
+                        "[W&B] Holding cloud metric writes until step "
+                        f"{self.wandb_log_min_step}; local JSONL remains enabled."
+                    )
             except Exception as e:
                 print(f"[W&B] init failed: {e}.")
                 self.use_wandb = False
@@ -1384,7 +1143,7 @@ class Logger:
         with open(self.log_file, "a") as f:
             f.write(json.dumps({"step": s, **metrics}) + "\n")
         self._emit_console_summary(s, metrics)
-        if self.use_wandb:
+        if self.use_wandb and s >= self.wandb_log_min_step:
             # W&B defaults to commit=False when an explicit step is supplied.
             # Make commits explicit so a run that stops before the next logging
             # interval still publishes its latest metrics.
@@ -1400,324 +1159,39 @@ class Logger:
 
 
 # ---------------------------------------------------------------------------
-# MAE feature extraction
+# Frozen DINO feature extraction
 # ---------------------------------------------------------------------------
 
-def _extract_mae_state_dict(state: Any) -> Tuple[Optional[Dict[str, torch.Tensor]], str]:
-    if isinstance(state, dict):
-        if "ema" in state and isinstance(state["ema"], dict):
-            return state["ema"], "EMA weights"
-        if "model" in state and isinstance(state["model"], dict):
-            return state["model"], "model weights"
-        if "state_dict" in state and isinstance(state["state_dict"], dict):
-            return state["state_dict"], "state_dict weights"
-        if "module" in state and isinstance(state["module"], dict):
-            return state["module"], "module weights"
-        if any(k.startswith("encoder.") for k in state.keys()):
-            return state, "weights"
-    return None, "weights"
-
-
-def _resolve_mae_cfg(cfg: dict, state: Any) -> dict:
-    mae_cfg = {
-        "num_classes": int(cfg.get("num_classes", 1000)),
-        "in_channels": int(cfg.get("in_channels", 4)),
-        "base_channels": 640,
-        "patch_size": 2,
-        "dropout_prob": 0.0,
-        "layers": [3, 4, 6, 3],
-        "use_bf16": bool(cfg.get("use_bf16", True)),
-        "input_patch_size": 1 if bool(cfg.get("use_latent", True)) else 8,
-        "use_remat": bool(cfg.get("mae_use_remat", False)),
-        "fuse_stats": int(cfg.get("throughput_opt_level", 0)) >= 2,
-    }
-
-    candidates: List[Dict[str, Any]] = []
-    if isinstance(state, dict):
-        if isinstance(state.get("model_config"), dict):
-            candidates.append(state["model_config"])
-        if isinstance(state.get("hf_metadata"), dict):
-            hf_meta_cfg = state["hf_metadata"].get("model_config")
-            if isinstance(hf_meta_cfg, dict):
-                candidates.append(hf_meta_cfg)
-        if isinstance(state.get("config"), dict):
-            nested_model_cfg = state["config"].get("model")
-            if isinstance(nested_model_cfg, dict):
-                candidates.append(nested_model_cfg)
-            else:
-                candidates.append(state["config"])
-
-    for cand in candidates:
-        for key in (
-            "num_classes",
-            "in_channels",
-            "base_channels",
-            "patch_size",
-            "dropout_prob",
-            "layers",
-            "use_bf16",
-            "input_patch_size",
-        ):
-            if key in cand and cand[key] is not None:
-                mae_cfg[key] = cand[key]
-
-    # MAE precision is determined by its checkpoint, not the generator config.
-    # (Generator use_bf16 controls generator dtype only, not MAE.)
-
-    sd, _ = _extract_mae_state_dict(state)
-    if isinstance(sd, dict):
-        conv1 = sd.get("encoder.conv1.weight")
-        if isinstance(conv1, torch.Tensor) and conv1.ndim == 4:
-            mae_cfg["base_channels"] = int(conv1.shape[0])
-            projected_in = int(conv1.shape[1])
-            in_ch = int(mae_cfg.get("in_channels", 4))
-            if in_ch > 0 and projected_in % in_ch == 0:
-                p2 = projected_in // in_ch
-                p = int(round(p2 ** 0.5))
-                if p * p == p2:
-                    mae_cfg["input_patch_size"] = p
-
-        fc_w = sd.get("fc.weight")
-        if isinstance(fc_w, torch.Tensor) and fc_w.ndim == 2:
-            mae_cfg["num_classes"] = int(fc_w.shape[0])
-
-        inferred_layers: List[int] = []
-        for stage_idx in range(8):
-            prefix = f"encoder.stages.{stage_idx}."
-            count = sum(
-                1
-                for key in sd.keys()
-                if key.startswith(prefix) and key.endswith(".conv1.weight")
-            )
-            if count == 0:
-                break
-            inferred_layers.append(count)
-        if inferred_layers:
-            mae_cfg["layers"] = inferred_layers
-
-    mae_cfg["layers"] = list(mae_cfg.get("layers", [3, 4, 6, 3]))
-    mae_cfg["base_channels"] = int(mae_cfg.get("base_channels", 640))
-    mae_cfg["in_channels"] = int(mae_cfg.get("in_channels", 4))
-    mae_cfg["num_classes"] = int(mae_cfg.get("num_classes", 1000))
-    mae_cfg["patch_size"] = int(mae_cfg.get("patch_size", 2))
-    mae_cfg["input_patch_size"] = int(mae_cfg.get("input_patch_size", 1))
-    mae_cfg["dropout_prob"] = float(mae_cfg.get("dropout_prob", 0.0))
-    mae_cfg["use_bf16"] = bool(mae_cfg.get("use_bf16", True))
-    # Runtime memory policy comes from the generator-training config, not the
-    # checkpoint metadata. It does not alter MAE weights or forward values.
-    mae_cfg["use_remat"] = bool(cfg.get("mae_use_remat", mae_cfg.get("use_remat", False)))
-    mae_cfg["fuse_stats"] = int(cfg.get("throughput_opt_level", 0)) >= 2
-    return mae_cfg
-
-
-def load_mae(checkpoint_path: str, cfg: dict, device: torch.device) -> MAEResNet:
-    """Load a pre-trained MAEResNet and freeze it."""
-    state: Any = None
-    if checkpoint_path:
-        if not Path(checkpoint_path).is_file():
-            raise FileNotFoundError(f"MAE checkpoint not found: {checkpoint_path}")
-        state = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    mae_cfg = _resolve_mae_cfg(cfg, state)
-    mae = build_mae_from_config(mae_cfg).to(device)
-    print(f"[MAE] Build config: {mae_cfg}")
-
-    if state is not None:
-        sd, source_name = _extract_mae_state_dict(state)
-        if sd is None:
-            raise ValueError(f"Unsupported MAE checkpoint format: {checkpoint_path}")
-        missing, unexpected = mae.load_state_dict(sd, strict=False)
-        print(f"[MAE] Loaded {source_name} from {checkpoint_path}")
-        if missing:
-            print(f"[MAE] Missing keys ({len(missing)}): {missing[:5]}{' ...' if len(missing) > 5 else ''}")
-        if unexpected:
-            print(f"[MAE] Unexpected keys ({len(unexpected)}): {unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}")
-        if bool(cfg.get("mae_strict_load", True)) and (missing or unexpected):
-            raise RuntimeError(
-                "MAE checkpoint is not architecture-compatible: "
-                f"missing={len(missing)}, unexpected={len(unexpected)}"
-            )
-
-    mae.eval()
-    for p in mae.parameters():
-        p.requires_grad_(False)
-    # Preserve fp32 MAE weights. bf16 compute is applied at callsites via autocast
-    # when the checkpoint metadata says `use_bf16: true`, matching the JAX setup
-    # more closely than converting stored weights to bf16.
-    return mae
-
-
 def resolve_feature_extractor_name(cfg: dict) -> str:
-    """Resolve MAE or the frozen direct-RGB DINO/MoCo feature encoder."""
-    name = str(cfg.get("feature_extractor", "mae")).strip().lower().replace("-", "_")
-    if name in {"mae", "mae_resnet", "mae_resnet256"}:
-        return "mae"
-    return canonical_ssl_backbone(name)
+    """Resolve the supported frozen DINO encoder; reject retired feature modes."""
+    name = canonical_ssl_backbone(str(cfg.get("feature_extractor", "dino_resnet50")))
+    if name != "dino_resnet50":
+        raise ValueError("Only the frozen DINO ResNet-50 feature encoder is supported")
+    return name
+
+
+def _validate_dino_only_config(cfg: dict) -> None:
+    """Keep old disabled flags readable while rejecting removed training paths."""
+    retired_flags = ("feature_adapter", "feature_gan", "use_convnext", "use_latent", "use_cache")
+    enabled = [key for key in retired_flags if bool(cfg.get(key, False))]
+    if enabled:
+        raise ValueError("DINO/direct-RGB training does not support enabled flags: " + ", ".join(enabled))
+    if cfg.get("feature_bridge_checkpoint"):
+        raise ValueError("Feature latent bridges are no longer supported")
+    if int(cfg.get("in_channels", 3)) != 3 or int(cfg.get("out_channels", 3)) != 3:
+        raise ValueError("DINO/direct-RGB training requires three input and output channels")
+    resolve_feature_extractor_name(cfg)
 
 
 def load_feature_extractor(cfg: dict, device: torch.device) -> nn.Module:
-    """Load a frozen metric; existing MAE defaults remain unchanged."""
-    name = resolve_feature_extractor_name(cfg)
-    if name == "mae":
-        checkpoint = cfg.get("feature_checkpoint") or cfg.get("mae_checkpoint") or os.environ.get("MAE_CHECKPOINT", "")
-        if not checkpoint and not bool(cfg.get("allow_random_mae", False)):
-            raise ValueError("mae_checkpoint is required unless allow_random_mae=true")
-        return load_mae(str(checkpoint), cfg, device)
-    checkpoint = cfg.get("feature_checkpoint") or os.environ.get("FEATURE_CHECKPOINT", "")
-    if not checkpoint:
-        raise ValueError(f"{name} requires the official feature_checkpoint")
-    return build_ssl_resnet_from_config(name, str(checkpoint), cfg, device)
-
-
-def build_feature_adapter_system(
-    mae: MAEResNet,
-    cfg: dict,
-    device: torch.device,
-    world_size: int,
-) -> Tuple[
-    Optional[nn.Module],
-    Optional[FeatureAdapterSystem],
-    Optional[torch.optim.Optimizer],
-]:
-    """Build the separately optimized online adapter and frozen drift target."""
-    if not bool(cfg.get("feature_adapter", False)):
-        return None, None, None
-
-    objective = str(cfg.get("feature_adapter_objective", "supcon")).lower().strip()
-    if objective not in (
-        "supcon",
-        "supcon_ce",
-        "real_anchor_multipos_infonce",
-        "gen_real_multipos_infonce",
-        "raw_drift_snr",
-    ):
-        raise ValueError(
-            "feature_adapter_objective must be 'supcon', 'supcon_ce', "
-            "'real_anchor_multipos_infonce', 'gen_real_multipos_infonce', or "
-            "'raw_drift_snr', "
-            f"got {objective!r}"
-        )
-    stages = canonical_adapter_stages(
-        cfg.get("feature_adapter_keys", ["layer3", "layer4"])
+    """Build the frozen DINO metric without adding a trainable feature path."""
+    _validate_dino_only_config(cfg)
+    checkpoint_path = cfg.get("feature_checkpoint") or os.environ.get("FEATURE_CHECKPOINT", "")
+    if not checkpoint_path:
+        raise ValueError("DINO feature extraction requires feature_checkpoint")
+    return build_ssl_resnet_from_config(
+        resolve_feature_extractor_name(cfg), str(checkpoint_path), cfg, device,
     )
-    base = int(mae.base_channels)
-    stage_channels = {
-        f"stage{index}": base * (2 ** (index - 1)) for index in range(1, 5)
-    }
-    online_raw = FeatureAdapterSystem(
-        stage_channels,
-        stages,
-        bottleneck=int(cfg.get("feature_adapter_bottleneck", 64)),
-        projection_dim=int(cfg.get("feature_adapter_projection_dim", 128)),
-        num_classes=int(cfg.get("num_classes", 1000)),
-        dropout=float(cfg.get("feature_adapter_dropout", 0.0)),
-        use_ce=objective == "supcon_ce",
-        objective=objective,
-    ).to(device)
-    if world_size > 1:
-        online: nn.Module = DDP(
-            online_raw,
-            device_ids=[device.index],
-            find_unused_parameters=False,
-            static_graph=True,
-            gradient_as_bucket_view=True,
-            broadcast_buffers=False,
-        )
-    else:
-        online = online_raw
-
-    # DDP construction broadcasts the online parameters from rank 0. Copy only
-    # afterwards so every rank begins from an identical EMA target.
-    target = copy.deepcopy(online_raw).to(device).eval()
-    for parameter in target.parameters():
-        parameter.requires_grad_(False)
-
-    optimizer = torch.optim.AdamW(
-        online_raw.parameters(),
-        lr=float(cfg.get("feature_adapter_lr", 1.0e-4)),
-        weight_decay=float(cfg.get("feature_adapter_weight_decay", 1.0e-4)),
-        betas=(
-            float(cfg.get("feature_adapter_adam_b1", 0.9)),
-            float(cfg.get("feature_adapter_adam_b2", 0.999)),
-        ),
-        fused=(
-            int(cfg.get("throughput_opt_level", 0)) >= 3
-            and device.type == "cuda"
-        ),
-    )
-    return online, target, optimizer
-
-
-def build_feature_discriminator_system(
-    mae: MAEResNet,
-    cfg: dict,
-    device: torch.device,
-    world_size: int,
-) -> Tuple[Optional[nn.Module], Optional[torch.optim.Optimizer]]:
-    """Build lightweight GAN heads over fixed terminal MAE stage maps."""
-    if not bool(cfg.get("feature_gan", False)):
-        return None, None
-
-    stages = canonical_feature_gan_stages(
-        cfg.get("feature_gan_keys", ["layer4"])
-    )
-    base = int(mae.base_channels)
-    stage_channels = {
-        f"stage{index}": base * (2 ** (index - 1)) for index in range(1, 5)
-    }
-    raw_discriminator = FrozenFeatureDiscriminator(
-        stage_channels,
-        stages,
-        hidden_channels=int(cfg.get("feature_gan_hidden_channels", 128)),
-        num_classes=int(cfg.get("num_classes", 1000)),
-    ).to(device)
-    if world_size > 1:
-        discriminator: nn.Module = DDP(
-            raw_discriminator,
-            device_ids=[device.index],
-            find_unused_parameters=False,
-            static_graph=True,
-            gradient_as_bucket_view=True,
-            broadcast_buffers=False,
-        )
-    else:
-        discriminator = raw_discriminator
-    optimizer = torch.optim.AdamW(
-        raw_discriminator.parameters(),
-        lr=float(cfg.get("feature_gan_lr", 2.0e-4)),
-        weight_decay=float(cfg.get("feature_gan_weight_decay", 1.0e-4)),
-        betas=(
-            float(cfg.get("feature_gan_adam_b1", 0.0)),
-            float(cfg.get("feature_gan_adam_b2", 0.9)),
-        ),
-    )
-    return discriminator, optimizer
-
-
-def _distributed_feature_gradient_norm(
-    loss: torch.Tensor,
-    features: Tuple[torch.Tensor, ...],
-    device: torch.device,
-) -> torch.Tensor:
-    """L2 norm of a loss gradient at selected feature-map boundaries.
-
-    Measuring at MAE stage outputs avoids an additional backward through the
-    frozen backbone.  The all-rank norm gives every DDP worker the same GAN
-    scale, while the ratio cancels the common world-size factor.
-    """
-    gradients = torch.autograd.grad(
-        loss,
-        features,
-        retain_graph=True,
-        create_graph=False,
-        allow_unused=True,
-    )
-    norm_sq = torch.zeros((), device=device, dtype=torch.float64)
-    for gradient in gradients:
-        if gradient is not None:
-            norm_sq = norm_sq + gradient.detach().double().square().sum()
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(norm_sq, op=dist.ReduceOp.SUM)
-    return norm_sq.clamp_min(0.0).sqrt().float()
 
 
 # ---------------------------------------------------------------------------
@@ -1805,10 +1279,8 @@ def compute_drift_loss_from_features(
     B and the spatial token axis are merged into the batch dimension.
 
     When `compute_raw_winner_stats_flag=True`, raw L2 winner counts are
-    computed once at image level: mean-pool the available terminal
-    layer1..layer4 features over tokens, concatenate them, then cdist. This
-    uses layer3+layer4 for a stage-3/4-only run instead of falling back to the
-    raw global latent. Emitted under
+    computed once at image level: mean-pool layer1..layer4 over tokens, concat
+    into a single (D1+D2+D3+D4,) vector per image, then cdist. Emitted under
     keys "raw/pos_winner_count", "raw/pos_winner_total",
     "raw/gen_winner_count", "raw/gen_winner_total".
 
@@ -1835,16 +1307,12 @@ def compute_drift_loss_from_features(
             "Use 'rev-drift', 'fwd-drift', or 'dual-drift'."
         )
 
-    # Image-level winner stats: mean-pool the available terminal MAE layers over
-    # tokens and concatenate them. With active_stages=[stage3, stage4], this
-    # deliberately uses only layer3/layer4 and never early-stage features.
+    # Image-level winner stats: mean-pool layer1..layer4 over tokens, concat to
+    # a single (D1+D2+D3+D4,) vector per image, then cdist. Replaces the older
+    # first-key (norm_x) per-token approach.
     if compute_raw_winner_stats_flag:
-        layer_keys = [
-            key
-            for key in ("layer1", "layer2", "layer3", "layer4")
-            if key in gen_feats and key in pos_feats
-        ]
-        if layer_keys:
+        layer_keys = ["layer1", "layer2", "layer3", "layer4"]
+        if all(k in gen_feats and k in pos_feats for k in layer_keys):
             with torch.no_grad():
                 pool_gen_list = [gen_feats[k].detach().float().mean(dim=1) for k in layer_keys]
                 pool_pos_list = [pos_feats[k].detach().float().mean(dim=1) for k in layer_keys]
@@ -2056,388 +1524,6 @@ def compute_drift_loss_from_features(
     return total_loss, total_info
 
 
-def _adapter_activations_from_maps(
-    maps: Dict[str, torch.Tensor],
-    activation_kwargs: Dict[str, Any],
-    *,
-    fuse_stats: bool,
-) -> Dict[str, torch.Tensor]:
-    """Apply the MAE's exact derived-activation transform to adapted maps."""
-    out: Dict[str, torch.Tensor] = {}
-    for name, feature_map in maps.items():
-        out.update(
-            activations_from_feature_map(
-                name,
-                feature_map,
-                patch_mean_size=activation_kwargs.get("patch_mean_size", [2, 4]),
-                patch_std_size=activation_kwargs.get("patch_std_size", [2, 4]),
-                use_std=bool(activation_kwargs.get("use_std", True)),
-                use_mean=bool(activation_kwargs.get("use_mean", True)),
-                fuse_stats=bool(fuse_stats),
-            )
-        )
-    return out
-
-
-def compute_adapter_raw_drift_snr_loss(
-    online_gen_feats: Dict[str, torch.Tensor],
-    online_pos_feats: Dict[str, torch.Tensor],
-    target_gen_feats: Dict[str, torch.Tensor],
-    target_pos_feats: Dict[str, torch.Tensor],
-    *,
-    batch_size: int,
-    generated_count: int,
-    positive_count: int,
-    query_count: int,
-    bank_count: int,
-    partition_seed: int,
-    R_list: Tuple[float, ...],
-    signal_weight: float,
-    consistency_weight: float,
-    variance_epsilon: float,
-    cosine_epsilon: float,
-    global_scale_stats: bool,
-    top_p: float,
-    top_p_min_keep: int,
-    top_k_pos: int,
-    top_k_neg: int,
-    affinity_kernel: str,
-    kernel_shape: float,
-    kernel_mix_weight: float,
-    kernel_temperature_mix: Tuple[float, ...],
-    kernel_temperature_mix_weights: Tuple[float, ...],
-    feature_temperature_multipliers: Optional[Dict[str, float]] = None,
-    feature_loss_weights: Optional[Dict[str, float]] = None,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Optimize raw drift signal-to-null-noise plus EMA bank consistency.
-
-    Each class-local set is split with a resume-stable permutation into an
-    independent generated query set plus real/generated banks ``a`` and ``b``.
-    Cross fields use ``(P_a,Q_a)`` and ``(P_b,Q_b)``; null fields use
-    ``(P_a,P_b)`` and ``(Q_a,Q_b)`` under exactly the same query measure and one
-    shared detached distance scale. Crucially, this function consumes the raw
-    per-temperature fields returned before force-RMS normalization.
-    normalization, so field energy is not an identity constant.
-    """
-    B = int(batch_size)
-    G = int(generated_count)
-    P = int(positive_count)
-    query_count = int(query_count)
-    bank_count = int(bank_count)
-    if B <= 0 or query_count <= 0 or bank_count < 2:
-        raise ValueError(
-            "raw drift SNR requires a positive batch/query count and banks of "
-            "at least two samples"
-        )
-    if query_count + 2 * bank_count > G or 2 * bank_count > P:
-        raise ValueError(
-            "raw drift query/banks do not fit the configured samples: "
-            f"query={query_count}, bank={bank_count}, G={G}, P={P}"
-        )
-    if not math.isfinite(float(signal_weight)) or float(signal_weight) < 0.0:
-        raise ValueError("raw drift signal weight must be finite and non-negative")
-    if (
-        not math.isfinite(float(consistency_weight))
-        or float(consistency_weight) < 0.0
-    ):
-        raise ValueError(
-            "raw drift consistency weight must be finite and non-negative"
-        )
-    if not math.isfinite(float(variance_epsilon)) or float(variance_epsilon) <= 0.0:
-        raise ValueError("raw drift variance epsilon must be finite and positive")
-    if not math.isfinite(float(cosine_epsilon)) or float(cosine_epsilon) <= 0.0:
-        raise ValueError("raw drift cosine epsilon must be finite and positive")
-    if int(top_k_pos) > 0 or int(top_k_neg) > 0:
-        raise ValueError(
-            "raw drift SNR currently requires dense banks (top-k=0) because "
-            "the compact indexed reduction has no adapter backward"
-        )
-
-    feature_names = tuple(online_gen_feats.keys())
-    if not feature_names:
-        raise ValueError("raw drift SNR received no adapter activations")
-    missing = {
-        name
-        for name in feature_names
-        if name not in online_pos_feats
-        or name not in target_gen_feats
-        or name not in target_pos_feats
-    }
-    if missing:
-        raise KeyError(f"raw drift SNR is missing matching features: {sorted(missing)}")
-
-    feature_device = next(iter(online_gen_feats.values())).device
-    partition_generator = torch.Generator(device="cpu")
-    partition_generator.manual_seed(int(partition_seed) % (2**63 - 1))
-    generated_permutation = torch.randperm(
-        G, generator=partition_generator, device="cpu"
-    ).to(feature_device)
-    partition_generator.manual_seed((int(partition_seed) + 104729) % (2**63 - 1))
-    positive_permutation = torch.randperm(
-        P, generator=partition_generator, device="cpu"
-    ).to(feature_device)
-    query_idx = generated_permutation[:query_count]
-    gen_a_idx = generated_permutation[
-        query_count : query_count + bank_count
-    ]
-    gen_b_idx = generated_permutation[
-        query_count + bank_count : query_count + 2 * bank_count
-    ]
-    pos_a_idx = positive_permutation[:bank_count]
-    pos_b_idx = positive_permutation[bank_count : 2 * bank_count]
-
-    weighted_j = next(iter(online_gen_feats.values())).new_zeros((), dtype=torch.float32)
-    weighted_consistency = weighted_j.clone()
-    weighted_dpq = weighted_j.clone()
-    weighted_d0 = weighted_j.clone()
-    weighted_var0 = weighted_j.clone()
-    weighted_signal = weighted_j.clone()
-    weighted_std0 = weighted_j.clone()
-    weighted_variance_floor = weighted_j.clone()
-    weighted_null_real = weighted_j.clone()
-    weighted_null_generated = weighted_j.clone()
-    weighted_near_zero = weighted_j.clone()
-    total_weight = 0.0
-    term_count = 0
-
-    common_field_kwargs = {
-        "global_scale_stats": bool(global_scale_stats),
-        "top_p": float(top_p),
-        "top_p_min_keep": int(top_p_min_keep),
-        "top_k_pos": int(top_k_pos),
-        "top_k_neg": int(top_k_neg),
-        "affinity_kernel": affinity_kernel,
-        "kernel_shape": float(kernel_shape),
-        "kernel_mix_weight": float(kernel_mix_weight),
-        "kernel_temperature_mix": kernel_temperature_mix,
-        "kernel_temperature_mix_weights": kernel_temperature_mix_weights,
-    }
-
-    for name in feature_names:
-        feature_weight = (
-            float(feature_loss_weights.get(name, 1.0))
-            if feature_loss_weights is not None
-            else 1.0
-        )
-        if feature_weight <= 0.0:
-            continue
-        online_gen = online_gen_feats[name]
-        online_pos = online_pos_feats[name]
-        target_gen = target_gen_feats[name].detach()
-        target_pos = target_pos_feats[name].detach()
-        if online_gen.ndim != 3 or online_pos.ndim != 3:
-            raise ValueError(f"adapter activation {name} must have shape [B*X,T,D]")
-        token_count = online_gen.shape[1]
-        feature_dim = online_gen.shape[2]
-        expected_gen = B * G
-        expected_pos = B * P
-        expected_shapes = (
-            (online_gen, expected_gen, "online generated"),
-            (online_pos, expected_pos, "online positive"),
-            (target_gen, expected_gen, "target generated"),
-            (target_pos, expected_pos, "target positive"),
-        )
-        for tensor, expected_examples, description in expected_shapes:
-            if (
-                tensor.shape[0] != expected_examples
-                or tensor.shape[1] != token_count
-                or tensor.shape[2] != feature_dim
-            ):
-                raise ValueError(
-                    f"{description} {name} has shape {tuple(tensor.shape)}; "
-                    f"expected ({expected_examples}, {token_count}, {feature_dim})"
-                )
-
-        def _to_bt(tensor: torch.Tensor, count: int) -> torch.Tensor:
-            return rearrange(
-                rearrange(tensor, "(b x) t d -> b x t d", b=B, x=count),
-                "b x t d -> (b t) x d",
-            )
-
-        online_generated_all = _to_bt(online_gen, G)
-        online_real = _to_bt(online_pos, P)
-        target_generated_all = _to_bt(target_gen, G)
-        target_real = _to_bt(target_pos, P)
-        online_query = online_generated_all.index_select(1, query_idx)
-        online_q_a = online_generated_all.index_select(1, gen_a_idx)
-        online_q_b = online_generated_all.index_select(1, gen_b_idx)
-        online_p_a = online_real.index_select(1, pos_a_idx)
-        online_p_b = online_real.index_select(1, pos_b_idx)
-        target_query = target_generated_all.index_select(1, query_idx)
-        target_q_a = target_generated_all.index_select(1, gen_a_idx)
-        target_q_b = target_generated_all.index_select(1, gen_b_idx)
-        target_p_a = target_real.index_select(1, pos_a_idx)
-        target_p_b = target_real.index_select(1, pos_b_idx)
-
-        temperature_multiplier = _feature_temperature_multiplier(
-            name, feature_temperature_multipliers
-        )
-        feature_R_list = tuple(
-            round(float(R) * temperature_multiplier, 12) for R in R_list
-        )
-        shared_distance_scale = detached_reverse_drift_scale(
-            online_query,
-            (online_p_a, online_p_b, online_q_a, online_q_b),
-            global_scale_stats=bool(global_scale_stats),
-        )
-        feature_field_kwargs = {
-            **common_field_kwargs,
-            "distance_scale": shared_distance_scale,
-        }
-        cross_a, _ = raw_reverse_drift_fields(
-            online_query,
-            online_p_a,
-            online_q_a,
-            R_list=feature_R_list,
-            **feature_field_kwargs,
-        )
-        cross_b, _ = raw_reverse_drift_fields(
-            online_query,
-            online_p_b,
-            online_q_b,
-            R_list=feature_R_list,
-            **feature_field_kwargs,
-        )
-        null_real, _ = raw_reverse_drift_fields(
-            online_query,
-            online_p_a,
-            online_p_b,
-            R_list=feature_R_list,
-            **feature_field_kwargs,
-        )
-        null_generated, _ = raw_reverse_drift_fields(
-            online_query,
-            online_q_a,
-            online_q_b,
-            R_list=feature_R_list,
-            **feature_field_kwargs,
-        )
-        with torch.no_grad():
-            target_distance_scale = detached_reverse_drift_scale(
-                target_query,
-                (target_p_a, target_p_b, target_q_a, target_q_b),
-                global_scale_stats=bool(global_scale_stats),
-            )
-            target_field_kwargs = {
-                **common_field_kwargs,
-                "distance_scale": target_distance_scale,
-            }
-            target_cross_b, _ = raw_reverse_drift_fields(
-                target_query,
-                target_p_b,
-                target_q_b,
-                R_list=feature_R_list,
-                **target_field_kwargs,
-            )
-
-        for field_a, field_b, field_rr, field_qq, field_target in zip(
-            cross_a,
-            cross_b,
-            null_real,
-            null_generated,
-            target_cross_b,
-        ):
-            energy_a = field_a.float().square().mean(dim=-1)
-            energy_b = field_b.float().square().mean(dim=-1)
-            energy_rr = field_rr.float().square().mean(dim=-1)
-            energy_qq = field_qq.float().square().mean(dim=-1)
-            dpq = 0.5 * (energy_a.mean() + energy_b.mean())
-            null_rr_mean = energy_rr.mean()
-            null_qq_mean = energy_qq.mean()
-            d0 = 0.5 * (null_rr_mean + null_qq_mean)
-            # Pooled finite-sample null variance around D0. Keeping this
-            # differentiable lets the adapter reduce estimator variance rather
-            # than merely enlarging cross-distribution field magnitude.
-            null_observation_count = energy_rr.numel() + energy_qq.numel()
-            var0 = (
-                (energy_rr - d0).square().sum()
-                + (energy_qq - d0).square().sum()
-            ) / float(max(1, null_observation_count - 1))
-            drift_signal = dpq - d0
-            drift_std0 = (var0 + float(variance_epsilon)).sqrt()
-            j_drift = drift_signal / drift_std0
-            with torch.no_grad():
-                near_zero_threshold = float(cosine_epsilon) ** 2
-                near_zero = 0.5 * (
-                    field_a.float()
-                    .square()
-                    .sum(dim=-1)
-                    .le(near_zero_threshold)
-                    .float()
-                    .mean()
-                    + field_target.float()
-                    .square()
-                    .sum(dim=-1)
-                    .le(near_zero_threshold)
-                    .float()
-                    .mean()
-                )
-                variance_floor_active = var0.le(float(variance_epsilon)).float()
-            direction_cosine = F.cosine_similarity(
-                field_a.float(),
-                field_target.detach().float(),
-                dim=-1,
-                eps=float(cosine_epsilon),
-            ).mean()
-            consistency = 1.0 - direction_cosine
-            weighted_j = weighted_j + feature_weight * j_drift
-            weighted_consistency = (
-                weighted_consistency + feature_weight * consistency
-            )
-            weighted_dpq = weighted_dpq + feature_weight * dpq
-            weighted_d0 = weighted_d0 + feature_weight * d0
-            weighted_var0 = weighted_var0 + feature_weight * var0
-            weighted_signal = weighted_signal + feature_weight * drift_signal
-            weighted_std0 = weighted_std0 + feature_weight * drift_std0
-            weighted_variance_floor = (
-                weighted_variance_floor
-                + feature_weight * variance_floor_active
-            )
-            weighted_null_real = (
-                weighted_null_real + feature_weight * null_rr_mean
-            )
-            weighted_null_generated = (
-                weighted_null_generated + feature_weight * null_qq_mean
-            )
-            weighted_near_zero = weighted_near_zero + feature_weight * near_zero
-            total_weight += feature_weight
-            term_count += 1
-
-    if total_weight <= 0.0 or term_count <= 0:
-        raise ValueError("raw drift SNR has no positive-weight feature/scale terms")
-    normalizer = float(total_weight)
-    mean_j = weighted_j / normalizer
-    mean_consistency = weighted_consistency / normalizer
-    loss = (
-        -float(signal_weight) * mean_j
-        + float(consistency_weight) * mean_consistency
-    )
-    metrics = {
-        "adapter/loss": loss.detach(),
-        "adapter/drift_snr": mean_j.detach(),
-        "adapter/drift_consistency": mean_consistency.detach(),
-        "adapter/drift_dpq": (weighted_dpq / normalizer).detach(),
-        "adapter/drift_d0": (weighted_d0 / normalizer).detach(),
-        "adapter/drift_var0": (weighted_var0 / normalizer).detach(),
-        "adapter/drift_signal": (weighted_signal / normalizer).detach(),
-        "adapter/drift_std0": (weighted_std0 / normalizer).detach(),
-        "adapter/drift_variance_floor_fraction": (
-            weighted_variance_floor / normalizer
-        ).detach(),
-        "adapter/drift_null_real": (weighted_null_real / normalizer).detach(),
-        "adapter/drift_null_generated": (
-            weighted_null_generated / normalizer
-        ).detach(),
-        "adapter/drift_direction_near_zero_fraction": (
-            weighted_near_zero / normalizer
-        ).detach(),
-        "adapter/drift_feature_scale_terms": loss.new_tensor(float(term_count)),
-        "adapter/drift_query_count": loss.new_tensor(float(query_count)),
-        "adapter/drift_bank_count": loss.new_tensor(float(bank_count)),
-    }
-    return loss, metrics
-
-
 
 # ---------------------------------------------------------------------------
 # Training step
@@ -2478,7 +1564,7 @@ def _historical_replay_ratio_for_step(cfg: dict, step: int, active: bool) -> flo
 
 def train_step(
     generator: nn.Module,
-    feature_extractor: MAEResNet,
+    feature_extractor: nn.Module,
     optimizer: torch.optim.Optimizer,
     labels: torch.Tensor,
     pos_samples: torch.Tensor,    # (B, P, C, H, W)
@@ -2487,12 +1573,6 @@ def train_step(
     step: int,
     cfg: dict,
     mix_alpha_tracker: Optional["MixAlphaTracker"] = None,
-    feature_adapter: Optional[nn.Module] = None,
-    feature_adapter_target: Optional[FeatureAdapterSystem] = None,
-    feature_adapter_optimizer: Optional[torch.optim.Optimizer] = None,
-    feature_adapter_update_allowed: bool = True,
-    feature_discriminator: Optional[nn.Module] = None,
-    feature_discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
     historical_samples: Optional[torch.Tensor] = None,
     fresh_historical_count: int = 0,
     adversarial_system: Optional[AdversarialDriftSystem] = None,
@@ -2501,7 +1581,7 @@ def train_step(
 
     Args:
         generator:   DitGen wrapped in DDP (or raw).
-        feature_extractor: Frozen MAEResNet.
+        feature_extractor: Frozen DINO feature encoder.
         optimizer:   AdamW.
         labels:      Class labels (B,).
         pos_samples: Real positive images (B, P, C, H, W).
@@ -2518,10 +1598,6 @@ def train_step(
     P = pos_samples.shape[1]
     N = neg_samples.shape[1]
     G = int(cfg.get("gen_per_label", 64))
-    if adversarial_system is not None and (
-        feature_adapter is not None or feature_discriminator is not None
-    ):
-        raise ValueError("Adversarial experiments cannot also change the DINO metric")
     adversarial_mode = adversarial_system.mode if adversarial_system is not None else None
     adversarial_teacher_real_features: Optional[Dict[str, torch.Tensor]] = None
     fresh_historical_count = int(fresh_historical_count)
@@ -2536,58 +1612,6 @@ def train_step(
         if historical_samples is not None
         else fresh_historical_count
     )
-    adapter_parts = (
-        feature_adapter,
-        feature_adapter_target,
-        feature_adapter_optimizer,
-    )
-    if any(part is not None for part in adapter_parts) and not all(
-        part is not None for part in adapter_parts
-    ):
-        raise ValueError(
-            "feature adapter, EMA target, and optimizer must be provided together"
-        )
-    adapter_objective = str(
-        cfg.get("feature_adapter_objective", "supcon")
-    ).lower().strip()
-    adapter_uses_generated = bool(
-        feature_adapter is not None
-        and adapter_objective
-        in (
-            "real_anchor_multipos_infonce",
-            "gen_real_multipos_infonce",
-            "raw_drift_snr",
-        )
-    )
-    adapter_uses_raw_drift = bool(
-        feature_adapter is not None and adapter_objective == "raw_drift_snr"
-    )
-    adapter_stage_names: Tuple[str, ...] = ()
-    if feature_adapter is not None:
-        raw_adapter_module = (
-            feature_adapter.module
-            if hasattr(feature_adapter, "module")
-            else feature_adapter
-        )
-        adapter_stage_names = tuple(raw_adapter_module.stages)
-    adapter_update_frequency = int(cfg.get("feature_adapter_update_freq", 1))
-    if feature_adapter is not None and adapter_update_frequency <= 0:
-        raise ValueError("feature_adapter_update_freq must be positive")
-    adapter_update_this_step = bool(
-        feature_adapter is not None
-        and feature_adapter_update_allowed
-        and step % adapter_update_frequency == 0
-    )
-    discriminator_parts = (
-        feature_discriminator,
-        feature_discriminator_optimizer,
-    )
-    if any(part is not None for part in discriminator_parts) and not all(
-        part is not None for part in discriminator_parts
-    ):
-        raise ValueError(
-            "feature discriminator and optimizer must be provided together"
-        )
 
     cfg_min     = float(cfg.get("cfg_min", 1.0))
     cfg_max     = float(cfg.get("cfg_max", 4.0))
@@ -2644,17 +1668,6 @@ def train_step(
     feature_loss_group_normalize = bool(
         cfg.get("feature_loss_group_normalize", False)
     )
-    feature_loss_normalization_reference_count = cfg.get(
-        "feature_loss_normalization_reference_count", None
-    )
-    if feature_loss_normalization_reference_count is not None:
-        feature_loss_normalization_reference_count = int(
-            feature_loss_normalization_reference_count
-        )
-        if feature_loss_normalization_reference_count <= 0:
-            raise ValueError(
-                "feature_loss_normalization_reference_count must be positive"
-            )
     topk_diagnostic_steps = int(cfg.get("topk_diagnostic_steps", 0))
     topk_diagnostic_pos = int(cfg.get("topk_diagnostic_pos", 16))
     topk_diagnostic_neg = int(cfg.get("topk_diagnostic_neg", 40))
@@ -2757,7 +1770,7 @@ def train_step(
 
     # 1b. Option B — cfg_batch_slice: single cfg for whole batch + slice pos/neg.
     # Keeps distance matrix exactly 16×48 by loading max (pos=16, neg=max) then
-    # slicing raw samples BEFORE MAE based on batch-uniform cfg.
+    # slicing raw samples before frozen feature extraction based on batch-uniform cfg.
     if cfg_batch_slice and N > 0:
         batch_cfg = cfg_scales[0].item()
         cfg_scales = cfg_scales[0:1].expand(B).contiguous()
@@ -2778,7 +1791,7 @@ def train_step(
     # 1c. cfg_uncond_split — partition the N "uncond" (mixed-class real) latents
     # between attraction (with pos_real) and repulsion (with old_gen) by cfg.
     # All weights = 1. Single cfg for the whole batch so x is scalar and we can
-    # slice the (latent) samples BEFORE MAE — total MAE compute = baseline
+    # slice the raw samples before feature extraction — total feature compute = baseline
     # (B*(P+N)), and the loss matrix C_p + C_g + C_n stays at P+G+N = 48.
     #   x = round(x_max * (1 - (cfg - cfg_min) / (cfg_max - cfg_min)))
     #   pos_samples_new = cat(pos_samples, neg_samples[:, :x])   (P_new = P + x)
@@ -2800,13 +1813,6 @@ def train_step(
         neg_samples = new_neg_samples
         P = P + x
         N = N - x
-
-    adapter_real_take = min(
-        int(cfg.get("feature_adapter_samples_per_class", 8)), P
-    )
-    adapter_generated_take = min(
-        int(cfg.get("feature_adapter_generated_samples_per_class", G)), G
-    )
 
     # Matched-geometry causal control for historical replay. Generate H
     # independent targets from the current generator, but isolate their RNG so
@@ -2855,28 +1861,14 @@ def train_step(
         )
     all_real = torch.cat(real_parts, dim=0)
 
-    mae_use_bf16 = _mae_use_bf16(feature_extractor)
+    feature_use_bf16 = _feature_use_bf16(feature_extractor)
     real_stage_features: Dict[str, torch.Tensor] = {}
-    need_terminal_stage_features = (
-        feature_discriminator is not None
-        or adapter_update_this_step
-        or adversarial_mode in {"feature_drift", "mixed"}
-    )
-    need_all_adapter_stage_features = bool(
-        adapter_uses_raw_drift and adapter_update_this_step
-    )
-    target_stage_adapters = (
-        feature_adapter_target.adapters
-        if feature_adapter_target is not None
-        else None
-    )
-    with torch.no_grad(), _amp_ctx(mae_use_bf16):
+    need_terminal_stage_features = adversarial_mode in {"feature_drift", "mixed"}
+    with torch.no_grad(), _amp_ctx(feature_use_bf16):
         real_activation_result = feature_extractor.get_activations(
             all_real.to(device),
             **act_kwargs,
-            stage_adapters=target_stage_adapters,
             return_stage_features=need_terminal_stage_features,
-            **({"return_all_stage_features": True} if need_all_adapter_stage_features else {}),
         )
         if need_terminal_stage_features:
             all_real_feats, real_stage_features = real_activation_result
@@ -2889,7 +1881,7 @@ def train_step(
             neg_feats = {k: v[:B * N] for k, v in neg_feats.items()}
         history_offset = B * (P + N)
         historical_feats = (
-            {k: v[history_offset:] for k, v in all_real_feats.items()}
+            {k: v[history_offset : history_offset + B * H] for k, v in all_real_feats.items()}
             if H > 0
             else None
         )
@@ -2914,40 +1906,10 @@ def train_step(
         # unused negative/history terminal maps before the generator forward.
         del real_stage_features, real_activation_result, values
 
-    if adversarial_system is not None:
-        del all_real, real_parts
+    del all_real, real_parts
 
     _prof_mark("after_real_mae")
 
-    adapter_target_pos_features: Dict[str, torch.Tensor] = {}
-    if adapter_uses_raw_drift and adapter_update_this_step:
-        for name, value in pos_feats.items():
-            if _feature_stage_group(name) not in adapter_stage_names:
-                continue
-            selected = value.reshape(B, P, *value.shape[1:])[
-                :, :adapter_real_take
-            ]
-            adapter_target_pos_features[name] = selected.reshape(
-                B * adapter_real_take, *value.shape[1:]
-            ).detach()
-
-    adapter_info: Dict[str, torch.Tensor] = {}
-    adapter_updated = False
-    if adapter_uses_generated and cfg_uncond_split:
-        raise ValueError(
-            f"{adapter_objective} cannot use cfg_uncond_split because "
-            "mixed-class negatives would be mislabeled as class positives"
-        )
-    if adapter_objective in (
-        "real_anchor_multipos_infonce",
-        "gen_real_multipos_infonce",
-    ) and bool(
-        cfg.get("feature_adapter_global_negatives", False)
-    ):
-        raise ValueError(
-            "feature_adapter_global_negatives=true is not implemented; use the "
-            "explicit rank-local candidate pool"
-        )
 
     # 3. Generate samples + compute their features (grad-enabled)
     expanded_labels = repeat(labels, "b -> (b g)", g=G)          # (B*G,)
@@ -3005,57 +1967,19 @@ def train_step(
 
     max_grad_norm = float(cfg.get("max_grad_norm", 2.0))
     _zero_generator_grad(optimizer, throughput_opt_level)
-    def _forward_gen_and_feats() -> Tuple[
-        torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]
-    ]:
-        # Match the JAX generator path: bf16 model compute when enabled, while
-        # attention can still upcast internally via attn_fp32.
+    def _forward_gen_and_feats() -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         with _amp_ctx(gen_use_bf16):
-            # The trainable forward must go through DistributedDataParallel so
-            # its reducer prepares gradient synchronization for this iteration.
             out = generator(expanded_labels, cfg_scale=expanded_cfg, train=True)
         gen_samples_local = out["samples"]
         _prof_mark("after_generator")
-        with _amp_ctx(mae_use_bf16):
-            need_generated_stage_features = (
-                feature_discriminator is not None
-                or (adapter_uses_generated and adapter_update_this_step)
+        with _amp_ctx(feature_use_bf16):
+            gen_feats_local = feature_extractor.get_activations(
+                gen_samples_local, **act_kwargs, return_stage_features=False,
             )
-            activation_result = feature_extractor.get_activations(
-                gen_samples_local,
-                **act_kwargs,
-                stage_adapters=target_stage_adapters,
-                return_stage_features=need_generated_stage_features,
-                **({"return_all_stage_features": True} if need_all_adapter_stage_features else {}),
-            )
-        if need_generated_stage_features:
-            gen_feats_local, gen_stage_features_local = activation_result
-        else:
-            gen_feats_local = activation_result
-            gen_stage_features_local = {}
         _prof_mark("after_generated_mae")
-        return gen_samples_local, gen_feats_local, gen_stage_features_local
+        return gen_samples_local, gen_feats_local
 
-    gen_samples, gen_feats, gen_stage_features = _forward_gen_and_feats()
-    adapter_generated_stage_features = (
-        {
-            name: feature.detach()
-            for name, feature in gen_stage_features.items()
-        }
-        if adapter_uses_generated and adapter_update_this_step
-        else None
-    )
-    adapter_target_gen_features: Dict[str, torch.Tensor] = {}
-    if adapter_uses_raw_drift and adapter_update_this_step:
-        for name, value in gen_feats.items():
-            if _feature_stage_group(name) not in adapter_stage_names:
-                continue
-            selected = value.reshape(B, G, *value.shape[1:])[
-                :, :adapter_generated_take
-            ]
-            adapter_target_gen_features[name] = selected.reshape(
-                B * adapter_generated_take, *value.shape[1:]
-            ).detach()
+    gen_samples, gen_feats = _forward_gen_and_feats()
     history_ratio = _historical_replay_ratio_for_step(cfg, step, active=H > 0)
     configured_current_weight = cfg.get("historical_gen_current_weight", None)
     if configured_current_weight is not None:
@@ -3099,9 +2023,6 @@ def train_step(
             tuple(gen_feats.keys()),
             feature_loss_group_weights,
             normalize=feature_loss_group_normalize,
-            normalization_reference_count=(
-                feature_loss_normalization_reference_count
-            ),
         )
     if selected_feature_stages is not None:
         stochastic_weights = _feature_loss_weights_for_stages(
@@ -3207,7 +2128,6 @@ def train_step(
     loss_info.update(topk_diagnostic_info)
     _prof_mark("after_drift_loss")
 
-    feature_gan_info: Dict[str, torch.Tensor | float] = {}
     adversarial_info: Dict[str, torch.Tensor | float] = {}
     total_generator_loss = loss
     if adversarial_system is not None:
@@ -3339,162 +2259,6 @@ def train_step(
                 auxiliary_pixel_norm / dino_pixel_norm.clamp_min(1.0e-12)
             )
             del auxiliary_pixel_grad, dino_pixel_grad
-    if feature_discriminator is not None:
-        raw_discriminator: FrozenFeatureDiscriminator = (
-            feature_discriminator.module
-            if hasattr(feature_discriminator, "module")
-            else feature_discriminator
-        )
-        discriminator_stages = raw_discriminator.stages
-        real_per_class = min(
-            P,
-            int(cfg.get("feature_gan_real_samples_per_class", G)),
-        )
-        if real_per_class <= 0:
-            raise ValueError("feature_gan_real_samples_per_class must be positive")
-
-        real_discriminator_features: Dict[str, torch.Tensor] = {}
-        fake_discriminator_features: Dict[str, torch.Tensor] = {}
-        for stage in discriminator_stages:
-            layer = f"layer{stage[-1]}"
-            if layer not in real_stage_features or layer not in gen_stage_features:
-                raise KeyError(
-                    f"MAE did not emit required feature-GAN stage {layer}"
-                )
-            real_feature = real_stage_features[layer][: B * P]
-            real_feature = real_feature.reshape(
-                B, P, *real_feature.shape[1:]
-            )[:, :real_per_class]
-            real_discriminator_features[stage] = real_feature.reshape(
-                B * real_per_class, *real_feature.shape[2:]
-            ).detach()
-            fake_discriminator_features[stage] = gen_stage_features[layer]
-
-        real_discriminator_labels = labels[:, None].expand(
-            B, real_per_class
-        ).reshape(-1)
-        fake_discriminator_labels = expanded_labels
-        discriminator_labels = torch.cat(
-            [real_discriminator_labels, fake_discriminator_labels], dim=0
-        )
-        discriminator_features = {
-            stage: torch.cat(
-                [
-                    real_discriminator_features[stage],
-                    fake_discriminator_features[stage].detach(),
-                ],
-                dim=0,
-            )
-            for stage in discriminator_stages
-        }
-
-        feature_discriminator.train()
-        feature_discriminator_optimizer.zero_grad(set_to_none=True)
-        with _amp_ctx(bool(cfg.get("feature_gan_use_bf16", True))):
-            discriminator_scores = feature_discriminator(
-                discriminator_features, discriminator_labels
-            )
-            real_count = real_discriminator_labels.shape[0]
-            real_scores = discriminator_scores[:real_count]
-            fake_scores_detached = discriminator_scores[real_count:]
-            discriminator_loss = discriminator_hinge_loss(
-                real_scores, fake_scores_detached
-            )
-        discriminator_loss.backward()
-        discriminator_grad_norm = nn.utils.clip_grad_norm_(
-            feature_discriminator.parameters(),
-            float(cfg.get("feature_gan_discriminator_max_grad_norm", 5.0)),
-        )
-        feature_discriminator_optimizer.step()
-        _prof_mark("after_feature_discriminator")
-
-        # The generator sees the just-updated discriminator, but discriminator
-        # weights are constants for this forward.  Gradients continue through
-        # its operations into the generated MAE maps and then the generator.
-        for parameter in raw_discriminator.parameters():
-            parameter.requires_grad_(False)
-        with _amp_ctx(bool(cfg.get("feature_gan_use_bf16", True))):
-            generator_fake_scores = raw_discriminator(
-                fake_discriminator_features, fake_discriminator_labels
-            )
-            adversarial_loss = generator_hinge_loss(generator_fake_scores)
-        for parameter in raw_discriminator.parameters():
-            parameter.requires_grad_(True)
-
-        calibration_frequency = int(
-            cfg.get("feature_gan_gradient_calibration_freq", 10)
-        )
-        if calibration_frequency <= 0:
-            raise ValueError(
-                "feature_gan_gradient_calibration_freq must be positive"
-            )
-        calibrate = (
-            step % calibration_frequency == 0
-            or int(raw_discriminator.gradient_ratio_updates.item()) == 0
-        )
-        if calibrate:
-            calibration_features = tuple(
-                fake_discriminator_features[stage]
-                for stage in discriminator_stages
-            )
-            drift_gradient_norm = _distributed_feature_gradient_norm(
-                loss, calibration_features, device
-            )
-            adversarial_gradient_norm = _distributed_feature_gradient_norm(
-                adversarial_loss, calibration_features, device
-            )
-            raw_discriminator.update_gradient_calibration(
-                drift_gradient_norm,
-                adversarial_gradient_norm,
-                ema_decay=float(cfg.get("feature_gan_gradient_ratio_ema", 0.0)),
-            )
-        else:
-            drift_gradient_norm = raw_discriminator.drift_grad_ema.detach()
-            adversarial_gradient_norm = (
-                raw_discriminator.adversarial_grad_ema.detach()
-            )
-
-        target_ratio = float(cfg.get("feature_gan_gradient_ratio", 0.1))
-        if target_ratio < 0.0 or not math.isfinite(target_ratio):
-            raise ValueError(
-                f"feature_gan_gradient_ratio must be finite and >= 0, got {target_ratio}"
-            )
-        gan_warmup_steps = int(cfg.get("feature_gan_warmup_steps", 1000))
-        if gan_warmup_steps > 0:
-            warmup_fraction = min(1.0, float(step + 1) / gan_warmup_steps)
-        else:
-            warmup_fraction = 1.0
-        effective_target_ratio = target_ratio * warmup_fraction
-        adversarial_scale = (
-            raw_discriminator.gradient_unit_scale * effective_target_ratio
-        ).clamp(
-            min=float(cfg.get("feature_gan_scale_min", 0.0)),
-            max=float(cfg.get("feature_gan_scale_max", 1000.0)),
-        )
-        total_generator_loss = loss + adversarial_scale.detach() * adversarial_loss
-        estimated_gradient_ratio = (
-            adversarial_scale.detach()
-            * raw_discriminator.adversarial_grad_ema
-            / raw_discriminator.drift_grad_ema.clamp_min(1.0e-12)
-        )
-        feature_gan_info = {
-            "feature_gan/d_loss": discriminator_loss.detach(),
-            "feature_gan/d_real_score": real_scores.detach().mean(),
-            "feature_gan/d_fake_score": fake_scores_detached.detach().mean(),
-            "feature_gan/d_grad_norm": discriminator_grad_norm.detach(),
-            "feature_gan/g_loss": adversarial_loss.detach(),
-            "feature_gan/g_scale": adversarial_scale.detach(),
-            "feature_gan/target_gradient_ratio": target_ratio,
-            "feature_gan/effective_target_gradient_ratio": effective_target_ratio,
-            "feature_gan/estimated_gradient_ratio": estimated_gradient_ratio.detach(),
-            "feature_gan/drift_feature_grad_norm": drift_gradient_norm.detach(),
-            "feature_gan/adversarial_feature_grad_norm": (
-                adversarial_gradient_norm.detach()
-            ),
-            "feature_gan/calibrated": float(calibrate),
-        }
-        if feature_adapter is None:
-            del real_stage_features, gen_stage_features
 
     total_generator_loss.backward()
     _prof_mark("after_backward")
@@ -3526,161 +2290,7 @@ def train_step(
         del adversarial_teacher_real_features, discriminator_reals, discriminator_fakes
         _prof_mark("after_adversarial_update")
 
-    _prof_mark("after_generator_optimizer")
-
-    # Alternate optimizers explicitly: the generator step above only sees the
-    # frozen target adapter.  The online adapter now learns from raw MAE maps;
-    # generated maps were detached before the generator backward, so this
-    # backward cannot update either the generator or frozen MAE.
-    if feature_adapter is not None:
-        if adapter_update_this_step:
-            feature_adapter.train()
-            feature_adapter_optimizer.zero_grad(set_to_none=True)
-            with _amp_ctx(mae_use_bf16):
-                adapter_output, adapter_info = feature_adapter(
-                    real_stage_features,
-                    labels,
-                    batch_size=B,
-                    positive_count=P,
-                    samples_per_class=int(
-                        cfg.get("feature_adapter_samples_per_class", 8)
-                    ),
-                    temperature=float(cfg.get("feature_adapter_temp", 0.1)),
-                    supcon_weight=float(
-                        cfg.get("feature_adapter_loss_weight", 1.0)
-                    ),
-                    ce_weight=float(cfg.get("feature_adapter_ce_weight", 0.1)),
-                    reg_weight=float(cfg.get("feature_adapter_reg_lambda", 0.01)),
-                    generated_stage_features=adapter_generated_stage_features,
-                    generated_count=G if adapter_uses_generated else 0,
-                    generated_samples_per_class=int(
-                        cfg.get("feature_adapter_generated_samples_per_class", G)
-                    ),
-                    generated_anchor_weight=float(
-                        cfg.get("feature_adapter_generated_anchor_weight", 1.0)
-                    ),
-                    real_anchor_weight=float(
-                        cfg.get("feature_adapter_real_anchor_weight", 0.0)
-                    ),
-                )
-            if adapter_uses_raw_drift:
-                adapted_real_maps, adapted_generated_maps = adapter_output
-                online_pos_adapter_feats = _adapter_activations_from_maps(
-                    adapted_real_maps,
-                    act_kwargs,
-                    fuse_stats=bool(feature_extractor.fuse_stats),
-                )
-                online_gen_adapter_feats = _adapter_activations_from_maps(
-                    adapted_generated_maps,
-                    act_kwargs,
-                    fuse_stats=bool(feature_extractor.fuse_stats),
-                )
-                adapter_loss, raw_drift_info = compute_adapter_raw_drift_snr_loss(
-                    online_gen_adapter_feats,
-                    online_pos_adapter_feats,
-                    adapter_target_gen_features,
-                    adapter_target_pos_features,
-                    batch_size=B,
-                    generated_count=adapter_generated_take,
-                    positive_count=adapter_real_take,
-                    query_count=int(
-                        cfg.get("feature_adapter_drift_query_count", 8)
-                    ),
-                    bank_count=int(
-                        cfg.get("feature_adapter_drift_bank_count", 12)
-                    ),
-                    partition_seed=(
-                        int(cfg.get("seed", 42))
-                        + 1_000_003 * int(step)
-                        + 7_919
-                    ),
-                    R_list=R_list,
-                    signal_weight=float(
-                        cfg.get("feature_adapter_loss_weight", 1.0)
-                    ),
-                    consistency_weight=float(
-                        cfg.get("feature_adapter_drift_consistency_weight", 1.0)
-                    ),
-                    variance_epsilon=float(
-                        cfg.get("feature_adapter_drift_variance_epsilon", 1.0e-8)
-                    ),
-                    cosine_epsilon=float(
-                        cfg.get("feature_adapter_drift_cosine_epsilon", 1.0e-8)
-                    ),
-                    global_scale_stats=bool(
-                        cfg.get("feature_adapter_drift_global_scale_stats", False)
-                    ),
-                    top_p=rev_drift_top_p,
-                    top_p_min_keep=drift_top_p_min_keep,
-                    top_k_pos=drift_top_k_pos,
-                    top_k_neg=drift_top_k_neg,
-                    affinity_kernel=rev_drift_affinity_kernel,
-                    kernel_shape=rev_drift_kernel_shape,
-                    kernel_mix_weight=rev_drift_kernel_mix_weight,
-                    kernel_temperature_mix=rev_drift_kernel_temperature_mix,
-                    kernel_temperature_mix_weights=(
-                        rev_drift_kernel_temperature_mix_weights
-                    ),
-                    feature_temperature_multipliers=(
-                        feature_temperature_multipliers
-                    ),
-                    feature_loss_weights=feature_loss_weights,
-                )
-                adapter_info.update(raw_drift_info)
-            else:
-                adapter_loss = adapter_output
-            adapter_loss.backward()
-            adapter_max_grad_norm = float(
-                cfg.get("feature_adapter_max_grad_norm", 1.0)
-            )
-            adapter_grad_norm = nn.utils.clip_grad_norm_(
-                feature_adapter.parameters(),
-                adapter_max_grad_norm,
-            )
-            feature_adapter_optimizer.step()
-            adapter_info["adapter/grad_norm"] = adapter_grad_norm.detach()
-            adapter_info["adapter/grad_clipped"] = adapter_grad_norm.detach().gt(
-                adapter_max_grad_norm
-            ).float()
-            adapter_info["adapter/real_samples_per_class"] = torch.tensor(
-                min(int(cfg.get("feature_adapter_samples_per_class", 8)), P),
-                device=device,
-                dtype=torch.float32,
-            )
-            adapter_info["adapter/generated_samples_per_class"] = torch.tensor(
-                (
-                    min(
-                        int(
-                            cfg.get(
-                                "feature_adapter_generated_samples_per_class", G
-                            )
-                        ),
-                        G,
-                    )
-                    if adapter_uses_generated
-                    else 0
-                ),
-                device=device,
-                dtype=torch.float32,
-            )
-            adapter_updated = True
-        adapter_info["adapter/update_allowed"] = torch.tensor(
-            float(feature_adapter_update_allowed),
-            device=device,
-            dtype=torch.float32,
-        )
-        adapter_info["adapter/updated"] = torch.tensor(
-            float(adapter_updated),
-            device=device,
-            dtype=torch.float32,
-        )
-    if adapter_updated:
-        update_adapter_ema(
-            feature_adapter_target,
-            feature_adapter,
-            float(cfg.get("feature_adapter_ema_decay", 0.999)),
-        )
-    _prof_mark("after_adapter_update")
+    _prof_mark("after_optimizer")
 
     metrics = {"drift_matching": drift_matching}
     if collect_training_metrics:
@@ -3698,11 +2308,7 @@ def train_step(
                 "cfg_mean": cfg_scales.mean().item(),
             }
         )
-        for name, value in adapter_info.items():
-            metrics[name] = _ddp_mean_scalar(value, device)
         metrics.update(_ddp_mean_scalars(adversarial_info, device))
-        for name, value in feature_gan_info.items():
-            metrics[name] = _ddp_mean_scalar(value, device)
         for stage_name in _STOCHASTIC_FEATURE_STAGES:
             metrics[f"drift_temperature/{stage_name}_multiplier"] = float(
                 feature_temperature_multipliers.get(
@@ -4071,7 +2677,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _validate_raw_temperature_calibration(cfg: dict) -> None:
-    """Fail closed unless a raw DINO/MoCo tau artifact matches this run."""
+    """Validate the original joint calibration artifact for this DINO run."""
     status = str(cfg.get("temperature_calibration_status", "pending")).strip().lower()
     if status == "calibration_capture":
         capture_invariants = {
@@ -4131,7 +2737,7 @@ def _validate_raw_temperature_calibration(cfg: dict) -> None:
     ]
     if failed_production:
         raise RuntimeError(
-            "Raw DINO/MoCo production config changed after calibration: "
+            "Raw DINO production config changed after calibration: "
             + ", ".join(failed_production)
         )
 
@@ -4141,7 +2747,7 @@ def _validate_raw_temperature_calibration(cfg: dict) -> None:
             f"Unexpected production temperature profile: {profile_name!r}"
         )
     role = str(cfg.get("temperature_calibration_role", "")).strip().lower()
-    if role not in {"dino", "moco"}:
+    if role != "dino":
         raise RuntimeError(f"Invalid temperature_calibration_role={role!r}")
     artifact_path = Path(
         str(cfg.get("temperature_calibration_artifact", ""))
@@ -4257,7 +2863,7 @@ def _validate_raw_temperature_calibration(cfg: dict) -> None:
         )
 
     extractor_name = resolve_feature_extractor_name(cfg)
-    expected_extractor = "dino_resnet50" if role == "dino" else "moco_v2_resnet50"
+    expected_extractor = "dino_resnet50"
     if extractor_name != expected_extractor:
         raise RuntimeError(
             f"Calibration role {role} does not match extractor {extractor_name}"
@@ -4268,6 +2874,18 @@ def _validate_raw_temperature_calibration(cfg: dict) -> None:
         raise FileNotFoundError(f"Feature checkpoint missing: {checkpoint}")
     encoder_provenance = (artifact.get("encoder_provenance") or {}).get(role) or {}
     if (
+        "temperature_calibration_inheritance_manifest" in cfg
+        or "temperature_calibration_inheritance_manifest_sha256" in cfg
+    ):
+        from temperature_calibration_inheritance import validate_dino_temperature_inheritance
+
+        validate_dino_temperature_inheritance(cfg, artifact, checkpoint)
+        print(
+            "[raw-tau] verified tuned-DINO weights-only ablation; "
+            "inheriting baseline numeric temperatures without refitting",
+            flush=True,
+        )
+    elif (
         encoder_provenance.get("feature_extractor") != expected_extractor
         or int(encoder_provenance.get("checkpoint_bytes", -1))
         != checkpoint.stat().st_size
@@ -4505,6 +3123,7 @@ def _validate_raw_imagefolder_dataset(dataset, split: str, manifest: dict) -> No
         )
 
 def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch.device) -> None:
+    _validate_dino_only_config(cfg)
     if bool(cfg.get("require_raw_temperature_calibration", False)):
         _validate_raw_temperature_calibration(cfg)
     process_seed = int(cfg.get("seed", 42)) + rank
@@ -4549,83 +3168,22 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     warmup_init_lr = float(cfg.get("warmup_init_lr", 1e-6))
 
     # --- Load frozen feature encoder ---
-    if resolve_feature_extractor_name(cfg) == "mae":
-        # --- Load frozen MAE ---
-        mae_ckpt = cfg.get("mae_checkpoint") or os.environ.get("MAE_CHECKPOINT", "")
-        if not mae_ckpt:
-            if not bool(cfg.get("allow_random_mae", False)):
-                raise ValueError(
-                    "mae_checkpoint is required for generator training. Set it in "
-                    "the config/launcher, or explicitly set allow_random_mae=true "
-                    "for a diagnostic-only run."
-                )
-            print(
-                "[WARNING] mae_checkpoint is not set; using random MAE weights "
-                "because allow_random_mae=true."
-            )
-        mae = load_mae(mae_ckpt, cfg, device)
-        feature_extractor: MAEResNet = mae
-    else:
-        fork_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
-        with torch.random.fork_rng(devices=fork_devices):
-            feature_extractor = load_feature_extractor(cfg, device)
-        mae = feature_extractor  # Preserve existing MAE adapter/eval call sites.
-        if is_main_process(rank):
-            print(f"[feature] extractor={resolve_feature_extractor_name(cfg)} checkpoint={cfg.get('feature_checkpoint')}", flush=True)
+    # Constructing the torchvision feature encoder consumes RNG
+    # ResNets. Preserve the post-generator RNG state so the three causal
+    # comparisons draw the same labels, CFG values, and generator noise.
+    fork_devices = (
+        [device.index if device.index is not None else torch.cuda.current_device()]
+        if device.type == "cuda"
+        else []
+    )
+    with torch.random.fork_rng(devices=fork_devices):
+        feature_extractor = load_feature_extractor(cfg, device)
     if is_main_process(rank):
-        raw_attention = gen_raw.model.blocks[0].attn
         print(
-            "[throughput] "
-            f"level={throughput_opt_level} "
-            f"sdpa={bool(getattr(raw_attention, 'use_sdpa', False))} "
-            f"tf32={bool(torch.backends.cuda.matmul.allow_tf32)} "
-            f"cudnn_benchmark={bool(torch.backends.cudnn.benchmark)} "
-            f"cudnn_benchmark_limit={int(getattr(torch.backends.cudnn, 'benchmark_limit', -1))} "
-            f"gen_remat={bool(getattr(gen_raw.model, 'use_remat', False))} "
-            f"mae_remat={bool(getattr(mae, 'use_remat', False))}",
+            f"[feature] extractor={resolve_feature_extractor_name(cfg)} "
+            f"checkpoint={cfg.get('feature_checkpoint')}",
             flush=True,
         )
-    (
-        feature_adapter,
-        feature_adapter_target,
-        feature_adapter_optimizer,
-    ) = build_feature_adapter_system(mae, cfg, device, world_size)
-    if (
-        feature_adapter is not None
-        and str(cfg.get("feature_adapter_objective", "supcon")).lower().strip()
-        == "raw_drift_snr"
-    ):
-        raw_adapter = (
-            feature_adapter.module
-            if hasattr(feature_adapter, "module")
-            else feature_adapter
-        )
-        raw_group_weights = _resolve_feature_loss_group_weights(cfg)
-        raw_default_weight = float(raw_group_weights.get("default", 1.0))
-        inactive_adapter_stages = [
-            stage
-            for stage in raw_adapter.stages
-            if float(raw_group_weights.get(stage, raw_default_weight)) <= 0.0
-        ]
-        if inactive_adapter_stages:
-            raise ValueError(
-                "raw_drift_snr requires a positive feature-loss weight for "
-                f"every adapter stage; inactive={inactive_adapter_stages}"
-            )
-        if bool(cfg.get("stochastic_feature_stage_loss", False)):
-            raise ValueError(
-                "raw_drift_snr cannot use stochastic_feature_stage_loss with "
-                "DDP static_graph adapters"
-            )
-        if float(cfg.get("feature_adapter_reg_lambda", 0.0)) != 0.0:
-            raise ValueError(
-                "raw_drift_snr currently requires feature_adapter_reg_lambda=0"
-            )
-    (
-        feature_discriminator,
-        feature_discriminator_optimizer,
-    ) = build_feature_discriminator_system(mae, cfg, device, world_size)
-
     adversarial_system = build_adversarial_system(cfg, device)
     if adversarial_system is not None and is_main_process(rank):
         print(
@@ -4636,17 +3194,12 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
 
     # --- Data ---
     imagenet_path = cfg.get("imagenet_path") or os.environ.get("IMAGENET_PATH", "")
-    cache_path    = cfg.get("cache_path") or os.environ.get("IMAGENET_CACHE_PATH", "")
     use_latent    = bool(cfg.get("use_latent", True))
     use_cache     = bool(cfg.get("use_cache", True))
     use_aug       = bool(cfg.get("use_aug", False))
     resolution    = int(cfg.get("resolution", 256))
     batch_size    = int(cfg.get("batch_size", 128))
     eval_bsz      = int(cfg.get("eval_batch_size", 256))
-    cache_format  = str(cfg.get("cache_format", "pt_imagefolder"))
-    eval_enabled  = bool(cfg.get("eval_enabled", True))
-    eval_split    = str(cfg.get("eval_split", "val"))
-
     memory_bank_storage_mode = str(
         cfg.get("memory_bank_storage_mode", "raw")
     ).strip().lower()
@@ -4666,6 +3219,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     eval_prefetch_factor = int(
         cfg.get("eval_prefetch_factor", prefetch_factor)
     )
+
 
     raw_imagenet_manifest = None
     if bool(cfg.get("require_complete_raw_imagenet", False)):
@@ -4701,55 +3255,57 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         use_aug=use_aug,
         use_latent=use_latent,
         use_cache=use_cache,
-        cache_path=cache_path,
-        cache_format=cache_format,
         num_workers=int(cfg.get("num_workers", 8)),
-        pin_memory=bool(cfg.get("pin_memory", True)),
         prefetch_factor=prefetch_factor,
+        pin_memory=bool(cfg.get("pin_memory", True)),
         persistent_workers=bool(cfg.get("persistent_workers", True)),
         distributed=(world_size > 1),
         rank=rank,
         world_size=world_size,
-        latent_device=device,
         return_uint8=raw_train_uint8,
         raw_image_io_concurrency=raw_image_io_concurrency,
         raw_image_io_semaphore=raw_image_io_semaphore,
     )
     eval_loader = None
     eval_postprocess_fn = None
-    if is_main_process(rank) and eval_enabled:
+    if is_main_process(rank):
         # Eval is only run on rank 0 below. Build a non-sharded val loader so
         # intermediate FID/IS uses the full validation distribution.
         eval_loader, _, eval_postprocess_fn = create_imagenet_split(
             imagenet_path=imagenet_path,
             resolution=resolution,
             batch_size=eval_bsz,
-            split=eval_split,
+            split="val",
             use_aug=False,
             use_latent=use_latent,
             use_cache=use_cache,
-            cache_path=cache_path,
-            cache_format=cache_format,
-            shuffle=False,
-            drop_last=False,
-            random_flip=False,
             num_workers=int(cfg.get("num_workers", 8)),
-            pin_memory=bool(cfg.get("pin_memory", True)),
             prefetch_factor=eval_prefetch_factor,
-            persistent_workers=bool(cfg.get("eval_persistent_workers", True)),
+            pin_memory=bool(cfg.get("pin_memory", True)),
+            persistent_workers=bool(cfg.get("eval_persistent_workers", False)),
             distributed=False,
             rank=0,
             world_size=1,
-            latent_device=device,
             raw_image_io_concurrency=raw_image_io_concurrency,
             raw_image_io_semaphore=raw_image_io_semaphore,
+        )
+        print(
+            "[data-loader] "
+            f"train_workers={int(cfg.get('num_workers', 8))} "
+            f"train_prefetch={prefetch_factor} "
+            f"train_persistent={bool(cfg.get('persistent_workers', True))} "
+            f"raw_train_uint8={raw_train_uint8}; "
+            f"raw_image_io_concurrency_per_rank={raw_image_io_concurrency}; "
+            f"eval_prefetch={eval_prefetch_factor} "
+            f"eval_persistent={bool(cfg.get('eval_persistent_workers', False))}",
+            flush=True,
         )
 
     if raw_imagenet_manifest is not None:
         _validate_raw_imagefolder_dataset(
             train_loader.dataset, "train", raw_imagenet_manifest
         )
-        if is_main_process(rank) and eval_enabled:
+        if is_main_process(rank):
             if eval_loader is None:
                 raise RuntimeError("Raw ImageNet validation loader was not constructed")
             _validate_raw_imagefolder_dataset(
@@ -4832,28 +3388,6 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     push_at_resume = int(cfg.get("push_at_resume", 3000))
     pos_per_sample = int(cfg.get("pos_per_sample", 64))
     neg_per_sample = int(cfg.get("neg_per_sample", 32))
-    adapter_requires_distinct_real = bool(
-        feature_adapter is not None
-        and str(cfg.get("feature_adapter_objective", "supcon")).lower().strip()
-        in (
-            "real_anchor_multipos_infonce",
-            "gen_real_multipos_infonce",
-            "raw_drift_snr",
-        )
-        and cfg.get("feature_adapter_require_distinct_real", False)
-    )
-    adapter_distinct_real_count = int(
-        cfg.get("feature_adapter_samples_per_class", 8)
-    )
-    if (
-        adapter_requires_distinct_real
-        and positive_bank_size < adapter_distinct_real_count
-    ):
-        raise ValueError(
-            "positive_bank_size must be at least feature_adapter_samples_per_class "
-            "when distinct real positives are required"
-        )
-    adapter_real_bank_ready = not adapter_requires_distinct_real
 
     # --- Mix-alpha tracker ---
     # Always created so per-step α1/β1 are logged for every config (rev-drift,
@@ -4973,18 +3507,6 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             "raw/global features=1"
         )
 
-        active_stages = cfg.get("activation_kwargs", {}).get(
-            "active_stages", None
-        )
-        active_stage_summary = (
-            "all" if active_stages is None else ",".join(active_stages)
-        )
-        print(
-            "[mae-activations] "
-            f"active_stages={active_stage_summary}; "
-            "earlier encoder stages still execute when required by later stages"
-        )
-
         feature_loss_profile = str(cfg.get("feature_loss_profile", "all"))
         feature_group_weights = _resolve_feature_loss_group_weights(cfg)
         feature_weight_summary = " ".join(
@@ -4994,108 +3516,13 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         print(
             "[feature-loss] "
             f"profile={feature_loss_profile} {feature_weight_summary}; "
-            f"mass_normalize={str(bool(cfg.get('feature_loss_group_normalize', False))).lower()} "
-            "normalization_reference_count="
-            f"{cfg.get('feature_loss_normalization_reference_count', 'active')}"
+            f"mass_normalize={str(bool(cfg.get('feature_loss_group_normalize', False))).lower()}"
         )
-        if feature_adapter is None:
-            print("[feature-adapter] disabled (frozen MAE metric)")
-        else:
-            raw_adapter = (
-                feature_adapter.module
-                if hasattr(feature_adapter, "module")
-                else feature_adapter
-            )
-            trainable_parameters = sum(
-                parameter.numel() for parameter in raw_adapter.parameters()
-            )
-            print(
-                "[feature-adapter] enabled "
-                f"objective={cfg.get('feature_adapter_objective', 'supcon')} "
-                f"stages={','.join(raw_adapter.stages)} "
-                f"bottleneck={int(cfg.get('feature_adapter_bottleneck', 64))} "
-                f"real_samples_per_class={int(cfg.get('feature_adapter_samples_per_class', 8))} "
-                "generated_samples_per_class="
-                f"{int(cfg.get('feature_adapter_generated_samples_per_class', cfg.get('gen_per_label', 64)))} "
-                "generated_anchor_weight="
-                f"{float(cfg.get('feature_adapter_generated_anchor_weight', 1.0)):g} "
-                "real_anchor_weight="
-                f"{float(cfg.get('feature_adapter_real_anchor_weight', 0.0)):g} "
-                "contrastive_scope="
-                f"{'global' if bool(cfg.get('feature_adapter_global_negatives', False)) else 'rank_local'} "
-                "require_distinct_real="
-                f"{str(adapter_requires_distinct_real).lower()} "
-                f"lr={float(cfg.get('feature_adapter_lr', 1.0e-4)):g} "
-                f"target_ema={float(cfg.get('feature_adapter_ema_decay', 0.999)):g} "
-                "direct_adapted_features="
-                f"{str(raw_adapter.objective in ('real_anchor_multipos_infonce', 'gen_real_multipos_infonce', 'raw_drift_snr')).lower()} "
-                f"parameters={trainable_parameters}"
-            )
-            if raw_adapter.objective == "raw_drift_snr":
-                print(
-                    "[feature-adapter-raw-drift] "
-                    "field=pre_fnorm_standardized "
-                    f"query={int(cfg.get('feature_adapter_drift_query_count', 8))} "
-                    f"bank_a=bank_b={int(cfg.get('feature_adapter_drift_bank_count', 12))} "
-                    "negative_distribution=generated "
-                    "real_cfg_negatives=excluded "
-                    f"signal_weight={float(cfg.get('feature_adapter_loss_weight', 1.0)):g} "
-                    "consistency_weight="
-                    f"{float(cfg.get('feature_adapter_drift_consistency_weight', 1.0)):g} "
-                    f"variance_epsilon={float(cfg.get('feature_adapter_drift_variance_epsilon', 1.0e-8)):g} "
-                    f"update_freq={int(cfg.get('feature_adapter_update_freq', 1))} "
-                    "shared_scale=per_online_feature target_scale=per_ema_feature",
-                    flush=True,
-                )
-        if feature_discriminator is None:
-            print("[feature-gan] disabled")
-        else:
-            raw_discriminator = (
-                feature_discriminator.module
-                if hasattr(feature_discriminator, "module")
-                else feature_discriminator
-            )
-            discriminator_parameters = sum(
-                parameter.numel() for parameter in raw_discriminator.parameters()
-            )
-            print(
-                "[feature-gan] enabled "
-                f"stages={','.join(raw_discriminator.stages)} "
-                f"target_gradient_ratio={float(cfg.get('feature_gan_gradient_ratio', 0.1)):g} "
-                f"warmup_steps={int(cfg.get('feature_gan_warmup_steps', 1000))} "
-                f"calibration_freq={int(cfg.get('feature_gan_gradient_calibration_freq', 10))} "
-                f"lr={float(cfg.get('feature_gan_lr', 2.0e-4)):g} "
-                f"parameters={discriminator_parameters}"
-            )
 
     generated_epoch_size = len(train_loader.dataset)
     generated_per_step = (
         batch_size * world_size * int(cfg.get("gen_per_label", 64))
     )
-    adapter_freeze_step: Optional[int] = None
-    adapter_freeze_epochs_value = cfg.get(
-        "feature_adapter_freeze_after_generated_epochs", None
-    )
-    if feature_adapter is not None and adapter_freeze_epochs_value is not None:
-        adapter_freeze_epochs = float(adapter_freeze_epochs_value)
-        if not math.isfinite(adapter_freeze_epochs) or adapter_freeze_epochs <= 0.0:
-            raise ValueError(
-                "feature_adapter_freeze_after_generated_epochs must be finite "
-                "and positive"
-            )
-        adapter_freeze_step = _steps_for_generated_epochs(
-            dataset_size=generated_epoch_size,
-            generated_per_step=generated_per_step,
-            epochs=adapter_freeze_epochs,
-        )
-        if is_main_process(rank):
-            print(
-                "[feature-adapter] late freeze "
-                f"after_generated_epochs={adapter_freeze_epochs:g} "
-                f"freeze_step={adapter_freeze_step}; generator keeps the frozen "
-                "EMA metric thereafter",
-                flush=True,
-            )
     historical_replay_enabled = bool(cfg.get("historical_gen_replay", False))
     historical_replay_ratio = float(
         cfg.get("historical_gen_replay_ratio", 0.0)
@@ -5114,9 +3541,6 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         cfg.get("historical_gen_replay_source", "frozen_snapshot")
     ).lower().strip()
     historical_replay_bank: Optional[ArrayMemoryBank] = None
-    rolling_capture_bank: Optional[ArrayMemoryBank] = None
-    rolling_loaded_target_epoch: Optional[int] = None
-    rolling_replay_lag_epochs = 0
     historical_replay_start_step = 0
     historical_replay_path = (
         Path(workdir) / f"historical_gen_replay_rank{rank:02d}.npz"
@@ -5143,38 +3567,15 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             raise ValueError(
                 "historical_gen_replay_bank_count cannot exceed gen_per_label"
             )
-        if historical_replay_source not in (
-            "frozen_snapshot",
-            "fresh_current",
-            "rolling_lag",
-        ):
+        if historical_replay_source not in ("frozen_snapshot", "fresh_current"):
             raise ValueError(
-                "historical_gen_replay_source must be frozen_snapshot, "
-                "fresh_current, or rolling_lag; "
-                f"got {historical_replay_source!r}"
+                "historical_gen_replay_source must be frozen_snapshot or "
+                f"fresh_current, got {historical_replay_source!r}"
             )
         if not math.isfinite(historical_replay_start_epochs) or historical_replay_start_epochs <= 0.0:
             raise ValueError(
                 "historical_gen_replay_start_generated_epochs must be finite and positive"
             )
-        if historical_replay_source == "rolling_lag":
-            rolling_lag_value = float(
-                cfg.get(
-                    "historical_gen_replay_lag_generated_epochs",
-                    historical_replay_start_epochs,
-                )
-            )
-            if (
-                not math.isfinite(rolling_lag_value)
-                or rolling_lag_value <= 0.0
-                or not rolling_lag_value.is_integer()
-            ):
-                raise ValueError(
-                    "historical_gen_replay_lag_generated_epochs must be a "
-                    "positive integer for rolling_lag"
-                )
-            rolling_replay_lag_epochs = int(rolling_lag_value)
-            historical_replay_start_epochs = float(rolling_replay_lag_epochs)
         storage_dtype_name = str(
             cfg.get("historical_gen_replay_storage_dtype", "float16")
         ).lower().strip()
@@ -5194,24 +3595,13 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 max_size=historical_replay_bank_count,
                 dtype=storage_dtypes[storage_dtype_name],
             )
-        elif historical_replay_source == "rolling_lag":
-            rolling_capture_bank = ArrayMemoryBank(
-                num_classes=int(cfg.get("num_classes", 1000)),
-                max_size=historical_replay_bank_count,
-                dtype=storage_dtypes[storage_dtype_name],
-            )
         if is_main_process(rank):
-            snapshot_summary = (
-                f"rolling_lag_epochs={rolling_replay_lag_epochs}"
-                if historical_replay_source == "rolling_lag"
-                else f"snapshot_epoch={historical_replay_start_epochs:g}"
-            )
             print(
                 "[historical-replay] enabled "
                 f"source={historical_replay_source} "
                 f"ratio={historical_replay_ratio:g} count={historical_replay_count} "
                 f"bank_count={historical_replay_bank_count} "
-                f"{snapshot_summary} "
+                f"snapshot_epoch={historical_replay_start_epochs:g} "
                 f"snapshot_step={historical_replay_start_step} "
                 f"storage_dtype={storage_dtype_name}; "
                 "current/replay generated mass is preserved",
@@ -5279,11 +3669,6 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         optimizer,
         device,
         mix_alpha_tracker=mix_alpha_tracker,
-        feature_adapter=feature_adapter,
-        feature_adapter_target=feature_adapter_target,
-        feature_adapter_optimizer=feature_adapter_optimizer,
-        feature_discriminator=feature_discriminator,
-        feature_discriminator_optimizer=feature_discriminator_optimizer,
         adversarial_system=adversarial_system,
     )
     if is_main_process(rank):
@@ -5304,53 +3689,6 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 f"[historical-replay] restored frozen snapshot from {historical_replay_path}",
                 flush=True,
             )
-    if rolling_capture_bank is not None and start_step > 0:
-        resumed_at_epoch_boundary = (
-            _rolling_snapshot_epoch_after_step(
-                step=start_step - 1,
-                generated_per_step=generated_per_step,
-                dataset_size=generated_epoch_size,
-            )
-            is not None
-        )
-        if not resumed_at_epoch_boundary:
-            rolling_capture_path = _rolling_replay_capture_path(
-                workdir,
-                rank=rank,
-                step=start_step,
-            )
-            if not rolling_capture_path.is_file():
-                raise FileNotFoundError(
-                    "Cannot resume rolling historical replay without its "
-                    f"step-matched capture state: {rolling_capture_path}"
-                )
-            capture_epoch = _generated_epoch_index(
-                completed_steps=start_step,
-                generated_per_step=generated_per_step,
-                dataset_size=generated_epoch_size,
-            )
-            rolling_capture_bank.load_npz(
-                rolling_capture_path,
-                expected_metadata=_rolling_replay_metadata(
-                    kind="rolling_capture",
-                    rank=rank,
-                    world_size=world_size,
-                    num_classes=int(cfg.get("num_classes", 1000)),
-                    bank_count=historical_replay_bank_count,
-                    storage_dtype=storage_dtype_name,
-                    lag_epochs=rolling_replay_lag_epochs,
-                    dataset_size=generated_epoch_size,
-                    generated_per_step=generated_per_step,
-                    epoch=capture_epoch,
-                    step=start_step,
-                ),
-            )
-            if is_main_process(rank):
-                print(
-                    "[historical-replay] restored rolling capture state from "
-                    f"{rolling_capture_path}",
-                    flush=True,
-                )
 
     total_steps  = int(cfg.get("total_steps", 200000))
     save_per     = int(cfg.get("save_per_step", 2000))
@@ -5376,7 +3714,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
 
     # --- Optional step-0 eval (baseline before any training) ---
     eval_at_start = bool(cfg.get("eval_at_start", False))
-    if start_step == 0 and eval_enabled and eval_at_start:
+    if start_step == 0 and eval_at_start:
         if world_size > 1:
             dist.barrier()
         if is_main_process(rank):
@@ -5396,14 +3734,14 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                     # have ample headroom for the temporary eval models.
                     if world_size == 1:
                         generator.to("cpu")
-                    mae.to("cpu")
-                    if feature_discriminator is not None and world_size == 1:
-                        feature_discriminator.to("cpu")
+                    feature_extractor.to("cpu")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     ema.shadow.to(device)
                     ema.shadow.eval()
-                    log_eval: Dict[str, float] = {}
+                    # Keep an explicit generated-epoch axis beside the W&B
+                    # step so baseline/10-epoch evaluations are unambiguous.
+                    log_eval: Dict[str, float] = {"eval/generated_epochs": 0.0}
                     for eval_cfg_scale in cfg_list[:3]:
                         eval_stats = eval_fid_is(
                             ema.shadow, eval_postprocess_fn, eval_loader, device,
@@ -5440,18 +3778,16 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     ema.shadow.to(device)
-                    mae.to(device)
+                    feature_extractor.to(device)
                     if world_size == 1:
                         generator.to(device)
-                    if feature_discriminator is not None and world_size == 1:
-                        feature_discriminator.to(device)
-                    for bank in pos_banks:
-                        if isinstance(bank, CompressedPixelMemoryBank):
-                            bank.resume_codec_workers()
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.synchronize(device)
                         torch.cuda.empty_cache()
+                    for bank in pos_banks:
+                        if isinstance(bank, CompressedPixelMemoryBank):
+                            bank.resume_codec_workers()
         if world_size > 1:
             dist.barrier()
         if torch.cuda.is_available() and device.type == "cuda":
@@ -5471,6 +3807,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     )
     start_time_all = time.time()
 
+
     step_limit = int(cfg.get("train_max_step_exclusive", 0) or 0)
     for step in pbar:
         if step_limit > 0 and step >= step_limit:
@@ -5478,6 +3815,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 print(f"[train] stopping early: train_max_step_exclusive={step_limit}")
             break
         logger.set_step(step)
+        iteration_t0 = time.time()
 
         # LR update
         lr = get_lr(step, warmup, base_lr, init_lr=warmup_init_lr)
@@ -5521,22 +3859,6 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             if n_pushed >= push_goal:
                 break
 
-        if not adapter_real_bank_ready:
-            local_adapter_bank_ready = all(
-                bank.is_ready(adapter_distinct_real_count) for bank in pos_banks
-            )
-            ready_tensor = torch.tensor(
-                int(local_adapter_bank_ready), device=device, dtype=torch.int32
-            )
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(ready_tensor, op=dist.ReduceOp.MIN)
-            adapter_real_bank_ready = bool(ready_tensor.item())
-            if adapter_real_bank_ready and is_main_process(rank):
-                print(
-                    "[feature-adapter] distinct-real bank ready; enabling updates "
-                    f"with {adapter_distinct_real_count} unique entries per class",
-                    flush=True,
-                )
 
         # --- Sample batch labels from the latest pushed batch, matching official JAX. ---
         labels_parts: List[np.ndarray] = []
@@ -5558,7 +3880,11 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             labels_sel = labels_pool[rng_idx]
             labels_parts.append(labels_sel)
             pos_parts.append(
-                pos_banks[bank_idx].sample(labels_sel, n_samples=pos_per_sample, device=device)
+                pos_banks[bank_idx].sample(
+                    labels_sel,
+                    n_samples=pos_per_sample,
+                    device=device,
+                )
             )
             neg_parts.append(
                 neg_banks[bank_idx].sample(
@@ -5579,83 +3905,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         pos_smp = torch.cat(pos_parts, dim=0)
         neg_smp = torch.cat(neg_parts, dim=0)
         historical_smp = None
-        rolling_current_epoch: Optional[int] = None
-        rolling_target_epoch: Optional[int] = None
-        if rolling_capture_bank is not None:
-            rolling_current_epoch = _generated_epoch_index(
-                completed_steps=step,
-                generated_per_step=generated_per_step,
-                dataset_size=generated_epoch_size,
-            )
-            rolling_target_epoch = _rolling_replay_target_epoch(
-                completed_steps=step,
-                generated_per_step=generated_per_step,
-                dataset_size=generated_epoch_size,
-                lag_epochs=rolling_replay_lag_epochs,
-            )
-            if (
-                rolling_target_epoch is not None
-                and rolling_target_epoch != rolling_loaded_target_epoch
-            ):
-                target_path = _rolling_replay_snapshot_path(
-                    workdir,
-                    rank=rank,
-                    epoch=rolling_target_epoch,
-                )
-                if not target_path.is_file():
-                    raise FileNotFoundError(
-                        "Rolling historical replay target is missing: "
-                        f"current_epoch={rolling_current_epoch} "
-                        f"target_epoch={rolling_target_epoch} path={target_path}"
-                    )
-                target_bank = ArrayMemoryBank(
-                    num_classes=int(cfg.get("num_classes", 1000)),
-                    max_size=historical_replay_bank_count,
-                    dtype=storage_dtypes[storage_dtype_name],
-                )
-                target_bank.load_npz(
-                    target_path,
-                    expected_metadata=_rolling_replay_metadata(
-                        kind="rolling_epoch_snapshot",
-                        rank=rank,
-                        world_size=world_size,
-                        num_classes=int(cfg.get("num_classes", 1000)),
-                        bank_count=historical_replay_bank_count,
-                        storage_dtype=storage_dtype_name,
-                        lag_epochs=rolling_replay_lag_epochs,
-                        dataset_size=generated_epoch_size,
-                        generated_per_step=generated_per_step,
-                        epoch=rolling_target_epoch,
-                    ),
-                )
-                if not target_bank.is_ready(historical_replay_count):
-                    raise RuntimeError(
-                        "Rolling historical replay snapshot is incomplete: "
-                        f"{target_path}"
-                    )
-                historical_replay_bank = target_bank
-                rolling_loaded_target_epoch = rolling_target_epoch
-                if is_main_process(rank):
-                    print(
-                        "[historical-replay] rolling target "
-                        f"current_epoch={rolling_current_epoch} "
-                        f"target_epoch={rolling_target_epoch} path={target_path}",
-                        flush=True,
-                    )
-        historical_bank_active = (
-            historical_replay_bank is not None
-            and (
-                (
-                    historical_replay_source == "rolling_lag"
-                    and rolling_target_epoch is not None
-                )
-                or (
-                    historical_replay_source == "frozen_snapshot"
-                    and step >= historical_replay_start_step
-                )
-            )
-        )
-        if historical_bank_active:
+        if historical_replay_bank is not None and step >= historical_replay_start_step:
             if not historical_replay_bank.is_ready(historical_replay_count):
                 raise RuntimeError(
                     "Historical replay reached its activation step before all class "
@@ -5696,30 +3946,12 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             generator, feature_extractor, optimizer, labels_t,
             pos_smp, neg_smp, device, step, cfg,
             mix_alpha_tracker=mix_alpha_tracker,
-            feature_adapter=feature_adapter,
-            feature_adapter_target=feature_adapter_target,
-            feature_adapter_optimizer=feature_adapter_optimizer,
-            feature_adapter_update_allowed=(
-                adapter_real_bank_ready
-                and (adapter_freeze_step is None or step < adapter_freeze_step)
-            ),
-            feature_discriminator=feature_discriminator,
-            feature_discriminator_optimizer=feature_discriminator_optimizer,
-            adversarial_system=adversarial_system,
             historical_samples=historical_smp,
             fresh_historical_count=fresh_historical_count,
+            adversarial_system=adversarial_system,
         )
         ema.update(gen_raw)
-        capture_bank: Optional[ArrayMemoryBank] = None
-        if (
-            historical_replay_source == "frozen_snapshot"
-            and historical_replay_bank is not None
-            and step < historical_replay_start_step
-        ):
-            capture_bank = historical_replay_bank
-        elif rolling_capture_bank is not None:
-            capture_bank = rolling_capture_bank
-        if capture_bank is not None:
+        if historical_replay_bank is not None and step < historical_replay_start_step:
             local_label_count = int(labels_t.shape[0])
             generated = step_extras["gen_samples_detached"].reshape(
                 local_label_count,
@@ -5727,7 +3959,8 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 *step_extras["gen_samples_detached"].shape[1:],
             )
             # The final H candidates for each selected class replace that
-            # class's capture entries, matching the frozen-snapshot policy.
+            # class's snapshot, so the frozen bank represents the generator
+            # immediately before the configured epoch boundary.
             snapshot_samples = generated[:, -historical_replay_bank_count:].reshape(
                 local_label_count * historical_replay_bank_count,
                 *generated.shape[2:],
@@ -5735,23 +3968,20 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             snapshot_labels = labels_t[:, None].expand(
                 -1, historical_replay_bank_count
             ).reshape(-1)
-            capture_bank.add(
+            historical_replay_bank.add(
                 snapshot_samples.detach().to(device="cpu", dtype=torch.float32),
                 snapshot_labels,
             )
-            if (
-                historical_replay_source == "frozen_snapshot"
-                and step + 1 == historical_replay_start_step
-            ):
-                if not capture_bank.is_ready(historical_replay_bank_count):
+            if step + 1 == historical_replay_start_step:
+                if not historical_replay_bank.is_ready(historical_replay_bank_count):
                     missing_classes = np.flatnonzero(
-                        capture_bank.count < historical_replay_bank_count
+                        historical_replay_bank.count < historical_replay_bank_count
                     )
                     raise RuntimeError(
                         "Historical replay snapshot warmup missed classes: "
                         f"{missing_classes[:20].tolist()}"
                     )
-                capture_bank.save_npz(historical_replay_path)
+                historical_replay_bank.save_npz(historical_replay_path)
                 if is_main_process(rank):
                     print(
                         "[historical-replay] froze epoch "
@@ -5759,43 +3989,6 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                         f"{historical_replay_path}",
                         flush=True,
                     )
-            elif historical_replay_source == "rolling_lag":
-                snapshot_epoch = _rolling_snapshot_epoch_after_step(
-                    step=step,
-                    generated_per_step=generated_per_step,
-                    dataset_size=generated_epoch_size,
-                )
-                if snapshot_epoch is not None:
-                    snapshot_path = _rolling_replay_snapshot_path(
-                        workdir,
-                        rank=rank,
-                        epoch=snapshot_epoch,
-                    )
-                    rolling_capture_bank = (
-                        _save_rolling_epoch_snapshot_and_reset(
-                            capture_bank,
-                            snapshot_path,
-                            metadata=_rolling_replay_metadata(
-                                kind="rolling_epoch_snapshot",
-                                rank=rank,
-                                world_size=world_size,
-                                num_classes=int(cfg.get("num_classes", 1000)),
-                                bank_count=historical_replay_bank_count,
-                                storage_dtype=storage_dtype_name,
-                                lag_epochs=rolling_replay_lag_epochs,
-                                dataset_size=generated_epoch_size,
-                                generated_per_step=generated_per_step,
-                                epoch=snapshot_epoch,
-                            ),
-                            min_per_class=historical_replay_bank_count,
-                        )
-                    )
-                    if is_main_process(rank):
-                        print(
-                            "[historical-replay] saved rolling snapshot "
-                            f"epoch={snapshot_epoch} path={snapshot_path}",
-                            flush=True,
-                        )
         if benchmark_profile and device.type == "cuda":
             torch.cuda.synchronize(device)
             metrics["profile/peak_allocated_gib"] = (
@@ -5808,23 +4001,42 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
 
         # --- Logging ---
         if step % log_every == 0 and is_main_process(rank):
+            compressed_pos_banks = [
+                bank
+                for bank in pos_banks
+                if isinstance(bank, CompressedPixelMemoryBank)
+            ]
+            if compressed_pos_banks:
+                compressed_bytes = sum(
+                    bank.payload_bytes for bank in compressed_pos_banks
+                )
+                raw_bytes = sum(
+                    bank.raw_equivalent_bytes for bank in compressed_pos_banks
+                )
+                metrics["bank/positive_payload_gib_rank0"] = (
+                    compressed_bytes / (1024 ** 3)
+                )
+                metrics["bank/positive_raw_equivalent_gib_rank0"] = (
+                    raw_bytes / (1024 ** 3)
+                )
+                metrics["bank/positive_compression_ratio_rank0"] = (
+                    raw_bytes / max(1, compressed_bytes)
+                )
+                metrics["bank/positive_codec_add_seconds_rank0"] = sum(
+                    bank.last_add_seconds for bank in compressed_pos_banks
+                )
+                metrics["bank/positive_codec_sample_seconds_rank0"] = sum(
+                    bank.last_sample_seconds for bank in compressed_pos_banks
+                )
             metrics["lr"]             = lr
             metrics["time/step"]      = step_time
+            metrics["time/iteration"] = time.time() - iteration_t0
             metrics["time/per_step"]  = (time.time() - start_time_all) / (step - start_step + 1)
             metrics["kimg"]           = (step - start_step + 1) * batch_size * world_size / 1000.0
             metrics["generated_kimg"] = (step + 1) * generated_per_step / 1000.0
             metrics["generated_epochs"] = (
                 (step + 1) * generated_per_step / generated_epoch_size
             )
-            if rolling_current_epoch is not None:
-                metrics["historical_replay/current_epoch"] = float(
-                    rolling_current_epoch
-                )
-                metrics["historical_replay/target_epoch"] = float(
-                    rolling_target_epoch
-                    if rolling_target_epoch is not None
-                    else -1
-                )
             logger.log(metrics)
 
         # --- Checkpoint ---
@@ -5838,39 +4050,6 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         else:
             save_due = (step + 1) % save_per == 0
         if save_due or (step + 1) == total_steps:
-            if (
-                rolling_capture_bank is not None
-                and rolling_capture_bank.bank is not None
-            ):
-                capture_step = step + 1
-                capture_epoch = _generated_epoch_index(
-                    completed_steps=capture_step,
-                    generated_per_step=generated_per_step,
-                    dataset_size=generated_epoch_size,
-                )
-                capture_path = _rolling_replay_capture_path(
-                    workdir,
-                    rank=rank,
-                    step=capture_step,
-                )
-                rolling_capture_bank.save_npz(
-                    capture_path,
-                    metadata=_rolling_replay_metadata(
-                        kind="rolling_capture",
-                        rank=rank,
-                        world_size=world_size,
-                        num_classes=int(cfg.get("num_classes", 1000)),
-                        bank_count=historical_replay_bank_count,
-                        storage_dtype=storage_dtype_name,
-                        lag_epochs=rolling_replay_lag_epochs,
-                        dataset_size=generated_epoch_size,
-                        generated_per_step=generated_per_step,
-                        epoch=capture_epoch,
-                        step=capture_step,
-                    ),
-                )
-            if rolling_capture_bank is not None and world_size > 1:
-                dist.barrier()
             if is_main_process(rank):
                 save_checkpoint(
                     workdir,
@@ -5882,15 +4061,8 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                     keep_last,
                     keep_every,
                     mix_alpha_tracker=mix_alpha_tracker,
-                    feature_adapter=feature_adapter,
-                    feature_adapter_target=feature_adapter_target,
-                    feature_adapter_optimizer=feature_adapter_optimizer,
-                    feature_discriminator=feature_discriminator,
-                    feature_discriminator_optimizer=feature_discriminator_optimizer,
                     adversarial_system=adversarial_system,
                 )
-            if rolling_capture_bank is not None and world_size > 1:
-                dist.barrier()
 
         # --- FID / IS evaluation ---
         if eval_per_generated_epochs > 0.0:
@@ -5902,7 +4074,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             )
         else:
             eval_due = (step + 1) % eval_per == 0
-        if eval_enabled and (eval_due or (step + 1) == total_steps):
+        if eval_due or (step + 1) == total_steps:
             # Barrier: ensure all ranks finish the current training step before
             # rank 0 starts eval. Without this, other ranks proceed to the next
             # train_step (which triggers a DDP all_reduce) while rank 0 is still
@@ -5923,14 +4095,17 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                     try:
                         if world_size == 1:
                             generator.to("cpu")
-                        mae.to("cpu")
-                        if feature_discriminator is not None and world_size == 1:
-                            feature_discriminator.to("cpu")
+                        feature_extractor.to("cpu")
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                         ema.shadow.to(device)
                         ema.shadow.eval()
-                        log_eval: Dict[str, float] = {}
+                        log_eval: Dict[str, float] = {
+                            "eval/generated_epochs": (
+                                (step + 1) * generated_per_step
+                                / generated_epoch_size
+                            )
+                        }
                         for eval_cfg_scale in cfg_list[:3]:  # limit to first 3 during training
                             eval_stats = eval_fid_is(
                                 ema.shadow, eval_postprocess_fn, eval_loader, device,
@@ -5966,15 +4141,13 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                        ema.shadow.to(device)
-                        mae.to(device)
-                        if world_size == 1:
-                            generator.to(device)
-                        if feature_discriminator is not None and world_size == 1:
-                            feature_discriminator.to(device)
                         for bank in pos_banks:
                             if isinstance(bank, CompressedPixelMemoryBank):
                                 bank.resume_codec_workers()
+                        ema.shadow.to(device)
+                        feature_extractor.to(device)
+                        if world_size == 1:
+                            generator.to(device)
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
@@ -5997,9 +4170,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ImageNet generator training (PyTorch)")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file.")
     parser.add_argument("--workdir", type=str, default="runs/gen", help="Working directory for checkpoints and logs.")
-    parser.add_argument("--mae_checkpoint", type=str, default="", help="Override MAE checkpoint path.")
-    parser.add_argument("--feature_checkpoint", type=str, default="", help="Override frozen DINO/MoCo checkpoint path.")
-    parser.add_argument("--feature_extractor", type=str, default="", help="Override frozen feature encoder.")
+    parser.add_argument(
+        "--feature_extractor",
+        type=str,
+        default="",
+        help="Override frozen DINO encoder alias: dino, dino_r50, or dino_resnet50.",
+    )
+    parser.add_argument(
+        "--feature_checkpoint",
+        type=str,
+        default="",
+        help="Override the selected frozen encoder checkpoint path.",
+    )
     parser.add_argument(
         "--seed",
         type=int,
@@ -6013,13 +4195,18 @@ def main() -> None:
         help="If >0, stop before this global step index (debug / smoke). 0 = run full total_steps from config.",
     )
     parser.add_argument(
+        "--skip_eval_at_start",
+        action="store_true",
+        help="Skip only the step-0 evaluation (useful for launch smoke tests).",
+    )
+    parser.add_argument(
         "--throughput_opt_level",
         type=int,
         default=-1,
         choices=(0, 1, 2, 3, 4),
         help=(
             "Benchmark/runtime stack: 0=baseline, 1=diagnostic gating, "
-            "2=+fused MAE stats, 3=+DDP/optimizer/EMA fast paths, "
+            "2=+fused feature stats, 3=+DDP/optimizer/EMA fast paths, "
             "4=+packed reverse f-norm reductions/runtime fast paths."
         ),
     )
@@ -6034,7 +4221,7 @@ def main() -> None:
         default=0,
         choices=(0, 1, 2, 3, 4),
         help=(
-            "Override stochastic MAE stage-loss sampling: 1-4 enables the "
+            "Override stochastic feature stage-loss sampling: 1-4 enables the "
             "sampler with that many stages; 0 keeps the YAML settings."
         ),
     )
@@ -6147,6 +4334,9 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_yaml_config(args.config)
+    wandb_name_override = os.environ.get("IDRIFT_WANDB_NAME", "").strip()
+    if wandb_name_override:
+        cfg["name"] = wandb_name_override
     if int(args.throughput_opt_level) >= 0:
         cfg["throughput_opt_level"] = int(args.throughput_opt_level)
     if int(args.seed) >= 0:
@@ -6196,6 +4386,8 @@ def main() -> None:
         cfg["eval_per_step"] = int(args.eval_per_step)
     if int(getattr(args, "max_steps", 0) or 0) > 0:
         cfg["train_max_step_exclusive"] = int(args.max_steps)
+    if args.skip_eval_at_start:
+        cfg["eval_at_start"] = False
 
     for top_p_key in ("rev_drift_top_p", "fwd_drift_top_p"):
         top_p_value = float(cfg.get(top_p_key, 1.0))
@@ -6227,14 +4419,15 @@ def main() -> None:
 
     if not cfg.get("imagenet_path"):
         cfg["imagenet_path"] = os.environ.get("IMAGENET_PATH", "")
-    if not cfg.get("cache_path"):
-        cfg["cache_path"] = os.environ.get("IMAGENET_CACHE_PATH", "")
-    if args.mae_checkpoint:
-        cfg["mae_checkpoint"] = args.mae_checkpoint
-    if args.feature_checkpoint:
-        cfg["feature_checkpoint"] = args.feature_checkpoint
     if args.feature_extractor:
         cfg["feature_extractor"] = args.feature_extractor
+    if args.feature_checkpoint:
+        cfg["feature_checkpoint"] = args.feature_checkpoint
+
+    try:
+        _validate_dino_only_config(cfg)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     rank, world_size, device = setup_distributed()
     Path(args.workdir).mkdir(parents=True, exist_ok=True)

@@ -26,15 +26,27 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--throughput-opt-level", type=int, default=3)
     parser.add_argument("--diagnostics-every-k", type=int, default=10)
+    parser.add_argument("--feature-real-microbatch-size", type=int, default=None)
+    parser.add_argument("--feature-generated-microbatch-size", type=int, default=None)
+    parser.add_argument("--prefetch-factor", type=int, default=None)
+    parser.add_argument(
+        "--raw-train-uint8",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--cudnn-benchmark", action="store_true")
-    parser.add_argument("--cudnn-benchmark-limit", type=int, default=10)
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--use-sdpa", action="store_true")
     args = parser.parse_args()
 
     torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
     if hasattr(torch.backends.cudnn, "benchmark_limit"):
-        torch.backends.cudnn.benchmark_limit = int(args.cudnn_benchmark_limit)
+        torch.backends.cudnn.benchmark_limit = 0 if args.cudnn_benchmark else 10
     torch.backends.cuda.matmul.allow_tf32 = bool(args.allow_tf32)
     torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
     torch.set_float32_matmul_precision("high" if args.allow_tf32 else "highest")
@@ -44,13 +56,32 @@ def main() -> None:
     cfg["throughput_opt_level"] = int(args.throughput_opt_level)
     cfg["allow_tf32"] = bool(args.allow_tf32)
     cfg["cudnn_benchmark"] = bool(args.cudnn_benchmark)
-    cfg["cudnn_benchmark_limit"] = int(args.cudnn_benchmark_limit)
+    cfg["cudnn_benchmark_limit"] = 0 if args.cudnn_benchmark else 10
     cfg["train_max_step_exclusive"] = int(args.steps)
     cfg["eval_at_start"] = False
     cfg["use_wandb"] = False
+    # Production runs remain fail-closed on the calibrated raw-input guard.
+    # This evaluation-free harness only changes runtime knobs and therefore
+    # disables the production-only W&B invariant while benchmarking.
+    cfg["require_raw_temperature_calibration"] = False
     cfg["log_every_k"] = 10
     cfg["diagnostics_every_k"] = int(args.diagnostics_every_k)
     cfg["profile_train_step"] = False
+    if args.feature_real_microbatch_size is not None:
+        cfg["feature_real_microbatch_size"] = int(
+            args.feature_real_microbatch_size
+        )
+    if args.feature_generated_microbatch_size is not None:
+        cfg["feature_generated_microbatch_size"] = int(
+            args.feature_generated_microbatch_size
+        )
+    if args.prefetch_factor is not None:
+        cfg["prefetch_factor"] = int(args.prefetch_factor)
+        cfg["eval_prefetch_factor"] = int(args.prefetch_factor)
+    if args.raw_train_uint8 is not None:
+        cfg["raw_train_uint8"] = bool(args.raw_train_uint8)
+    if args.pin_memory is not None:
+        cfg["pin_memory"] = bool(args.pin_memory)
     cfg["_raw"].setdefault("model", {})["use_sdpa"] = bool(args.use_sdpa)
 
     rank, world_size, device = setup_distributed()
@@ -70,8 +101,11 @@ def main() -> None:
         "[benchmark-summary] "
         f"rank={rank} world={world_size} batch={args.batch_size} "
         f"opt={args.throughput_opt_level} sdpa={args.use_sdpa} "
+        f"real_mb={cfg.get('feature_real_microbatch_size', 'default')} "
+        f"generated_mb={cfg.get('feature_generated_microbatch_size', 'default')} "
+        f"raw_train_uint8={cfg.get('raw_train_uint8', False)} "
+        f"prefetch={cfg.get('prefetch_factor', 2)} "
         f"tf32={args.allow_tf32} cudnn_benchmark={args.cudnn_benchmark} "
-        f"cudnn_benchmark_limit={args.cudnn_benchmark_limit} "
         f"peak_allocated_gib={peak_allocated:.3f} "
         f"peak_reserved_gib={peak_reserved:.3f}",
         flush=True,

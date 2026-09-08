@@ -9,104 +9,11 @@ from drifting_core.imagenet_loss import drift_loss_imagenet
 from memory_bank import ArrayMemoryBank
 from train_imagenet_gen import (
     _historical_replay_ratio_for_step,
-    _rolling_replay_capture_path,
-    _rolling_replay_metadata,
-    _rolling_replay_snapshot_path,
-    _rolling_replay_target_epoch,
-    _rolling_snapshot_epoch_after_step,
-    _save_rolling_epoch_snapshot_and_reset,
     compute_drift_loss_from_features,
 )
 
 
 class HistoricalGeneratedReplayTest(unittest.TestCase):
-    def test_rolling_lag_maps_epoch_24_to_epoch_14(self):
-        common = {
-            "generated_per_step": 10,
-            "dataset_size": 100,
-            "lag_epochs": 10,
-        }
-        self.assertIsNone(
-            _rolling_replay_target_epoch(completed_steps=99, **common)
-        )
-        self.assertEqual(
-            _rolling_replay_target_epoch(completed_steps=100, **common), 0
-        )
-        self.assertEqual(
-            _rolling_replay_target_epoch(completed_steps=240, **common), 14
-        )
-        self.assertEqual(
-            _rolling_replay_target_epoch(
-                completed_steps=243,
-                generated_per_step=10,
-                dataset_size=101,
-                lag_epochs=10,
-            ),
-            14,
-        )
-
-    def test_rolling_snapshot_uses_the_epoch_bucket_just_completed(self):
-        common = {"generated_per_step": 10, "dataset_size": 100}
-        self.assertIsNone(_rolling_snapshot_epoch_after_step(step=8, **common))
-        self.assertEqual(
-            _rolling_snapshot_epoch_after_step(step=9, **common), 0
-        )
-        self.assertEqual(
-            _rolling_snapshot_epoch_after_step(step=149, **common), 14
-        )
-
-    def test_rolling_snapshot_path_is_rank_and_epoch_specific(self):
-        path = _rolling_replay_snapshot_path(
-            "/tmp/replay-test", rank=3, epoch=14
-        )
-        self.assertEqual(
-            path.name,
-            "historical_gen_replay_epoch0014_rank03.npz",
-        )
-        capture_path = _rolling_replay_capture_path(
-            "/tmp/replay-test", rank=3, step=120110
-        )
-        self.assertEqual(
-            capture_path.name,
-            "historical_gen_replay_capture_step0120110_rank03.npz",
-        )
-
-    def test_rolling_epoch_snapshot_resets_capture_bank(self):
-        bank = ArrayMemoryBank(num_classes=2, max_size=1, dtype=np.float16)
-        bank.add(
-            torch.tensor([[1.0], [2.0]]),
-            torch.tensor([0, 1]),
-        )
-        metadata = _rolling_replay_metadata(
-            kind="rolling_epoch_snapshot",
-            rank=0,
-            world_size=2,
-            num_classes=2,
-            bank_count=1,
-            storage_dtype="float16",
-            lag_epochs=10,
-            dataset_size=100,
-            generated_per_step=10,
-            epoch=14,
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "epoch14.npz"
-            fresh = _save_rolling_epoch_snapshot_and_reset(
-                bank,
-                path,
-                metadata=metadata,
-                min_per_class=1,
-            )
-            frozen = ArrayMemoryBank(
-                num_classes=2,
-                max_size=1,
-                dtype=np.float16,
-            )
-            frozen.load_npz(path, expected_metadata=metadata)
-        self.assertEqual(len(fresh), 0)
-        self.assertIsNone(fresh.bank)
-        np.testing.assert_array_equal(frozen.bank[:, 0, 0], [1.0, 2.0])
-
     def test_replay_ratio_linear_ramp(self):
         cfg = {
             "historical_gen_replay_ratio": 0.5,
@@ -126,35 +33,13 @@ class HistoricalGeneratedReplayTest(unittest.TestCase):
         samples = torch.arange(24, dtype=torch.float32).reshape(6, 4)
         labels = torch.tensor([0, 0, 1, 1, 2, 2])
         bank.add(samples, labels)
-        metadata = _rolling_replay_metadata(
-            kind="rolling_epoch_snapshot",
-            rank=1,
-            world_size=2,
-            num_classes=3,
-            bank_count=2,
-            storage_dtype="float16",
-            lag_epochs=10,
-            dataset_size=100,
-            generated_per_step=10,
-            epoch=14,
-        )
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "snapshot.npz"
-            bank.save_npz(path, metadata=metadata)
+            bank.save_npz(path)
             restored = ArrayMemoryBank(
                 num_classes=3, max_size=2, dtype=np.float16
             )
-            loaded_metadata = restored.load_npz(
-                path,
-                expected_metadata=metadata,
-            )
-            with self.assertRaisesRegex(ValueError, "metadata mismatch"):
-                restored.load_npz(
-                    path,
-                    expected_metadata={**metadata, "world_size": 4},
-                )
-            self.assertFalse(any(Path(tmpdir).glob(".*.tmp.npz")))
-        self.assertEqual(loaded_metadata, metadata)
+            restored.load_npz(path)
         self.assertTrue(restored.is_ready(2))
         np.testing.assert_array_equal(restored.bank, bank.bank)
         np.testing.assert_array_equal(restored.ptr, bank.ptr)
