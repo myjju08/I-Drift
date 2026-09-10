@@ -1,0 +1,211 @@
+# DINO-R50 scale-preserving adapter ablation. Generator/data/drift sampling
+# exactly matches S4 / DINO / adapter(align); only the geometry objective adds
+# RR/RG/GG cosine-distance scale and mean preservation.
+
+logging:
+  project: "Feature encoder - S4 model"
+  entity: "a01065522071-kaist-digital-humanities-and-social-science"
+  name: "S4 / DINO / adapter(align+scale+mean)"
+  use_wandb: true
+  log_every_k: 10
+  wandb_rewind_on_resume: false
+
+env:
+  imagenet_path: "data/imagenet/raw_ilsvrc2012"
+  cache_path: ""
+
+dataset:
+  resolution: 256
+  use_aug: false
+  use_latent: false
+  use_cache: false
+  require_complete_raw_imagenet: true
+  num_classes: 1000
+  batch_size: 4
+  eval_batch_size: 8
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  eval_prefetch_factor: 2
+  persistent_workers: true
+  eval_persistent_workers: false
+  raw_train_uint8: true
+  # Keep eight deterministic workers, but permit only one concurrent raw
+  # image open/decode per rank (two total) so this third run cannot flood the
+  # shared backing storage used by the two control runs.
+  raw_image_io_concurrency_per_rank: 1
+
+model:
+  cond_dim: 384
+  input_size: 256
+  in_channels: 3
+  patch_size: 32
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  out_channels: 3
+  use_qk_norm: true
+  use_swiglu: true
+  use_rope: true
+  use_rmsnorm: true
+  n_cls_tokens: 16
+  noise_classes: 64
+  noise_coords: 32
+  use_bf16: true
+  attn_fp32: false
+  use_remat: false
+
+optimizer:
+  lr: 0.0004
+  weight_decay: 0.0
+  adam_b1: 0.9
+  adam_b2: 0.95
+  warmup_steps: 2000
+  lr_schedule: "const"
+
+train:
+  seed: 43
+  seed_host_rng: true
+  total_steps: 200183
+  total_generated_epochs: 40.0
+  save_per_step: 5000
+  save_per_generated_epochs: 10.0
+  eval_per_step: 400000
+  eval_per_generated_epochs: 10.0
+  eval_samples: 1024
+  eval_at_start: true
+  ema_decay: 0.999
+  max_grad_norm: 2.0
+  keep_every: 3000
+  keep_last: 20
+  pos_per_sample: 64
+  neg_per_sample: 32
+  positive_bank_size: 128
+  negative_bank_size: 1000
+  memory_bank_storage_mode: "pixel_uint8"
+  # Preserve the same 128 post-crop/post-flip uint8 samples and sampling RNG,
+  # but keep positive slots as independent lossless frames to avoid displacing
+  # the raw ImageNet page cache when this third experiment is added.
+  positive_memory_bank_backend: "zstd_delta"
+  positive_memory_bank_zstd_level: 1
+  positive_memory_bank_codec_workers: 4
+  banks_per_rank: 1
+  push_per_step: 128
+  loader_batch_size: 128
+  push_at_resume: 0
+  gen_per_label: 32
+  cfg_min: 1.0
+  cfg_max: 4.0
+  neg_cfg_pw: 3.0
+  no_cfg_frac: 0.0
+  drift_matching: "rev-drift"
+  R_list: [0.2, 0.05, 0.02]
+  rev_drift_affinity_kernel: "exponential"
+  rev_drift_kernel_shape: 1.0
+  rev_drift_kernel_adaptive_k_pos: 0
+  rev_drift_kernel_adaptive_k_neg: 0
+  rev_drift_force_multiplier: 1.0
+  rev_drift_top_p: 1.0
+  drift_top_p_min_keep: 1
+  drift_top_k_pos: 0
+  drift_top_k_neg: 0
+  drift_top_k_groups: "all"
+  layer_temperature_profile: "raw_imagenet_dino_moco_symmetric_3seed_p32_v2"
+  require_raw_temperature_calibration: true
+  temperature_calibration_status: "ready"
+  temperature_calibration_role: "dino"
+  temperature_calibration_artifact: "experiments/dino/calibration/raw_imagenet_dino_moco_symmetric_3seed.json"
+  temperature_calibration_artifact_sha256: "8e1ff1977e1ac136154ec1cd06c2722c47d8fb4139a91928914f4be6e26417fa"
+  temperature_calibration_raw_manifest_sha256: "cca95638ea4a4872373944443202656b5cebc0db9133afe2b804c3f0112e2664"
+  layer_temperature_profiles:
+    uniform: {default: 1.0, stage1: 1.0, stage2: 1.0, stage3: 1.0, stage4: 1.0}
+    raw_imagenet_dino_moco_symmetric_3seed_p32_v2:
+      default: 1.0
+      stage3: 1.010352456195719
+      stage4: 1.0110986372034372
+  feature_loss_profile: "no_stage12_norm_x2"
+  feature_loss_group_normalize: true
+  prune_skipped_feature_tensors: true
+  feature_loss_profiles:
+    no_stage12_norm_x2:
+      default: 1.0
+      norm_x: 2.0
+      stage1: 0.0
+      stage2: 0.0
+  global_scale_stats: true
+  global_fnorm_stats: true
+  compute_wpos_stats: true
+  compute_wpos_stats_every_k: 1000
+  activation_kwargs:
+    active_stages: [stage3, stage4]
+    patch_mean_size: [2, 4]
+    patch_std_size: [2, 4]
+    use_std: true
+    use_mean: true
+    with_global: true
+    with_norm_x: true
+    every_k_block: 2
+    exclude_terminal_block: false
+  cfg_list: [1.0, 2.0, 3.0]
+  historical_gen_replay: false
+  historical_gen_replay_ratio: 0.0
+  historical_gen_replay_ratio_start: null
+  historical_gen_replay_ratio_ramp_start_step: 0
+  historical_gen_replay_ratio_ramp_end_step: 0
+  historical_gen_current_weight: null
+  historical_gen_history_weight: null
+  historical_gen_replay_count: 16
+  historical_gen_replay_bank_count: 16
+  historical_gen_replay_start_generated_epochs: 10.0
+  historical_gen_replay_storage_dtype: "float16"
+  historical_gen_replay_source: "frozen_snapshot"
+  throughput_opt_level: 3
+
+feature:
+  feature_extractor: "dino_resnet50"
+  feature_checkpoint: "weights/pretrained/dino_resnet50_pretrain.pth"
+  use_convnext: false
+  feature_use_bf16: true
+  feature_use_remat: false
+  feature_microbatch_size: 16
+  feature_real_microbatch_size: 64
+  feature_generated_microbatch_size: 32
+  feature_spatial_pool: 2
+  feature_include_norm_x: true
+  feature_clip_decoded_pixels: false
+
+  # G step: frozen hard-copy adapter. Adapter step: detached generated queries
+  # against same-class real keys, with all other labeled real keys as negatives.
+  feature_adapter: true
+  feature_adapter_objective: "gen_real_multipos_infonce"
+  feature_adapter_keys: [layer3, layer4]
+  feature_adapter_bottleneck: 64
+  feature_adapter_projection_dim: 0
+  feature_adapter_dropout: 0.0
+  feature_adapter_lr: 0.0001
+  feature_adapter_weight_decay: 0.0
+  feature_adapter_adam_b1: 0.9
+  feature_adapter_adam_b2: 0.999
+  # Start as soon as every rank's per-class bank has P=64 distinct real keys;
+  # the readiness latch resets safely after checkpoint resume.
+  feature_adapter_start_step: 0
+  feature_adapter_update_freq: 1
+  feature_adapter_samples_per_class: 64
+  feature_adapter_generated_samples_per_class: 32
+  feature_adapter_require_unique_reals: true
+  feature_adapter_temp: 0.1
+  feature_adapter_loss_weight: 1.0
+  # Preserve pair ordering plus the absolute cosine-distance moments in each
+  # local RR/RG/GG group. Coefficients are calibrated so their combined
+  # weighted loss is about 4% of InfoNCE at the old DINO geometry, matching the
+  # successful MoCo+align run rather than simply stacking more regularization.
+  feature_adapter_drift_align_lambda: 1.0
+  feature_adapter_distance_scale_lambda: 0.02
+  feature_adapter_distance_mean_lambda: 0.0004
+  # Pure InfoNCE adapter update: no auxiliary CE/residual loss or weight decay.
+  feature_adapter_reg_lambda: 0.0
+  feature_adapter_max_grad_norm: 1.0
+  feature_adapter_ema_decay: 0.0
+  feature_adapter_global_contrastive: true
+  feature_gan: false

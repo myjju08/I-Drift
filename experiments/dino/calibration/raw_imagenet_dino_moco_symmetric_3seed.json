@@ -1,0 +1,511 @@
+{
+  "schema_version": 3,
+  "definition": "Robust Huber location of log(candidate/reference) for the actual normalized kernel distance d/weighted_mean_d. Values below the minimum distance are excluded before fitting because their d/(R*m) is a generated near-tie rather than a stable temperature signal.",
+  "references": {
+    "43": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/dino_s43.json",
+    "44": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/dino_s44.json",
+    "45": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/dino_s45.json"
+  },
+  "groups_considered": [
+    "positive",
+    "generated_nonself",
+    "real_negative"
+  ],
+  "quantiles": [
+    "p10",
+    "p25",
+    "p50",
+    "p75",
+    "p90"
+  ],
+  "min_distance": 0.02,
+  "huber_tuning": 1.5,
+  "trim_fraction": 0.1,
+  "capture_protocol": {
+    "generator_geometry": {
+      "input_size": 256,
+      "in_channels": 3,
+      "out_channels": 3,
+      "patch_size": 32,
+      "image_tokens": 64,
+      "class_tokens": 16
+    },
+    "batch": {
+      "B": 4,
+      "G": 32,
+      "P": 64,
+      "N": 32
+    },
+    "R_list": [
+      0.2,
+      0.05,
+      0.02
+    ],
+    "max_token_rows_per_feature": 64,
+    "feature_layout": {
+      "layer3": {
+        "stage": "stage3",
+        "tokens": 64,
+        "dimension": 1024
+      },
+      "layer3_blk2": {
+        "stage": "stage3",
+        "tokens": 64,
+        "dimension": 1024
+      },
+      "layer3_blk2_mean": {
+        "stage": "stage3",
+        "tokens": 1,
+        "dimension": 1024
+      },
+      "layer3_blk2_mean_2": {
+        "stage": "stage3",
+        "tokens": 16,
+        "dimension": 1024
+      },
+      "layer3_blk2_mean_4": {
+        "stage": "stage3",
+        "tokens": 4,
+        "dimension": 1024
+      },
+      "layer3_blk2_std": {
+        "stage": "stage3",
+        "tokens": 1,
+        "dimension": 1024
+      },
+      "layer3_blk2_std_2": {
+        "stage": "stage3",
+        "tokens": 16,
+        "dimension": 1024
+      },
+      "layer3_blk2_std_4": {
+        "stage": "stage3",
+        "tokens": 4,
+        "dimension": 1024
+      },
+      "layer3_blk4": {
+        "stage": "stage3",
+        "tokens": 64,
+        "dimension": 1024
+      },
+      "layer3_blk4_mean": {
+        "stage": "stage3",
+        "tokens": 1,
+        "dimension": 1024
+      },
+      "layer3_blk4_mean_2": {
+        "stage": "stage3",
+        "tokens": 16,
+        "dimension": 1024
+      },
+      "layer3_blk4_mean_4": {
+        "stage": "stage3",
+        "tokens": 4,
+        "dimension": 1024
+      },
+      "layer3_blk4_std": {
+        "stage": "stage3",
+        "tokens": 1,
+        "dimension": 1024
+      },
+      "layer3_blk4_std_2": {
+        "stage": "stage3",
+        "tokens": 16,
+        "dimension": 1024
+      },
+      "layer3_blk4_std_4": {
+        "stage": "stage3",
+        "tokens": 4,
+        "dimension": 1024
+      },
+      "layer3_blk6": {
+        "stage": "stage3",
+        "tokens": 64,
+        "dimension": 1024
+      },
+      "layer3_blk6_mean": {
+        "stage": "stage3",
+        "tokens": 1,
+        "dimension": 1024
+      },
+      "layer3_blk6_mean_2": {
+        "stage": "stage3",
+        "tokens": 16,
+        "dimension": 1024
+      },
+      "layer3_blk6_mean_4": {
+        "stage": "stage3",
+        "tokens": 4,
+        "dimension": 1024
+      },
+      "layer3_blk6_std": {
+        "stage": "stage3",
+        "tokens": 1,
+        "dimension": 1024
+      },
+      "layer3_blk6_std_2": {
+        "stage": "stage3",
+        "tokens": 16,
+        "dimension": 1024
+      },
+      "layer3_blk6_std_4": {
+        "stage": "stage3",
+        "tokens": 4,
+        "dimension": 1024
+      },
+      "layer3_mean": {
+        "stage": "stage3",
+        "tokens": 1,
+        "dimension": 1024
+      },
+      "layer3_mean_2": {
+        "stage": "stage3",
+        "tokens": 16,
+        "dimension": 1024
+      },
+      "layer3_mean_4": {
+        "stage": "stage3",
+        "tokens": 4,
+        "dimension": 1024
+      },
+      "layer3_std": {
+        "stage": "stage3",
+        "tokens": 1,
+        "dimension": 1024
+      },
+      "layer3_std_2": {
+        "stage": "stage3",
+        "tokens": 16,
+        "dimension": 1024
+      },
+      "layer3_std_4": {
+        "stage": "stage3",
+        "tokens": 4,
+        "dimension": 1024
+      },
+      "layer4": {
+        "stage": "stage4",
+        "tokens": 16,
+        "dimension": 2048
+      },
+      "layer4_blk2": {
+        "stage": "stage4",
+        "tokens": 16,
+        "dimension": 2048
+      },
+      "layer4_blk2_mean": {
+        "stage": "stage4",
+        "tokens": 1,
+        "dimension": 2048
+      },
+      "layer4_blk2_mean_2": {
+        "stage": "stage4",
+        "tokens": 4,
+        "dimension": 2048
+      },
+      "layer4_blk2_mean_4": {
+        "stage": "stage4",
+        "tokens": 1,
+        "dimension": 2048
+      },
+      "layer4_blk2_std": {
+        "stage": "stage4",
+        "tokens": 1,
+        "dimension": 2048
+      },
+      "layer4_blk2_std_2": {
+        "stage": "stage4",
+        "tokens": 4,
+        "dimension": 2048
+      },
+      "layer4_blk2_std_4": {
+        "stage": "stage4",
+        "tokens": 1,
+        "dimension": 2048
+      },
+      "layer4_mean": {
+        "stage": "stage4",
+        "tokens": 1,
+        "dimension": 2048
+      },
+      "layer4_mean_2": {
+        "stage": "stage4",
+        "tokens": 4,
+        "dimension": 2048
+      },
+      "layer4_mean_4": {
+        "stage": "stage4",
+        "tokens": 1,
+        "dimension": 2048
+      },
+      "layer4_std": {
+        "stage": "stage4",
+        "tokens": 1,
+        "dimension": 2048
+      },
+      "layer4_std_2": {
+        "stage": "stage4",
+        "tokens": 4,
+        "dimension": 2048
+      },
+      "layer4_std_4": {
+        "stage": "stage4",
+        "tokens": 1,
+        "dimension": 2048
+      }
+    }
+  },
+  "dataset_provenance": {
+    "root": "/workspace/I-Drift/data/imagenet/raw_ilsvrc2012",
+    "manifest": "/workspace/I-Drift/data/imagenet/raw_ilsvrc2012/raw_imagenet_manifest.json",
+    "manifest_sha256": "cca95638ea4a4872373944443202656b5cebc0db9133afe2b804c3f0112e2664",
+    "mapping_sha256": "853b11a1d6f1c20440cc525fcf936a1f991dc3d84d6be92b1a5a7cdedc7c85b3",
+    "expected": {
+      "classes": 1000,
+      "train_files": 1281167,
+      "val_files": 50000
+    }
+  },
+  "candidates": {
+    "moco": {
+      "captures": {
+        "43": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/moco_s43.json",
+        "44": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/moco_s44.json",
+        "45": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/moco_s45.json"
+      },
+      "input_hash_validation": {
+        "43": {
+          "labels": true,
+          "positive_samples": true,
+          "negative_samples": true,
+          "generated_samples": true,
+          "cfg_scales": true
+        },
+        "44": {
+          "labels": true,
+          "positive_samples": true,
+          "negative_samples": true,
+          "generated_samples": true,
+          "cfg_scales": true
+        },
+        "45": {
+          "labels": true,
+          "positive_samples": true,
+          "negative_samples": true,
+          "generated_samples": true,
+          "cfg_scales": true
+        }
+      },
+      "stages": {
+        "stage3": {
+          "selected_multiplier": 0.9796122263524923,
+          "effective_tau": [
+            0.19592244527049849,
+            0.04898061131762462,
+            0.019592244527049846
+          ],
+          "huber_tuning": 1.5,
+          "log_mad_scale": 0.13904751689062264,
+          "median_multiplier": 0.9864786777594269,
+          "trimmed_geometric_mean_multiplier": 0.9796121846124809,
+          "accepted_terms": 840,
+          "per_seed_multiplier": {
+            "43": 0.9835714861321119,
+            "44": 0.9695959294654176,
+            "45": 0.9865486026160195
+          },
+          "groups": {
+            "positive": {
+              "huber_multiplier": 0.982135588070712,
+              "median_multiplier": 0.9887089277740829,
+              "log_mad_scale": 0.1256555770916836,
+              "accepted": 420,
+              "excluded_below_min_distance": 0
+            },
+            "generated_nonself": {
+              "accepted": 0,
+              "excluded_below_min_distance": 420,
+              "status": "all_excluded"
+            },
+            "real_negative": {
+              "huber_multiplier": 0.9779379093302645,
+              "median_multiplier": 0.9841861433457005,
+              "log_mad_scale": 0.15232877623881125,
+              "accepted": 420,
+              "excluded_below_min_distance": 0
+            }
+          }
+        },
+        "stage4": {
+          "selected_multiplier": 0.9781668711958771,
+          "effective_tau": [
+            0.19563337423917543,
+            0.04890834355979386,
+            0.019563337423917544
+          ],
+          "huber_tuning": 1.5,
+          "log_mad_scale": 0.09441119566181326,
+          "median_multiplier": 0.9938541856687203,
+          "trimmed_geometric_mean_multiplier": 0.9716012196341213,
+          "accepted_terms": 420,
+          "per_seed_multiplier": {
+            "43": 0.9958472579947951,
+            "44": 0.9815791308515357,
+            "45": 0.9324169860244481
+          },
+          "groups": {
+            "positive": {
+              "huber_multiplier": 0.9840888199456637,
+              "median_multiplier": 0.9866856691221635,
+              "log_mad_scale": 0.08613140787364883,
+              "accepted": 210,
+              "excluded_below_min_distance": 0
+            },
+            "generated_nonself": {
+              "accepted": 0,
+              "excluded_below_min_distance": 210,
+              "status": "all_excluded"
+            },
+            "real_negative": {
+              "huber_multiplier": 0.9684765225046958,
+              "median_multiplier": 1.0017820237406225,
+              "log_mad_scale": 0.11243855467119779,
+              "accepted": 210,
+              "excluded_below_min_distance": 0
+            }
+          }
+        }
+      }
+    }
+  },
+  "calibration_kind": "symmetric_raw_imagenet_dino_moco",
+  "required_seeds": [
+    43,
+    44,
+    45
+  ],
+  "centering": "geometric_mean_one",
+  "fixed_input_feature_multipliers": {
+    "global": 1.0,
+    "norm_x": 1.0,
+    "reason": "global and norm_x are computed directly from the same raw RGB input tensor before either frozen encoder"
+  },
+  "encoder_provenance": {
+    "dino": {
+      "feature_extractor": "dino_resnet50",
+      "checkpoint": "/workspace/I-Drift/weights/pretrained/dino_resnet50_pretrain.pth",
+      "checkpoint_bytes": 94345885,
+      "checkpoint_sha256": "156f8c4166a23dc2951ae811e39d76a06269c565932edf647c0187e65cd7aa7c"
+    },
+    "moco": {
+      "feature_extractor": "moco_v2_resnet50",
+      "checkpoint": "/workspace/I-Drift/weights/pretrained/moco_v2_800ep_pretrain.pth.tar",
+      "checkpoint_bytes": 112133139,
+      "checkpoint_sha256": "5e4a3fd7178a95837c0ad71c265ed5f477d271e753ba505b6b6a5e86829eeb7e"
+    }
+  },
+  "symmetric_profiles": {
+    "dino": {
+      "default": 1.0,
+      "stage3": 1.010352456195719,
+      "stage4": 1.0110986372034372
+    },
+    "moco": {
+      "default": 1.0,
+      "stage3": 0.9897536190145971,
+      "stage4": 0.9890231904237013
+    }
+  },
+  "capture_validation": {
+    "dino": {
+      "43": {
+        "capture": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/dino_s43.json",
+        "config_sha256": "4ae2fc32c2f3419929c21356c2b75dde54a40dc34ca7bb7f51edf457a91c19cb",
+        "tensor_sha256": {
+          "labels": "9a698385ce9fca93b70c33752852482df39699fe7ec0d5d60360caa169d74148",
+          "positive_samples": "705a3b322caae972f30141684222b361c5252872f7430fd8f63623412df48a2b",
+          "negative_samples": "245846e8b200d107512ff6f0796d883957034d35c7439ade53d427a135b23dc8",
+          "generated_samples": "2c3c244ae0cefe38edb6c26abbff4f0b36256e4e34d300022558a6a2cdb74ec7",
+          "cfg_scales": "0462902881d5dbf020f58148ca534b424cffbc2ea986f2dbb589e7d43ecf152e"
+        }
+      },
+      "44": {
+        "capture": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/dino_s44.json",
+        "config_sha256": "4ae2fc32c2f3419929c21356c2b75dde54a40dc34ca7bb7f51edf457a91c19cb",
+        "tensor_sha256": {
+          "labels": "1732437fb2a0dabba3934dbea90236774be9eaee4dccd0ab21ee5fb98c9bf0b9",
+          "positive_samples": "240cd0de18dcda1b5959b39cd50eb990832a138db574912383e6ab38ea564131",
+          "negative_samples": "19007e3eca1120ff62a06cfeda950471a941719b8262066867402d69a89b8602",
+          "generated_samples": "2c3c244ae0cefe38edb6c26abbff4f0b36256e4e34d300022558a6a2cdb74ec7",
+          "cfg_scales": "f186392ae90b5935e7b2529b04c2df1d8c1cdcced3f700d6a9b3fc107facaf91"
+        }
+      },
+      "45": {
+        "capture": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/dino_s45.json",
+        "config_sha256": "4ae2fc32c2f3419929c21356c2b75dde54a40dc34ca7bb7f51edf457a91c19cb",
+        "tensor_sha256": {
+          "labels": "43cfd9ae0ec8269131ed8f2279e3f9ff3d120ee0c7c65cc9939a1002a809b3e0",
+          "positive_samples": "7132697b3cd022391c12b8fdd118dd30fce1ba9a631030d0d73cb5de7f804cef",
+          "negative_samples": "dd31c430bdd043e85bcf2de87e721b7ade128bda3c4b714381bcd38fe6b06315",
+          "generated_samples": "2c3c244ae0cefe38edb6c26abbff4f0b36256e4e34d300022558a6a2cdb74ec7",
+          "cfg_scales": "31eaea7c42109cb68c337fa5560db4ee685e08ed3d1aa0c938cfb087f09714f1"
+        }
+      }
+    },
+    "moco": {
+      "43": {
+        "capture": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/moco_s43.json",
+        "config_sha256": "316b82fe8c30b1522e6347f828d7a2731601568d96159463b91138606ae7ce28",
+        "tensor_sha256": {
+          "labels": "9a698385ce9fca93b70c33752852482df39699fe7ec0d5d60360caa169d74148",
+          "positive_samples": "705a3b322caae972f30141684222b361c5252872f7430fd8f63623412df48a2b",
+          "negative_samples": "245846e8b200d107512ff6f0796d883957034d35c7439ade53d427a135b23dc8",
+          "generated_samples": "2c3c244ae0cefe38edb6c26abbff4f0b36256e4e34d300022558a6a2cdb74ec7",
+          "cfg_scales": "0462902881d5dbf020f58148ca534b424cffbc2ea986f2dbb589e7d43ecf152e"
+        }
+      },
+      "44": {
+        "capture": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/moco_s44.json",
+        "config_sha256": "316b82fe8c30b1522e6347f828d7a2731601568d96159463b91138606ae7ce28",
+        "tensor_sha256": {
+          "labels": "1732437fb2a0dabba3934dbea90236774be9eaee4dccd0ab21ee5fb98c9bf0b9",
+          "positive_samples": "240cd0de18dcda1b5959b39cd50eb990832a138db574912383e6ab38ea564131",
+          "negative_samples": "19007e3eca1120ff62a06cfeda950471a941719b8262066867402d69a89b8602",
+          "generated_samples": "2c3c244ae0cefe38edb6c26abbff4f0b36256e4e34d300022558a6a2cdb74ec7",
+          "cfg_scales": "f186392ae90b5935e7b2529b04c2df1d8c1cdcced3f700d6a9b3fc107facaf91"
+        }
+      },
+      "45": {
+        "capture": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/moco_s45.json",
+        "config_sha256": "316b82fe8c30b1522e6347f828d7a2731601568d96159463b91138606ae7ce28",
+        "tensor_sha256": {
+          "labels": "43cfd9ae0ec8269131ed8f2279e3f9ff3d120ee0c7c65cc9939a1002a809b3e0",
+          "positive_samples": "7132697b3cd022391c12b8fdd118dd30fce1ba9a631030d0d73cb5de7f804cef",
+          "negative_samples": "dd31c430bdd043e85bcf2de87e721b7ade128bda3c4b714381bcd38fe6b06315",
+          "generated_samples": "2c3c244ae0cefe38edb6c26abbff4f0b36256e4e34d300022558a6a2cdb74ec7",
+          "cfg_scales": "31eaea7c42109cb68c337fa5560db4ee685e08ed3d1aa0c938cfb087f09714f1"
+        }
+      }
+    }
+  },
+  "reciprocity_validation": {
+    "verified": true,
+    "reverse_artifact": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/reverse_dino_over_moco.json",
+    "reverse_artifact_sha256": "35743b87017219bde80e5b7aaa8bdf46aa42b5de5290901f85e305a01e15d675",
+    "max_log_reciprocity_error": 1e-10,
+    "stages": {
+      "stage3": {
+        "moco_over_dino": 0.9796122263524923,
+        "dino_over_moco": 1.0208120857407221,
+        "product": 1.0,
+        "abs_log_product": 0.0
+      },
+      "stage4": {
+        "moco_over_dino": 0.9781668711958771,
+        "dino_over_moco": 1.022320454154648,
+        "product": 1.0000000000000002,
+        "abs_log_product": 2.2204460492503128e-16
+      }
+    }
+  }
+}

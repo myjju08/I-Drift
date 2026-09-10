@@ -1,0 +1,294 @@
+{
+  "checked_utc": "2026-09-10T17:45:30.638472+00:00",
+  "scope": "Original live source/config files and the eight workers of the four running experiments; no experiment restarts performed.",
+  "source_files_unchanged": true,
+  "all_eight_training_workers_preserved": true,
+  "files": [
+    {
+      "path": "/workspace/I-Drift/train_imagenet_gen.py",
+      "sha256_before": "b7253c1148e5be68fbab4a581d7de3b85d55b5fb275987f47fc04dc889d1d486",
+      "sha256_after": "b7253c1148e5be68fbab4a581d7de3b85d55b5fb275987f47fc04dc889d1d486",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/I-Drift/models/adversarial_drift.py",
+      "sha256_before": "6554a3fbaa696ba48aaf8c1b5ac88e6d855a521944f4dc649665f25f73cbcbe8",
+      "sha256_after": "6554a3fbaa696ba48aaf8c1b5ac88e6d855a521944f4dc649665f25f73cbcbe8",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/idrift2_transfer_20260908/dino_only_replay_feature_drift_20260909/trainer_dino_only_replay.py",
+      "sha256_before": "4e808de607d3f2c5f1972ff02e9b21f0495ce288bdd3a562344e482342c42236",
+      "sha256_after": "4e808de607d3f2c5f1972ff02e9b21f0495ce288bdd3a562344e482342c42236",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/idrift2_transfer_20260908/dino_only_replay_feature_drift_20260909/experiment.yaml",
+      "sha256_before": "b06c7fc2ea149082c6f3f56d81a986137f3aced83fc7605dcf290e82c6b026f2",
+      "sha256_after": "b06c7fc2ea149082c6f3f56d81a986137f3aced83fc7605dcf290e82c6b026f2",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/mae256_gan_prepare_20260910/latent_direct_gan.py",
+      "sha256_before": "3a6deffab951138da8a7c61b18c6b81f8b48bc8ff91e76584e97368a41f257cf",
+      "sha256_after": "3a6deffab951138da8a7c61b18c6b81f8b48bc8ff91e76584e97368a41f257cf",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/mae256_gan_prepare_20260910/latent_spatial_gan.py",
+      "sha256_before": "61ab08283310e106464a5357a01141233f34437a9d1c5c5e23e9cf89c81518e5",
+      "sha256_after": "61ab08283310e106464a5357a01141233f34437a9d1c5c5e23e9cf89c81518e5",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/mae256_gan_prepare_20260910/latent_cache.py",
+      "sha256_before": "04ce894d7ec4db2123a0c6f2afd3fc17913e3919b87ea43ff4410bf5d24b8dab",
+      "sha256_after": "04ce894d7ec4db2123a0c6f2afd3fc17913e3919b87ea43ff4410bf5d24b8dab",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/mae256_gan_prepare_20260910/trainer_bridge.py",
+      "sha256_before": "a264b0ad3202fe42e148dad9ddee06ec07a527298bad19a26aadadc61bd7ecf7",
+      "sha256_after": "a264b0ad3202fe42e148dad9ddee06ec07a527298bad19a26aadadc61bd7ecf7",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/mae256_gan_prepare_20260910/latent_spatial/runtime.py",
+      "sha256_before": "2d4d36145425a5a7c386918f23cca92d6165b521f021403feb7e059f2e396d1d",
+      "sha256_after": "2d4d36145425a5a7c386918f23cca92d6165b521f021403feb7e059f2e396d1d",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/raw_gan.yaml",
+      "sha256_before": "f61119bb99072629a64faed2215fe4740ecee7d5ff18d1e8098aea4a7a8ff214",
+      "sha256_after": "f61119bb99072629a64faed2215fe4740ecee7d5ff18d1e8098aea4a7a8ff214",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/feature_drift.yaml",
+      "sha256_before": "a4eaa4886577197a3d10464de70198677af22cfac63ad7783c61fc0319cae93a",
+      "sha256_after": "a4eaa4886577197a3d10464de70198677af22cfac63ad7783c61fc0319cae93a",
+      "unchanged": true
+    },
+    {
+      "path": "/workspace/mae256_gan_prepare_20260910/configs/control.yaml",
+      "sha256_before": "cca7f1f22723ca13c7fc099aae338203cd976bbf1d11618a589e004936e6c29a",
+      "sha256_after": "cca7f1f22723ca13c7fc099aae338203cd976bbf1d11618a589e004936e6c29a",
+      "unchanged": true
+    }
+  ],
+  "processes": [
+    {
+      "pid": 257487,
+      "ppid_before": 257447,
+      "start_ticks_before": "63469975",
+      "command_before": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/idrift2_transfer_20260908/dino_only_replay_feature_drift_20260909/train_feature.py",
+        "--train"
+      ],
+      "alive": true,
+      "ppid_after": 257447,
+      "start_ticks_after": "63469975",
+      "command_after": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/idrift2_transfer_20260908/dino_only_replay_feature_drift_20260909/train_feature.py",
+        "--train"
+      ],
+      "cwd_after": "/workspace/I-Drift",
+      "same_process": true
+    },
+    {
+      "pid": 257488,
+      "ppid_before": 257447,
+      "start_ticks_before": "63469975",
+      "command_before": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/idrift2_transfer_20260908/dino_only_replay_feature_drift_20260909/train_feature.py",
+        "--train"
+      ],
+      "alive": true,
+      "ppid_after": 257447,
+      "start_ticks_after": "63469975",
+      "command_after": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/idrift2_transfer_20260908/dino_only_replay_feature_drift_20260909/train_feature.py",
+        "--train"
+      ],
+      "cwd_after": "/workspace/I-Drift",
+      "same_process": true
+    },
+    {
+      "pid": 328253,
+      "ppid_before": 328118,
+      "start_ticks_before": "68233083",
+      "command_before": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/configs/control.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_same_cache_control_scratch_cfg123_20260910"
+      ],
+      "alive": true,
+      "ppid_after": 328118,
+      "start_ticks_after": "68233083",
+      "command_after": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/configs/control.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_same_cache_control_scratch_cfg123_20260910"
+      ],
+      "cwd_after": "/workspace/I-Drift",
+      "same_process": true
+    },
+    {
+      "pid": 328254,
+      "ppid_before": 328118,
+      "start_ticks_before": "68233083",
+      "command_before": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/configs/control.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_same_cache_control_scratch_cfg123_20260910"
+      ],
+      "alive": true,
+      "ppid_after": 328118,
+      "start_ticks_after": "68233083",
+      "command_after": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/configs/control.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_same_cache_control_scratch_cfg123_20260910"
+      ],
+      "cwd_after": "/workspace/I-Drift",
+      "same_process": true
+    },
+    {
+      "pid": 365138,
+      "ppid_before": 364912,
+      "start_ticks_before": "71382736",
+      "command_before": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/raw_gan.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_spatial844_raw_gan_d32_w0p15_scratch_cfg123_20260910T142743Z"
+      ],
+      "alive": true,
+      "ppid_after": 364912,
+      "start_ticks_after": "71382736",
+      "command_after": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/raw_gan.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_spatial844_raw_gan_d32_w0p15_scratch_cfg123_20260910T142743Z"
+      ],
+      "cwd_after": "/workspace/I-Drift",
+      "same_process": true
+    },
+    {
+      "pid": 365139,
+      "ppid_before": 364912,
+      "start_ticks_before": "71382737",
+      "command_before": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/raw_gan.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_spatial844_raw_gan_d32_w0p15_scratch_cfg123_20260910T142743Z"
+      ],
+      "alive": true,
+      "ppid_after": 364912,
+      "start_ticks_after": "71382737",
+      "command_after": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/raw_gan.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_spatial844_raw_gan_d32_w0p15_scratch_cfg123_20260910T142743Z"
+      ],
+      "cwd_after": "/workspace/I-Drift",
+      "same_process": true
+    },
+    {
+      "pid": 365163,
+      "ppid_before": 364952,
+      "start_ticks_before": "71382859",
+      "command_before": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/feature_drift.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_spatial844_feature_drift_d32_w0p1_scratch_cfg123_20260910T142743Z"
+      ],
+      "alive": true,
+      "ppid_after": 364952,
+      "start_ticks_after": "71382859",
+      "command_after": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/feature_drift.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_spatial844_feature_drift_d32_w0p1_scratch_cfg123_20260910T142743Z"
+      ],
+      "cwd_after": "/workspace/I-Drift",
+      "same_process": true
+    },
+    {
+      "pid": 365164,
+      "ppid_before": 364952,
+      "start_ticks_before": "71382859",
+      "command_before": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/feature_drift.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_spatial844_feature_drift_d32_w0p1_scratch_cfg123_20260910T142743Z"
+      ],
+      "alive": true,
+      "ppid_after": 364952,
+      "start_ticks_after": "71382859",
+      "command_after": [
+        "/venv/main/bin/python",
+        "-u",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/runtime.py",
+        "--config",
+        "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/feature_drift.yaml",
+        "--workdir",
+        "/workspace/I-Drift/runs/S4_MAE256_latent_spatial844_feature_drift_d32_w0p1_scratch_cfg123_20260910T142743Z"
+      ],
+      "cwd_after": "/workspace/I-Drift",
+      "same_process": true
+    }
+  ]
+}

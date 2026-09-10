@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-09-10",
+  "sources": {
+    "io/packed_ram_bank.py": {
+      "source_path": "/workspace/idrift2_transfer_20260908/io_optimization/packed_ram_bank.py",
+      "source_sha256": "b0000e84f0685f4de95c6ecc0301dce16cb2c4d661f3f9a98b23d8af2ac83231",
+      "ported_sha256": "9c3781bff488829c2615e6097728f7039319fe3e9f0dc7211928911409876f2e"
+    },
+    "io/color_compressed_memory_bank.py": {
+      "source_path": "/workspace/idrift2_transfer_20260908/io_optimization/color_compressed_memory_bank.py",
+      "source_sha256": "7c0dde242f157738033b09c346fe752a285582ee6c2b334aa4965dba7c0a908f",
+      "ported_sha256": "edc09d7c94723e87a38b9332b9d42b169f2e1a7e4857a14173f35898b55a6c0a"
+    },
+    "io/native_color_decoder.py": {
+      "source_path": "/workspace/idrift2_transfer_20260908/io_optimization/native_color_decoder.py",
+      "source_sha256": "da873856a9b966f2c51722430eaf967592cf168af5b2aa5cd9e871c631d68c84",
+      "ported_sha256": "9e16f67b2b7dbb66566278a4a412e861fce52ab6076272f558eb18abf23dbe86"
+    },
+    "io/native_color_decode.c": {
+      "source_path": "/workspace/idrift2_transfer_20260908/io_optimization/native_color_decode.c",
+      "source_sha256": "359a290136709d74239c09e6141584792807a18a693c4db4898644b2cc8ed14e",
+      "ported_sha256": "359a290136709d74239c09e6141584792807a18a693c4db4898644b2cc8ed14e"
+    },
+    "io/compact_imagefolder.py": {
+      "source_path": "/workspace/idrift2_transfer_20260908/io_optimization/compact_imagefolder.py",
+      "source_sha256": "e4cc752184fc7dde201cd38c64b4b3b967b2eb70c5e18dfc768d872d41847b5c",
+      "ported_sha256": "e4cc752184fc7dde201cd38c64b4b3b967b2eb70c5e18dfc768d872d41847b5c"
+    },
+    "io/wholefile_reader.py": {
+      "source_path": "/workspace/idrift2_transfer_20260908/io_optimization/prepare_wholefile_candidate.py",
+      "source_sha256": "b788234d17b63e52b8cfcd073b251b5bc3db3b6b4a26681fcb5a7df4364a1f21",
+      "ported_sha256": "2d47cb6c8c6c8b293333f02bf9d574029a782e8c57d9ab7e61f670717a8a7569"
+    },
+    "calibration/raw_imagenet_dino_moco_symmetric_3seed.json": {
+      "source_path": "/workspace/I-Drift/runs/calibration/raw_imagenet_s4_p32_direct_3seed_v2/raw_imagenet_dino_moco_symmetric_3seed.json",
+      "source_sha256": "8e1ff1977e1ac136154ec1cd06c2722c47d8fb4139a91928914f4be6e26417fa",
+      "ported_sha256": "8e1ff1977e1ac136154ec1cd06c2722c47d8fb4139a91928914f4be6e26417fa"
+    }
+  },
+  "presets": {
+    "dino_only_replay_feature": {
+      "source_path": "/workspace/idrift2_transfer_20260908/dino_only_replay_feature_drift_20260909/experiment.yaml",
+      "source_sha256": "b06c7fc2ea149082c6f3f56d81a986137f3aced83fc7605dcf290e82c6b026f2",
+      "ported_sha256": "7ef6e722973834f8ae4dfe608e5b8d67bfccc74feda58dd0a9eb92c963070416",
+      "relocated_fields": {
+        "env.imagenet_path": "data/imagenet/raw_ilsvrc2012",
+        "feature.feature_checkpoint": "weights/pretrained/dino_resnet50_pretrain.pth",
+        "train.temperature_calibration_artifact": "experiments/dino/calibration/raw_imagenet_dino_moco_symmetric_3seed.json"
+      },
+      "io_backend": "packed",
+      "status_at_capture": "running"
+    },
+    "replay_feature_hardcopy": {
+      "source_path": "/workspace/idrift2_transfer_20260908/replay_adversarial_feature_drift_hardcopy_20260909/experiment.yaml",
+      "source_sha256": "e2981a56e1705cb5b94dddab470dba9ced29054f1cd5d439e49e0f3a9b7d3697",
+      "ported_sha256": "04feb5c490d872a596d7510a12a03d43caeb17349731cd0cb4d3d75fe59358aa",
+      "relocated_fields": {
+        "env.imagenet_path": "data/imagenet/raw_ilsvrc2012",
+        "feature.feature_checkpoint": "weights/pretrained/dino_resnet50_pretrain.pth",
+        "train.temperature_calibration_artifact": "experiments/dino/calibration/raw_imagenet_dino_moco_symmetric_3seed.json"
+      },
+      "io_backend": "packed",
+      "status_at_capture": "historical_prepared_or_completed"
+    },
+    "replay_raw_gan_d32": {
+      "source_path": "/workspace/I-Drift/configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-historical-replay-e10-rho035-raw-conditional-gan-d32.yaml",
+      "source_sha256": "345934cee8e341d1b013351e05bb79d6567c8ddc8ef15c63c9a704da543328c6",
+      "ported_sha256": "7baf973ec98f14386a3407029a9b519973fd11b9cbbb1b713229df459cfd3576",
+      "relocated_fields": {
+        "env.imagenet_path": "data/imagenet/raw_ilsvrc2012",
+        "feature.feature_checkpoint": "weights/pretrained/dino_resnet50_pretrain.pth",
+        "train.temperature_calibration_artifact": "experiments/dino/calibration/raw_imagenet_dino_moco_symmetric_3seed.json"
+      },
+      "io_backend": "standard",
+      "status_at_capture": "historical_prepared_or_completed"
+    },
+    "replay_raw_gan_d128": {
+      "source_path": "/workspace/I-Drift/configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-historical-replay-e10-rho035-raw-conditional-gan-d128.yaml",
+      "source_sha256": "6a41777f2f671cbf7c81141ee8ea1f1d81416711e7f8f81364d119c8537d1e59",
+      "ported_sha256": "c03a82c2fe4bed29de99d18153fd6edba6eb2287dd785b92a75123624a1ce810",
+      "relocated_fields": {
+        "env.imagenet_path": "data/imagenet/raw_ilsvrc2012",
+        "feature.feature_checkpoint": "weights/pretrained/dino_resnet50_pretrain.pth",
+        "train.temperature_calibration_artifact": "experiments/dino/calibration/raw_imagenet_dino_moco_symmetric_3seed.json"
+      },
+      "io_backend": "standard",
+      "status_at_capture": "historical_prepared_or_completed"
+    }
+  },
+  "reference_sources": {
+    "dino_only_replay_feature_drift_20260909/trainer_dino_only_replay.py": {
+      "path": "/workspace/idrift2_transfer_20260908/dino_only_replay_feature_drift_20260909/trainer_dino_only_replay.py",
+      "sha256": "4e808de607d3f2c5f1972ff02e9b21f0495ce288bdd3a562344e482342c42236"
+    },
+    "dino_only_replay_feature_drift_20260909/train_feature.py": {
+      "path": "/workspace/idrift2_transfer_20260908/dino_only_replay_feature_drift_20260909/train_feature.py",
+      "sha256": "a8ca184d8a2cb2871469b8f072834ba4b7ae078907bf4d1b830e299c37ce4dc1"
+    },
+    "replay_adversarial_feature_drift_hardcopy_20260909/train_feature.py": {
+      "path": "/workspace/idrift2_transfer_20260908/replay_adversarial_feature_drift_hardcopy_20260909/train_feature.py",
+      "sha256": "79ebd6efbdeaff3d16950c9d282bcd35ec0910c14e30f76af1a7e6f267da705c"
+    },
+    "io_optimization/train_fastio_ablation.py": {
+      "path": "/workspace/idrift2_transfer_20260908/io_optimization/train_fastio_ablation.py",
+      "sha256": "af93321c93f9d453aa0cd104490adf00b497bb950a1f0eedec118d1eb20e12d3"
+    },
+    "training_launch/launch_replay_gan_pair.py": {
+      "path": "/workspace/idrift2_transfer_20260908/training_launch/launch_replay_gan_pair.py",
+      "sha256": "00a4b8231fb7d86f7b71406f6993e36f4177bccb25ac70c2f33da882618ace66"
+    }
+  }
+}

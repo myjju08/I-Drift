@@ -1,0 +1,148 @@
+{
+  "observed_utc": "2026-09-10T17:46:39.933495+00:00",
+  "suite": {
+    "passed": 290,
+    "skipped": 2,
+    "subtests_passed": 600,
+    "warnings": 46,
+    "seconds": 16.63,
+    "command": "CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 IDRIFT_MAE_REFERENCE_ROOT=/workspace/mae256_gan_prepare_20260910 PYTHONPATH=/tmp/idrift-port-test-deps:. python -m pytest tests -q"
+  },
+  "environment": {
+    "python": "3.12.14",
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "pytest": "9.1.1",
+    "gpu_training_launched": false
+  },
+  "dino_preflight": {
+    "adversarial": {
+      "adversarial_adam_b1": 0.0,
+      "adversarial_adam_b2": 0.99,
+      "adversarial_apply_replay": false,
+      "adversarial_base_channels": 32,
+      "adversarial_d_chunk_size": 8,
+      "adversarial_drift_weight": 1,
+      "adversarial_ema_decay": 0,
+      "adversarial_g_chunk_size": 16,
+      "adversarial_loss_weight": 0,
+      "adversarial_lr": 0.0001,
+      "adversarial_max_grad_norm": 0.0,
+      "adversarial_mode": "feature_drift",
+      "adversarial_r1_gamma": 1.0,
+      "adversarial_r1_interval": 16,
+      "adversarial_samples_per_class": 8,
+      "adversarial_seed": 43,
+      "adversarial_structure_weight": 0
+    },
+    "assets_checked": true,
+    "calibration_artifact_sha256": "8e1ff1977e1ac136154ec1cd06c2722c47d8fb4139a91928914f4be6e26417fa",
+    "cuda_initialized": false,
+    "decode_backend": "native",
+    "feature_extractor": "dino_resnet50",
+    "generated_per_step": 256,
+    "generator_initial_state": {
+      "0": {
+        "matches_source": true,
+        "seed": 43,
+        "sha256": "f2d9f6522592733bd50c5d995bfb507f09bff965f7bfd397fddc336b383aa31c"
+      },
+      "1": {
+        "matches_source": true,
+        "seed": 44,
+        "sha256": "b4300af0b38959d2e642bc3a8d719087a48f6daceba3d49ad3ed167677266ce9"
+      }
+    },
+    "generator_seed_per_rank": [
+      43,
+      44
+    ],
+    "io_backend": "packed",
+    "name": "S4 / DINO-only Replay (frozen 10epoch, rho 0.35) / CNN feature drift (D32, no Replay, no structure, no EMA) / scratch",
+    "packed_bank": {
+      "empty_class": true,
+      "passed": true,
+      "ring_wrap": true,
+      "samples_and_rng_identical": true,
+      "storage_stats": {
+        "arena_capacity_bytes": 15728640,
+        "arena_dontfork": true,
+        "closed": false,
+        "disk_entries": 0,
+        "disk_payload_bytes": 0,
+        "free_capacity_bytes": 15192064,
+        "metadata_bytes": 1047360,
+        "page_bytes": 4096,
+        "page_slack_bytes": 533563,
+        "pages_used": 131,
+        "payload_bytes": 3013,
+        "ram_allocated_capacity_bytes": 16776000,
+        "ram_budget_bytes": 16777216,
+        "ram_entries": 131,
+        "ram_payload_bytes": 3013,
+        "raw_equivalent_bytes": 2358,
+        "spill_read_bytes": 0,
+        "spill_write_bytes": 0
+      }
+    },
+    "passed": true,
+    "preset": "dino_only_replay_feature",
+    "raw_imagenet_expected": {
+      "classes": 1000,
+      "train_files": 1281167,
+      "val_files": 50000
+    },
+    "replay": {
+      "historical_gen_current_weight": null,
+      "historical_gen_history_weight": null,
+      "historical_gen_replay": true,
+      "historical_gen_replay_bank_count": 16,
+      "historical_gen_replay_count": 16,
+      "historical_gen_replay_ratio": 0.35,
+      "historical_gen_replay_ratio_ramp_end_step": 0,
+      "historical_gen_replay_ratio_ramp_start_step": 0,
+      "historical_gen_replay_ratio_start": null,
+      "historical_gen_replay_source": "frozen_snapshot",
+      "historical_gen_replay_start_generated_epochs": 10.0,
+      "historical_gen_replay_storage_dtype": "float16"
+    },
+    "replay_ratio_after": 0.35,
+    "replay_ratio_before": 0.0,
+    "replay_start_step": 50046,
+    "samples_per_rank": {
+      "batch_size": 4,
+      "gen_per_label": 32,
+      "neg_per_sample": 32,
+      "pos_per_sample": 64
+    },
+    "schedule": {
+      "cfg_list": [
+        1.0,
+        2.0,
+        3.0
+      ],
+      "eval_at_start": true,
+      "eval_per_generated_epochs": 10.0,
+      "eval_samples": 1024,
+      "save_per_generated_epochs": 10.0,
+      "total_generated_epochs": 40.0
+    },
+    "train_prefetch_factor_runtime": 1,
+    "training_started": false,
+    "world_size": 2
+  },
+  "mae_preflight": {
+    "mode": "raw_gan",
+    "architecture": "latent_spatial_844",
+    "asset_hashes_verified": true,
+    "cache_counts": {
+      "train": 1281167,
+      "val": 50000
+    },
+    "training_started": false
+  },
+  "syntax_compile_passed": true,
+  "git_diff_check_passed": true,
+  "live_preservation_artifact": "live_preservation_audit.json",
+  "scope_limit": "CPU parity and asset/config checks; no full-data GPU rerun or final FID reproduction."
+}

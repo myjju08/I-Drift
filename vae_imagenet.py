@@ -17,19 +17,30 @@ import torch.nn as nn
 _vae_cache: dict = {}
 
 
-def _load_vae(device: Optional[torch.device] = None):
-    """Load the SD VAE (cached after first call)."""
-    if "model" not in _vae_cache:
+def load_vae(
+    device: Optional[torch.device] = None,
+    model_id: str = "stabilityai/sd-vae-ft-mse",
+    revision: Optional[str] = None,
+):
+    """Load and freeze an SD VAE, cached by model id and revision."""
+    cache_key = (str(model_id), str(revision) if revision else None)
+    if cache_key not in _vae_cache:
         from diffusers import AutoencoderKL
-        vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
-        _vae_cache["model"] = vae
-    vae = _vae_cache["model"]
+        load_kwargs = {"revision": revision} if revision else {}
+        vae = AutoencoderKL.from_pretrained(model_id, **load_kwargs)
+        _vae_cache[cache_key] = vae
+    vae = _vae_cache[cache_key]
     if device is not None:
         vae = vae.to(device)
     vae.eval()
     for p in vae.parameters():
         p.requires_grad_(False)
     return vae
+
+
+def _load_vae(device: Optional[torch.device] = None):
+    """Backward-compatible default VAE loader."""
+    return load_vae(device=device)
 
 
 def vae_encode(
@@ -75,12 +86,14 @@ def vae_decode(
 
 def get_vae_enc_dec(
     device: Optional[torch.device] = None,
+    model_id: str = "stabilityai/sd-vae-ft-mse",
+    revision: Optional[str] = None,
 ) -> Tuple[Callable, Callable]:
     """Return (encode_fn, decode_fn) bound to a shared VAE instance.
 
     Both callables accept torch tensors on `device` and return tensors on the same device.
     """
-    vae = _load_vae(device)
+    vae = load_vae(device=device, model_id=model_id, revision=revision)
     return (
         partial(vae_encode, vae=vae),
         partial(vae_decode, vae=vae),
@@ -178,4 +191,10 @@ def build_latent_cache(
                 os.replace(tmp, out)
 
 
-__all__ = ["vae_encode", "vae_decode", "get_vae_enc_dec", "build_latent_cache"]
+__all__ = [
+    "load_vae",
+    "vae_encode",
+    "vae_decode",
+    "get_vae_enc_dec",
+    "build_latent_cache",
+]

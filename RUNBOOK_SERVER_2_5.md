@@ -1,5 +1,11 @@
 # Drift ImageNet Runbook (Servers 2/3/4/5)
 
+This is the historical multi-node cluster runbook. Its host paths, world size
+and batch settings do not describe the DINO/MAE adversarial experiments ported
+on 2026-09-10. For their two-rank configurations and local runtime commands,
+use [the current README](README.md), [DINO guide](DINO_EXPERIMENTS.md), and
+[MAE guide](experiments/mae/README.md).
+
 Assumptions:
 - 4 nodes total: server2, server3, server4, server5
 - each node has 8 GPUs

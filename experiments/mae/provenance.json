@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "observed_utc": "2026-09-10",
+  "source_root": "/workspace/mae256_gan_prepare_20260910",
+  "source_sha256": {
+    "/workspace/mae256_gan_prepare_20260910/configs/control.yaml": "cca7f1f22723ca13c7fc099aae338203cd976bbf1d11618a589e004936e6c29a",
+    "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/raw_gan.yaml": "f61119bb99072629a64faed2215fe4740ecee7d5ff18d1e8098aea4a7a8ff214",
+    "/workspace/mae256_gan_prepare_20260910/latent_spatial/configs/feature_drift.yaml": "a4eaa4886577197a3d10464de70198677af22cfac63ad7783c61fc0319cae93a",
+    "/workspace/mae256_gan_prepare_20260910/latent_direct_gan.py": "3a6deffab951138da8a7c61b18c6b81f8b48bc8ff91e76584e97368a41f257cf",
+    "/workspace/mae256_gan_prepare_20260910/latent_spatial_gan.py": "61ab08283310e106464a5357a01141233f34437a9d1c5c5e23e9cf89c81518e5",
+    "/workspace/mae256_gan_prepare_20260910/latent_cache.py": "04ce894d7ec4db2123a0c6f2afd3fc17913e3919b87ea43ff4410bf5d24b8dab",
+    "/workspace/mae256_gan_prepare_20260910/trainer_bridge.py": "a264b0ad3202fe42e148dad9ddee06ec07a527298bad19a26aadadc61bd7ecf7",
+    "/workspace/mae256_gan_prepare_20260910/runtime.py": "359eb8c493face94187b5e37077b007fe70f78f2da6921191390c479e84b5a62",
+    "/workspace/mae256_gan_prepare_20260910/latent_spatial/runtime.py": "2d4d36145425a5a7c386918f23cca92d6165b521f021403feb7e059f2e396d1d",
+    "/workspace/mae256_gan_prepare_20260910/latent_spatial/identity.json": "b9f01c8969b5e107324183ec3f583fb24c8d0c71b0f31f885d2efa1611da7dfd",
+    "/workspace/mae256_gan_prepare_20260910/control_identity.json": "9808323ae87632ceb5695fd35ffb6e21e06d8ff67a44509aa82afa12c026b3bc"
+  },
+  "config_path_relocations": {
+    "imagenet_path": "data/imagenet/raw_ilsvrc2012",
+    "cache_path": "data/imagenet/latent_cache_256_mae_gan_20260910",
+    "feature_checkpoint": "artifacts/mae_latent_256/ckpt_ema.pt",
+    "mae_checkpoint": "artifacts/mae_latent_256/ckpt_ema.pt",
+    "feature_vae_model_id": "artifacts/sd-vae-ft-mse"
+  },
+  "preserved_scientific_config_fields": true,
+  "asset_sha256": {
+    "mae_checkpoint": "8e3eed607d1740af93838de15af8bb4d46cfcae1f0f41b2228fc61437ab37d43",
+    "vae_config": "92d3dfb746fca211a2c9e019e285f8597412211728dce3c5bcf4eda0f2d62e7e",
+    "vae_weights": "a1d993488569e928462932c8c38a0760b874d166399b14414135bd9c42df5815"
+  }
+}

@@ -86,10 +86,14 @@ class SharedDualDriftDistanceTest(unittest.TestCase):
         self.assertEqual(set(shared_info), set(reference_info))
         for key in reference_info:
             with self.subTest(metric=key):
-                self.assertAlmostEqual(
+                # Diagnostics use the same fp32 reductions as the loss. Allow
+                # their few-ULP reordering error with the loss/gradient bounds,
+                # instead of a decimal-place threshold independent of scale.
+                torch.testing.assert_close(
                     float(shared_info[key]),
                     float(reference_info[key]),
-                    places=5,
+                    rtol=2e-5,
+                    atol=2e-6,
                 )
 
     def test_shared_path_halves_pairwise_distance_calls(self):

@@ -14,6 +14,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.so
 .Python
 .pytest_cache/
 .mypy_cache/

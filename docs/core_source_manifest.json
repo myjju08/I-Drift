@@ -1,0 +1,711 @@
+{
+  "source": "/workspace/I-Drift",
+  "snapshot_date": "2026-09-10",
+  "files": [
+    {
+      "path": "memory_bank.py",
+      "sha256": "312c607133cf22845e1f52b0a7577ca85d930b832c086d5c506a71f02d28b51f",
+      "ported_sha256": "312c607133cf22845e1f52b0a7577ca85d930b832c086d5c506a71f02d28b51f"
+    },
+    {
+      "path": "temperature_calibration_inheritance.py",
+      "sha256": "13de8d3ca7eea0dc524dddb5a52bda420360cb862be9d4384e2df11ee2d8a73b",
+      "ported_sha256": "13de8d3ca7eea0dc524dddb5a52bda420360cb862be9d4384e2df11ee2d8a73b"
+    },
+    {
+      "path": "train_imagenet_gen.py",
+      "sha256": "b7253c1148e5be68fbab4a581d7de3b85d55b5fb275987f47fc04dc889d1d486",
+      "ported_sha256": "668142aae99804ac2328cf59d8827c0a89532fc457c5d1e7c75b19c68a4425ef"
+    },
+    {
+      "path": "train_imagenet_mae.py",
+      "sha256": "e66f8b0a75b23079557607571fbec29678e808c51aee2cb096660494cbed93cb",
+      "ported_sha256": "e66f8b0a75b23079557607571fbec29678e808c51aee2cb096660494cbed93cb"
+    },
+    {
+      "path": "utils.py",
+      "sha256": "b3e8c3804838e2e4f8d4e85848d66079f5f871df8c3230ccfe184101f8dcf1f6",
+      "ported_sha256": "b3e8c3804838e2e4f8d4e85848d66079f5f871df8c3230ccfe184101f8dcf1f6"
+    },
+    {
+      "path": "vae_imagenet.py",
+      "sha256": "4c5d0e0947c3b4e9d82745b5365bc91ad2e9f7ed79286d00fa7f896b71546205",
+      "ported_sha256": "4c5d0e0947c3b4e9d82745b5365bc91ad2e9f7ed79286d00fa7f896b71546205"
+    },
+    {
+      "path": "models/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ported_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "models/adversarial_drift.py",
+      "sha256": "6554a3fbaa696ba48aaf8c1b5ac88e6d855a521944f4dc649665f25f73cbcbe8",
+      "ported_sha256": "6554a3fbaa696ba48aaf8c1b5ac88e6d855a521944f4dc649665f25f73cbcbe8"
+    },
+    {
+      "path": "models/dino_rf_tuning.py",
+      "sha256": "e0da080bda6de5c3e18a698487d6c4bfcd942d0d84fdb309330de607baf9669a",
+      "ported_sha256": "e0da080bda6de5c3e18a698487d6c4bfcd942d0d84fdb309330de607baf9669a"
+    },
+    {
+      "path": "models/feature_adapter.py",
+      "sha256": "0dd958eb796454fa263b35557099b238e6e75aa43cbd59b13d8320d64187de7c",
+      "ported_sha256": "0dd958eb796454fa263b35557099b238e6e75aa43cbd59b13d8320d64187de7c"
+    },
+    {
+      "path": "models/feature_gan.py",
+      "sha256": "29d469638ddc81bc6ef4e5eb9779783066ea5fc281ac40dd38913b9e6ba5b92c",
+      "ported_sha256": "29d469638ddc81bc6ef4e5eb9779783066ea5fc281ac40dd38913b9e6ba5b92c"
+    },
+    {
+      "path": "models/feature_memory_bank.py",
+      "sha256": "e6e6c27a363e649385a449a4a2012aa416533dcf0ff308ca1ededaa4f26e24e2",
+      "ported_sha256": "e6e6c27a363e649385a449a4a2012aa416533dcf0ff308ca1ededaa4f26e24e2"
+    },
+    {
+      "path": "models/imagenet_generator.py",
+      "sha256": "1a6ace95849e6b82b3f30b67d9a2d4b5c9e111b28086e841b20071399f33cd20",
+      "ported_sha256": "1a6ace95849e6b82b3f30b67d9a2d4b5c9e111b28086e841b20071399f33cd20"
+    },
+    {
+      "path": "models/mae_resnet.py",
+      "sha256": "10a4788a01d5b2fea3b1c085d451d6e6827f8e54847536d9ea706f9581171a43",
+      "ported_sha256": "10a4788a01d5b2fea3b1c085d451d6e6827f8e54847536d9ea706f9581171a43"
+    },
+    {
+      "path": "models/ssl_latent_bridge.py",
+      "sha256": "e86a73a638356d58ddaaa5c3608c6bb57c0327d591c1e9931c138815a1e5ceb2",
+      "ported_sha256": "e86a73a638356d58ddaaa5c3608c6bb57c0327d591c1e9931c138815a1e5ceb2"
+    },
+    {
+      "path": "models/ssl_resnet.py",
+      "sha256": "a67854f1093ad35e2f20894f23d8daec5fa035176b5f16ce839a762f5d4dfc87",
+      "ported_sha256": "a67854f1093ad35e2f20894f23d8daec5fa035176b5f16ce839a762f5d4dfc87"
+    },
+    {
+      "path": "train/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ported_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "train/train_configs.py",
+      "sha256": "159bb00752b0c06018ec99d1e92914145e6d7f9fcb598333bd9d2b60361bef76",
+      "ported_sha256": "159bb00752b0c06018ec99d1e92914145e6d7f9fcb598333bd9d2b60361bef76"
+    },
+    {
+      "path": "train/train_data.py",
+      "sha256": "f922c9968f0286846b9f8b001007832076d22829fea195f91a60ac032c9c10e9",
+      "ported_sha256": "f922c9968f0286846b9f8b001007832076d22829fea195f91a60ac032c9c10e9"
+    },
+    {
+      "path": "drifting_core/__init__.py",
+      "sha256": "2d057844841620304c84953d162f40162141f902be292c8b93e112d69ced9f3d",
+      "ported_sha256": "2d057844841620304c84953d162f40162141f902be292c8b93e112d69ced9f3d"
+    },
+    {
+      "path": "drifting_core/imagenet_loss.py",
+      "sha256": "4c11f42d41b86f299bec0a778961336f18c04fda0a8fbd1ea2b5f6b87a1a1fe3",
+      "ported_sha256": "4c11f42d41b86f299bec0a778961336f18c04fda0a8fbd1ea2b5f6b87a1a1fe3"
+    },
+    {
+      "path": "drifting_core/indexed_reduce.py",
+      "sha256": "1ada1830245029598bf3d0bb7f62e993ca478fb8dfad5807038cc14eac5aa773",
+      "ported_sha256": "1ada1830245029598bf3d0bb7f62e993ca478fb8dfad5807038cc14eac5aa773"
+    },
+    {
+      "path": "drifting_core/topk_diagnostics.py",
+      "sha256": "6d8fa029d80992ce665b8b6691cddac0b8925ae7b8a5da64b84c566918edbd33",
+      "ported_sha256": "6d8fa029d80992ce665b8b6691cddac0b8925ae7b8a5da64b84c566918edbd33"
+    },
+    {
+      "path": "tests/__init__.py",
+      "sha256": "bd2d7524566a26f9fc6e10cff180474e83ecd7feb9c9e8ac5631a9b5fd5f947f",
+      "ported_sha256": "bd2d7524566a26f9fc6e10cff180474e83ecd7feb9c9e8ac5631a9b5fd5f947f"
+    },
+    {
+      "path": "tests/test_adversarial_drift.py",
+      "sha256": "7f584b042da3c82fbca2b01283e43bca1265e801e473546f83d32ad7683d9402",
+      "ported_sha256": "7f584b042da3c82fbca2b01283e43bca1265e801e473546f83d32ad7683d9402"
+    },
+    {
+      "path": "tests/test_counterfactual_drift_adapter_objective.py",
+      "sha256": "7802eecd1890f8bfee114b049b48c859684658240fddff6b3ff0e4bbf7b49c57",
+      "ported_sha256": "836014edf011566c533166a22db95edf8114362ed170d1eced816e18e60c4ad8"
+    },
+    {
+      "path": "tests/test_dino_masked_self_distill_adapter.py",
+      "sha256": "8ca852d967518f7507a3a611ac6d9fd3f26ccd13f0808113e4eabb3da2f7700d",
+      "ported_sha256": "8ca852d967518f7507a3a611ac6d9fd3f26ccd13f0808113e4eabb3da2f7700d"
+    },
+    {
+      "path": "tests/test_dino_rf_tuning.py",
+      "sha256": "07eccfce5a78a597a438df71eadf5b6214a02f4da0197f2eb58f6c5ff7599ede",
+      "ported_sha256": "07eccfce5a78a597a438df71eadf5b6214a02f4da0197f2eb58f6c5ff7599ede"
+    },
+    {
+      "path": "tests/test_dino_rf_tuning_data.py",
+      "sha256": "2282557b57e39d974e3ed5288cf6a1cf4745188f065e3b25b37750e208f56cda",
+      "ported_sha256": "2282557b57e39d974e3ed5288cf6a1cf4745188f065e3b25b37750e208f56cda"
+    },
+    {
+      "path": "tests/test_download_extract_raw_imagenet.py",
+      "sha256": "4a7de2c7448b4e09117b9613d4e4dcaf4cc492a5f441df1c41d8e96de8c3b592",
+      "ported_sha256": "4a7de2c7448b4e09117b9613d4e4dcaf4cc492a5f441df1c41d8e96de8c3b592"
+    },
+    {
+      "path": "tests/test_drift_force_multiplier.py",
+      "sha256": "1825c421ac5fbc547ae3c06d6e22d70d9531ca4ae630029183f32dc7c3c294c8",
+      "ported_sha256": "1825c421ac5fbc547ae3c06d6e22d70d9531ca4ae630029183f32dc7c3c294c8"
+    },
+    {
+      "path": "tests/test_drift_top_k.py",
+      "sha256": "490058dc81a6be2d1998fd5d5c0f9e50e08b54f85269089ec61a6e1978413b84",
+      "ported_sha256": "490058dc81a6be2d1998fd5d5c0f9e50e08b54f85269089ec61a6e1978413b84"
+    },
+    {
+      "path": "tests/test_drift_top_p.py",
+      "sha256": "b72c4ae8fc7dc33270ad06a38e0afd10917323078a6bfe474db40d0fe7da8311",
+      "ported_sha256": "b72c4ae8fc7dc33270ad06a38e0afd10917323078a6bfe474db40d0fe7da8311"
+    },
+    {
+      "path": "tests/test_feature_adapter.py",
+      "sha256": "e748f8f9f5eb7f06a8ce4168b4f9fd352c040cee19cc0296ca45cf1b2534e38b",
+      "ported_sha256": "e748f8f9f5eb7f06a8ce4168b4f9fd352c040cee19cc0296ca45cf1b2534e38b"
+    },
+    {
+      "path": "tests/test_feature_gan.py",
+      "sha256": "86a6569d4e054e82b9c75781100d06c62986cab71c79ff340347dff5864a09f7",
+      "ported_sha256": "86a6569d4e054e82b9c75781100d06c62986cab71c79ff340347dff5864a09f7"
+    },
+    {
+      "path": "tests/test_feature_loss_groups.py",
+      "sha256": "ed2a63b7d0c9d6e36d911c3b697c2a42a2aa2bc26ba7f7d7633cbf09bfc6d1d1",
+      "ported_sha256": "ed2a63b7d0c9d6e36d911c3b697c2a42a2aa2bc26ba7f7d7633cbf09bfc6d1d1"
+    },
+    {
+      "path": "tests/test_feature_memory_bank.py",
+      "sha256": "97249b9ed66652f8f6f4079c5fc0e2b0be4f470dc8cdb3414295f35eac98f89c",
+      "ported_sha256": "97249b9ed66652f8f6f4079c5fc0e2b0be4f470dc8cdb3414295f35eac98f89c"
+    },
+    {
+      "path": "tests/test_historical_gen_replay.py",
+      "sha256": "07ce7fac1aba871328fab1cf12563f51737604dc0763ce533c9fc1438e0ddda8",
+      "ported_sha256": "07ce7fac1aba871328fab1cf12563f51737604dc0763ce533c9fc1438e0ddda8"
+    },
+    {
+      "path": "tests/test_imagenet_generator_attention.py",
+      "sha256": "b1c04241875106b3ce0eee6ea8570e449b118835646f6783e652fb8d3b78ed8c",
+      "ported_sha256": "b1c04241875106b3ce0eee6ea8570e449b118835646f6783e652fb8d3b78ed8c"
+    },
+    {
+      "path": "tests/test_layer_temperature.py",
+      "sha256": "b0a49b33093ab1430a9c79055c4bff8b01c346ba0ef9365030ee740ffcf2ffa5",
+      "ported_sha256": "b0a49b33093ab1430a9c79055c4bff8b01c346ba0ef9365030ee740ffcf2ffa5"
+    },
+    {
+      "path": "tests/test_manage_raw_imagenet_storage.py",
+      "sha256": "47def83ecfb076f547c6a129fdf793cd5dd605731dec85a8f45e5bb498f71299",
+      "ported_sha256": "47def83ecfb076f547c6a129fdf793cd5dd605731dec85a8f45e5bb498f71299"
+    },
+    {
+      "path": "tests/test_memory_bank.py",
+      "sha256": "061fd4f4560797e1fc10c2cb1701b2ad1684e83f87f794593ef39c878522449f",
+      "ported_sha256": "061fd4f4560797e1fc10c2cb1701b2ad1684e83f87f794593ef39c878522449f"
+    },
+    {
+      "path": "tests/test_mirror_raw_imagenet_to_ram.py",
+      "sha256": "aabc4fb1ee089e3093e37f63a7aeff6b477cda7d0e860c73804e520c7d8d954a",
+      "ported_sha256": "658f930a5a57b12ee26823cd8f5a3d7bce458464e93db17a686828619558bea0"
+    },
+    {
+      "path": "tests/test_mix_alpha_tracker.py",
+      "sha256": "b902705d687b651f71cd6697f7092ebde1a2cf9f43bed6aebaa6c9b14fed7642",
+      "ported_sha256": "b902705d687b651f71cd6697f7092ebde1a2cf9f43bed6aebaa6c9b14fed7642"
+    },
+    {
+      "path": "tests/test_raw_drift_adapter_objective.py",
+      "sha256": "904227b91e12ffd32a38603a398713c486af46721df3a28aa50fcb15badf743e",
+      "ported_sha256": "904227b91e12ffd32a38603a398713c486af46721df3a28aa50fcb15badf743e"
+    },
+    {
+      "path": "tests/test_raw_drift_adapter_v2.py",
+      "sha256": "620894cd099bf851808d593220bff3a9fd578fb84cab10562dbf00b8e9e0e143",
+      "ported_sha256": "620894cd099bf851808d593220bff3a9fd578fb84cab10562dbf00b8e9e0e143"
+    },
+    {
+      "path": "tests/test_raw_temperature_guard.py",
+      "sha256": "1d86ded2450747145ee4a443d53c214cf7a9cec76ce3a34a17f33e9e8c05d980",
+      "ported_sha256": "1d86ded2450747145ee4a443d53c214cf7a9cec76ce3a34a17f33e9e8c05d980"
+    },
+    {
+      "path": "tests/test_reverse_affinity_kernels.py",
+      "sha256": "fdeafa8c438f0614fdd475e5cb75d00d292b8cfa2213e3073a6e2e8f35238ddb",
+      "ported_sha256": "fdeafa8c438f0614fdd475e5cb75d00d292b8cfa2213e3073a6e2e8f35238ddb"
+    },
+    {
+      "path": "tests/test_reverse_drift_raw_fields.py",
+      "sha256": "70413b2e50ca7d1119486b13955b2e3fbf464cda8496e9702381a6b5768de6fd",
+      "ported_sha256": "70413b2e50ca7d1119486b13955b2e3fbf464cda8496e9702381a6b5768de6fd"
+    },
+    {
+      "path": "tests/test_shared_dual_drift.py",
+      "sha256": "3242513e983dca472f350ec6fc93868a831cc4d13c80ab0ed1b04a6481e69e4e",
+      "ported_sha256": "a23693c2a80a5a82ee2cf1d570e2dd9e355777ea3e4cf5d3cb9bed9f11616a11"
+    },
+    {
+      "path": "tests/test_ssl_latent_bridge.py",
+      "sha256": "f905cf48a6206b32e15504cae08ca1413abf4dc352cdab6a9d4f059b08863f53",
+      "ported_sha256": "f905cf48a6206b32e15504cae08ca1413abf4dc352cdab6a9d4f059b08863f53"
+    },
+    {
+      "path": "tests/test_ssl_resnet.py",
+      "sha256": "d440d4b7f5cb4467a6912327119640bc06c164d009a185a7cc6bfaa85bf6757c",
+      "ported_sha256": "d440d4b7f5cb4467a6912327119640bc06c164d009a185a7cc6bfaa85bf6757c"
+    },
+    {
+      "path": "tests/test_temperature_calibration_inheritance.py",
+      "sha256": "d10bbd25096471fe18fb75cf076a99b5f5fae173955a78bc351a858d43b7d2ee",
+      "ported_sha256": "d10bbd25096471fe18fb75cf076a99b5f5fae173955a78bc351a858d43b7d2ee"
+    },
+    {
+      "path": "tests/test_throughput_opt_level4.py",
+      "sha256": "a6a384209bcc4b5dfe0af0afcb62d891b9359334bb440e39e8e299b8bf445090",
+      "ported_sha256": "a6a384209bcc4b5dfe0af0afcb62d891b9359334bb440e39e8e299b8bf445090"
+    },
+    {
+      "path": "tests/test_topk_heterogeneity.py",
+      "sha256": "dc28db14a0a82d9812c70a12f703a6d69ad161b5a8e2249e4cced971ed8db32f",
+      "ported_sha256": "dc28db14a0a82d9812c70a12f703a6d69ad161b5a8e2249e4cced971ed8db32f"
+    },
+    {
+      "path": "tests/test_train_data_uint8.py",
+      "sha256": "34596025c9e7dfe0ff4c968641a297128fe1e2b4d9b1c810d12532a8ea4834a5",
+      "ported_sha256": "34596025c9e7dfe0ff4c968641a297128fe1e2b4d9b1c810d12532a8ea4834a5"
+    },
+    {
+      "path": "scripts/benchmark_drift_variant.py",
+      "sha256": "148e4b16481a7cb31c7f1d76560cabd21102189af323c2187727d42a54aa9662",
+      "ported_sha256": "148e4b16481a7cb31c7f1d76560cabd21102189af323c2187727d42a54aa9662"
+    },
+    {
+      "path": "scripts/benchmark_s4_mixed_adversarial.py",
+      "sha256": "b73d4fbfadf49561e7824bff792db945ef0af1a0bc909d22ba9595d72329295f",
+      "ported_sha256": "b73d4fbfadf49561e7824bff792db945ef0af1a0bc909d22ba9595d72329295f"
+    },
+    {
+      "path": "scripts/benchmark_s4_pixel_banks.py",
+      "sha256": "b593f4444c44ccf0411845a7d90b433388cb6300e8d04657dabcd27947c1890a",
+      "ported_sha256": "b593f4444c44ccf0411845a7d90b433388cb6300e8d04657dabcd27947c1890a"
+    },
+    {
+      "path": "scripts/benchmark_s4_throughput.py",
+      "sha256": "94157485f27e02bc2b221e665703282fe7bea592f267d6d4a8801f1875d01757",
+      "ported_sha256": "94157485f27e02bc2b221e665703282fe7bea592f267d6d4a8801f1875d01757"
+    },
+    {
+      "path": "scripts/build_pixel_cache_from_latents.py",
+      "sha256": "bef9055d6b2ff09ba5f787fbaeb42dd6dab6de105903445724df497385c69691",
+      "ported_sha256": "bef9055d6b2ff09ba5f787fbaeb42dd6dab6de105903445724df497385c69691"
+    },
+    {
+      "path": "scripts/calibrate_feature_encoder_temperatures.py",
+      "sha256": "3f1b1ed91632825f5847fa64c5e0269f8403a56e1faac933a0464645ed0357c8",
+      "ported_sha256": "3f1b1ed91632825f5847fa64c5e0269f8403a56e1faac933a0464645ed0357c8"
+    },
+    {
+      "path": "scripts/convert_gen_hf_jax_to_torch.py",
+      "sha256": "151be5173449b671dd94583db5fa44f0c562367a8abda63cf4617ca585a4af08",
+      "ported_sha256": "151be5173449b671dd94583db5fa44f0c562367a8abda63cf4617ca585a4af08"
+    },
+    {
+      "path": "scripts/convert_mae_hf_jax_to_torch.py",
+      "sha256": "9d1af128cac4f3032114bdc72c1be7bdad407630b3af6d39492cb6f668c68f49",
+      "ported_sha256": "9d1af128cac4f3032114bdc72c1be7bdad407630b3af6d39492cb6f668c68f49"
+    },
+    {
+      "path": "scripts/debug_self_mask_compare.py",
+      "sha256": "bb9198de56a1c2dba53d3914a4c8539d7361f58c61fd8f8f8dab0c8d3a39b654",
+      "ported_sha256": "bb9198de56a1c2dba53d3914a4c8539d7361f58c61fd8f8f8dab0c8d3a39b654"
+    },
+    {
+      "path": "scripts/diagnose_reverse_kernel_ess.py",
+      "sha256": "cbc2d6243c0efc310c3f0571ba17a997fd9ecfa2e147ce37cb2c554e2eee171c",
+      "ported_sha256": "cbc2d6243c0efc310c3f0571ba17a997fd9ecfa2e147ce37cb2c554e2eee171c"
+    },
+    {
+      "path": "scripts/diagnose_topk_heterogeneity.py",
+      "sha256": "f0c119877009b04e8aa2a33a0911519c0224b59179c5a8cae9f01b2c5ea92dd1",
+      "ported_sha256": "f0c119877009b04e8aa2a33a0911519c0224b59179c5a8cae9f01b2c5ea92dd1"
+    },
+    {
+      "path": "scripts/download_extract_raw_imagenet.py",
+      "sha256": "a380becf8c6d5accfc256502ec83f9bf42f68597aba4c00e274bedf80940521b",
+      "ported_sha256": "a380becf8c6d5accfc256502ec83f9bf42f68597aba4c00e274bedf80940521b"
+    },
+    {
+      "path": "scripts/download_imagenet256_ref_batch.py",
+      "sha256": "aea26e8f0122c5f0b8b57964fbcf49ca754de2c3feaef0d28ec76f010d8ec4ab",
+      "ported_sha256": "aea26e8f0122c5f0b8b57964fbcf49ca754de2c3feaef0d28ec76f010d8ec4ab"
+    },
+    {
+      "path": "scripts/eval_fid_is_standalone.py",
+      "sha256": "a084dfbb9113a353957a328674e14f5370015bda29109de150df121f16c087f9",
+      "ported_sha256": "a084dfbb9113a353957a328674e14f5370015bda29109de150df121f16c087f9"
+    },
+    {
+      "path": "scripts/eval_npz_roundtrip.py",
+      "sha256": "008fc9e294b00a8721bd3863e582a226e0d8618041c163724bdc8066525a6005",
+      "ported_sha256": "008fc9e294b00a8721bd3863e582a226e0d8618041c163724bdc8066525a6005"
+    },
+    {
+      "path": "scripts/eval_official_imagenet256.py",
+      "sha256": "7d4d1adbf0fabe3ae80d98e6f9093b1ab736b3af8e87a5e3b77fd213d0b9eacb",
+      "ported_sha256": "7d4d1adbf0fabe3ae80d98e6f9093b1ab736b3af8e87a5e3b77fd213d0b9eacb"
+    },
+    {
+      "path": "scripts/kernel_ess_spec.py",
+      "sha256": "0d4c4c84b534ffcbee387eeadc9ae2298fc2a7d4ffc9c1a03dec8aea5dbcd9f4",
+      "ported_sha256": "0d4c4c84b534ffcbee387eeadc9ae2298fc2a7d4ffc9c1a03dec8aea5dbcd9f4"
+    },
+    {
+      "path": "scripts/manage_raw_imagenet_storage.py",
+      "sha256": "53b3c589727c8856ff3315cdb93c1ee7aef4e900f92a83896585f6ce3156223e",
+      "ported_sha256": "53b3c589727c8856ff3315cdb93c1ee7aef4e900f92a83896585f6ce3156223e"
+    },
+    {
+      "path": "scripts/mirror_raw_imagenet_to_ram.py",
+      "sha256": "a360fd424cb8a02b9ec02123dd58cde6a126808307aeb2fbe02597af7e9e4b16",
+      "ported_sha256": "a360fd424cb8a02b9ec02123dd58cde6a126808307aeb2fbe02597af7e9e4b16"
+    },
+    {
+      "path": "scripts/prepare_dino_rf_tuning_data.py",
+      "sha256": "268d03ccb5ee9178a7c9a155c04d5d4889216ce77c7bba8393b0246b835e3948",
+      "ported_sha256": "268d03ccb5ee9178a7c9a155c04d5d4889216ce77c7bba8393b0246b835e3948"
+    },
+    {
+      "path": "scripts/prepare_imagenet_256.py",
+      "sha256": "7e48f5dd9d198c9984568f4b637e8f6c33d164f8ac9f502c396c7a9fa73be828",
+      "ported_sha256": "7e48f5dd9d198c9984568f4b637e8f6c33d164f8ac9f502c396c7a9fa73be828"
+    },
+    {
+      "path": "scripts/run_B4_compute_matched_objective.py",
+      "sha256": "eb9c8aa2b9e1f1ac1fe0df82095da923b4ea9240bbba85c07785744a4a17b96a",
+      "ported_sha256": "eb9c8aa2b9e1f1ac1fe0df82095da923b4ea9240bbba85c07785744a4a17b96a"
+    },
+    {
+      "path": "scripts/run_B4_reverse_ess_kernel_ablation.py",
+      "sha256": "3c24b8f4f0e53208f2a04b8ec1f91b36f90732bf1f5c8771ae353108888d2d33",
+      "ported_sha256": "3c24b8f4f0e53208f2a04b8ec1f91b36f90732bf1f5c8771ae353108888d2d33"
+    },
+    {
+      "path": "scripts/run_B4_reverse_feature_adapter_ablation.py",
+      "sha256": "afe99ee6b03390f7f1d2c4969b2d8c369bda1a0d2bfc7370ad727e9435d82128",
+      "ported_sha256": "afe99ee6b03390f7f1d2c4969b2d8c369bda1a0d2bfc7370ad727e9435d82128"
+    },
+    {
+      "path": "scripts/run_B4_reverse_feature_gan_ablation.py",
+      "sha256": "fd78015019130a71fb7c883b0600c5f2ed790e5a0a5a4e11b60cb392eb701637",
+      "ported_sha256": "fd78015019130a71fb7c883b0600c5f2ed790e5a0a5a4e11b60cb392eb701637"
+    },
+    {
+      "path": "scripts/run_B4_reverse_gaussian_temperature_ablation.py",
+      "sha256": "4f20f9e0d801e36edb06578ce3e51e133159b3ab92124ce21b37d73f5d7be100",
+      "ported_sha256": "4f20f9e0d801e36edb06578ce3e51e133159b3ab92124ce21b37d73f5d7be100"
+    },
+    {
+      "path": "scripts/run_B4_reverse_history_causal_ablation.py",
+      "sha256": "3934ddefa2592dff98000a5ebae96f4f65118d55e94a2d693e45d42d09f5dd8e",
+      "ported_sha256": "3934ddefa2592dff98000a5ebae96f4f65118d55e94a2d693e45d42d09f5dd8e"
+    },
+    {
+      "path": "scripts/run_B4_reverse_history_efficiency_ablation.py",
+      "sha256": "2f1cc44fcb1b6cf3c4eecc5e6e6e04e6b122ea03ea1eab7c346adc126f88fc10",
+      "ported_sha256": "2f1cc44fcb1b6cf3c4eecc5e6e6e04e6b122ea03ea1eab7c346adc126f88fc10"
+    },
+    {
+      "path": "scripts/run_B4_reverse_history_replay_ablation.py",
+      "sha256": "f2f56faf7cf3671775ae116fe408b2444d4649fc34083dd8f6085b8221b36f3f",
+      "ported_sha256": "f2f56faf7cf3671775ae116fe408b2444d4649fc34083dd8f6085b8221b36f3f"
+    },
+    {
+      "path": "scripts/run_B4_reverse_kernel_ablation.py",
+      "sha256": "adf0a31be6f1bcce9e37117ae333cbb426ff37b1d23321ceade859ff3343cc1c",
+      "ported_sha256": "adf0a31be6f1bcce9e37117ae333cbb426ff37b1d23321ceade859ff3343cc1c"
+    },
+    {
+      "path": "scripts/run_B4_reverse_kernel_mix_ablation.py",
+      "sha256": "f853139013dd33bdcf3dd3392261bf5dd0428245b2b8272b3147b278fe87ecb3",
+      "ported_sha256": "f853139013dd33bdcf3dd3392261bf5dd0428245b2b8272b3147b278fe87ecb3"
+    },
+    {
+      "path": "scripts/run_B4_reverse_kernel_temperature_ablation.py",
+      "sha256": "65eb62c37ecd78499c0a637630ee9de8523d523c3a33d339ffbfc873bc2110cc",
+      "ported_sha256": "65eb62c37ecd78499c0a637630ee9de8523d523c3a33d339ffbfc873bc2110cc"
+    },
+    {
+      "path": "scripts/smoke_s4_adversarial.py",
+      "sha256": "ccb6a28a6b4b5ef4534cb0a446e07bde134b18c9992e155ab34c843f65cad818",
+      "ported_sha256": "ccb6a28a6b4b5ef4534cb0a446e07bde134b18c9992e155ab34c843f65cad818"
+    },
+    {
+      "path": "scripts/smoke_s4_ssl_genreal_adapter.py",
+      "sha256": "26f002ef00457298edb3af04d398eedad72379c03736b47fd01f0eb5277de475",
+      "ported_sha256": "26f002ef00457298edb3af04d398eedad72379c03736b47fd01f0eb5277de475"
+    },
+    {
+      "path": "scripts/train_ssl_latent_bridge.py",
+      "sha256": "3345fb328aa50ad780cb6818613a9f99adcdf51eed4d59c7306173167d53c218",
+      "ported_sha256": "3345fb328aa50ad780cb6818613a9f99adcdf51eed4d59c7306173167d53c218"
+    },
+    {
+      "path": "scripts/tune_dino_real_fake.py",
+      "sha256": "7f5e7782e566c4b4133b81db552fada2f286a22d0f03b5d850539631ddcc9da4",
+      "ported_sha256": "7f5e7782e566c4b4133b81db552fada2f286a22d0f03b5d850539631ddcc9da4"
+    },
+    {
+      "path": "scripts/validate_ssl_latent_bridge.py",
+      "sha256": "585559c2b7b1ac9563955a31de905991a9f0351e2f93c5e4cbeca2de9a00847c",
+      "ported_sha256": "585559c2b7b1ac9563955a31de905991a9f0351e2f93c5e4cbeca2de9a00847c"
+    },
+    {
+      "path": "configs/gen/B2_dual-drift.yaml",
+      "sha256": "98ea1c4aa210caabf21cb65bace567a7d2f6ac905f60fdaf31b706ecb41c0710",
+      "ported_sha256": "98ea1c4aa210caabf21cb65bace567a7d2f6ac905f60fdaf31b706ecb41c0710"
+    },
+    {
+      "path": "configs/gen/B2_fwd-drift.yaml",
+      "sha256": "afe44fe607ed96f75a7bdab81d14ada3b9bb868cb2a8c2fef97b113ad898aab2",
+      "ported_sha256": "afe44fe607ed96f75a7bdab81d14ada3b9bb868cb2a8c2fef97b113ad898aab2"
+    },
+    {
+      "path": "configs/gen/B2_rev-drift.yaml",
+      "sha256": "3436b7ddab1d62f838183b9981220c6a681891d3c77ce58aee9dd77250be9e93",
+      "ported_sha256": "3436b7ddab1d62f838183b9981220c6a681891d3c77ce58aee9dd77250be9e93"
+    },
+    {
+      "path": "configs/gen/B4_dual-drift_mae256.yaml",
+      "sha256": "7422a96707712a8da13d9468543f5bbb2551df17d2ebf03809c080e0225e03ac",
+      "ported_sha256": "7422a96707712a8da13d9468543f5bbb2551df17d2ebf03809c080e0225e03ac"
+    },
+    {
+      "path": "configs/gen/B4_replay-rho050_featurecmp_mae256.yaml",
+      "sha256": "ae9ee1ff3d943f2dfa2ed41a519f9399c95376df88a7d4f98402a973603e1a03",
+      "ported_sha256": "dd6d1a338adedfa55a16933fa0268bf934cf7fd6bac23299fd9140953070fbd7"
+    },
+    {
+      "path": "configs/gen/B4_rev-drift_featurecmp_dino-latent-bridge.yaml",
+      "sha256": "9d0f8279fe2754264682b1925690e1a97856c5cd961012b4bf9d9e4a54fa63bc",
+      "ported_sha256": "750fb4714beaba16b5152af83302db76ccec06c1c6823994ec908f72448aeb22"
+    },
+    {
+      "path": "configs/gen/B4_rev-drift_featurecmp_mae256.yaml",
+      "sha256": "f4bc79e398229c017d87056433bd86ae68569ff9f6d18c8bacaab4a6f691fb93",
+      "ported_sha256": "eeae6334cb39ef2e62eec958a2ea3a9b714164618afcf9b714982dbe705ebb64"
+    },
+    {
+      "path": "configs/gen/B4_rev-drift_featurecmp_moco-v2-latent-bridge.yaml",
+      "sha256": "7f5e51806d91b168aed1d8e6fba8687404d31aea8790b0bced9154999f66cd05",
+      "ported_sha256": "8e2d689669a8eba470bb68c1b65b443855f8062cf02471d448acaa6e6257c96e"
+    },
+    {
+      "path": "configs/gen/B4_rev-drift_mae256.yaml",
+      "sha256": "fe147ad8359d0c99cca91ad8aef5d256d5305eeb841ee8154fee0d6c46746172",
+      "ported_sha256": "fe147ad8359d0c99cca91ad8aef5d256d5305eeb841ee8154fee0d6c46746172"
+    },
+    {
+      "path": "configs/gen/L2_dual-drift.yaml",
+      "sha256": "ca1070e1d84f53831bf43df64ef84c5602b6e3b429e9838e3ea751cc0ab17016",
+      "ported_sha256": "ca1070e1d84f53831bf43df64ef84c5602b6e3b429e9838e3ea751cc0ab17016"
+    },
+    {
+      "path": "configs/gen/L2_dual-drift_hedge_g2.yaml",
+      "sha256": "af97744253c7edf428c11f1beeddb9fa6eec3ce925a50fe09c41eb39b0647f8d",
+      "ported_sha256": "af97744253c7edf428c11f1beeddb9fa6eec3ce925a50fe09c41eb39b0647f8d"
+    },
+    {
+      "path": "configs/gen/L2_dual-drift_hedge_g2_e5x.yaml",
+      "sha256": "5842a0913f93a02c2f88d254c3ea463874ae2e9278128c80b52ee166a930dc4a",
+      "ported_sha256": "5842a0913f93a02c2f88d254c3ea463874ae2e9278128c80b52ee166a930dc4a"
+    },
+    {
+      "path": "configs/gen/L2_dual-drift_hedge_g4.yaml",
+      "sha256": "ccf859c87decc2f7c04c9cbe3cb2cd7214121ddeb582d3c799a7f92cb53f3601",
+      "ported_sha256": "ccf859c87decc2f7c04c9cbe3cb2cd7214121ddeb582d3c799a7f92cb53f3601"
+    },
+    {
+      "path": "configs/gen/L2_fwd-drift.yaml",
+      "sha256": "ca828f9178fa41004508b8186063a4cbf8b50f9c39b4d42d954deca3609fde7c",
+      "ported_sha256": "ca828f9178fa41004508b8186063a4cbf8b50f9c39b4d42d954deca3609fde7c"
+    },
+    {
+      "path": "configs/gen/L2_rev-drift.yaml",
+      "sha256": "5e83fec89d96b11886bae03ca43fd1ec7c731bc4c3d9f5a15d05861beb7dbde0",
+      "ported_sha256": "5e83fec89d96b11886bae03ca43fd1ec7c731bc4c3d9f5a15d05861beb7dbde0"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-adversarial-feature-drift.yaml",
+      "sha256": "18a2a001233b7345766ea44941446f41823587735b3af01ad55fd2268a57de68",
+      "ported_sha256": "1f12b29a27e1a81d7976613f109b0d876aad8f1c0375cbddb1f0c9a28cd0e5e7"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-cf-drift-realreal-infonce-adapter.yaml",
+      "sha256": "5efea95ea583e9dfe5733390689cdd13eb682d68a520fa48a0b11efc6e410c6e",
+      "ported_sha256": "f5e8f388e07c5c9d7bf17aa1ac6907e171e099ee6d98daf232762b03f253f344"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-genreal-mp-infonce-adapter-align-scale.yaml",
+      "sha256": "255f5de58cfc23868488926b66a203e14f6fbe6e0098878d1f46ceb390be82c2",
+      "ported_sha256": "fefcbeb9285f647d385b08263f11b963267539553d438548b632e8993a350d9e"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-genreal-mp-infonce-adapter-align.yaml",
+      "sha256": "ba41696aad6578c8b5d63c7942338dd44b7464f0907df5d435d4f8db663e86b1",
+      "ported_sha256": "24bb4d2f50a552bddeb82e953598a0021eceedc6ab33831af623251a48a96a7e"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-historical-replay-e10-rho035-raw-conditional-gan-d128.yaml",
+      "sha256": "6a41777f2f671cbf7c81141ee8ea1f1d81416711e7f8f81364d119c8537d1e59",
+      "ported_sha256": "bc4df734d6860a997bdf3709e419fe5b5fd6ed68caa17c9fdc4ad005b96f8398"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-historical-replay-e10-rho035-raw-conditional-gan-d32.yaml",
+      "sha256": "345934cee8e341d1b013351e05bb79d6567c8ddc8ef15c63c9a704da543328c6",
+      "ported_sha256": "9f131d0376453c1bd556634b40d0884a5ac79771723514bbd5d46dd1a016a6c2"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-historical-replay-e10-rho050.yaml",
+      "sha256": "a445e81f45be6f237cddb7a00513daaa2ca48f00263787b87bbf418cf02416b6",
+      "ported_sha256": "840f91a7d932908e0e1f4094c55e327a8006a6a7d9730d62b99c5ed526473c3b"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-mixed-gan-feature-drift-d128-opt4.yaml",
+      "sha256": "241bbe6e962f2fdc11642c7093754348dc8967eeabb4b8f54d6824194378ee90",
+      "ported_sha256": "d50aa5128d4427b2b339413bb17450ebfccafffa29d2c0eb22d36b0777b1190b"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-mixed-gan-feature-drift-d32-opt4.yaml",
+      "sha256": "266a2f0489588659bcba094347374492d502893e0d09ca4a5b12a558174fcf08",
+      "ported_sha256": "c08b8ffbc162c38db057b2c0b87a459ccb2b145023b0488dd58e0591f4f60494"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-raw-conditional-gan-d128.yaml",
+      "sha256": "a1b716a66861283d708d2fc569d0860f4ccadb953c3a4033f4dc1f9e2eb89345",
+      "ported_sha256": "e16b49bd1c2f8fc1061ae5c4870d3722a179b26278dcbcf850b9e4877943b618"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-raw-conditional-gan.yaml",
+      "sha256": "064f3e78b14623e17a604d00d8bc1f4677439dd4c4c89f85f1e74bb0f7b29f29",
+      "ported_sha256": "78ffb6918b2a4a5a63862239e790bac88bd7dcca5821b65aa0e8a115a61052ca"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-raw-drift-snr-v2-adapter.yaml",
+      "sha256": "5dc7a4634263945e0ce09d1daf81df9c2345f0a59a36457af273ce27bc081a70",
+      "ported_sha256": "e96c30789851889fa0a689c6c3c73637d83df4086724977c70a92a0c59618831"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-realreal-infonce-mdino-adapter.yaml",
+      "sha256": "8def53b89229d43701180d37f8d2635c57730b90f96b8aeb169f7e3df74c90bd",
+      "ported_sha256": "983a2a2f7c39c5c92d042298b045f2a21989964dd8b225a5492ca1965a1405a1"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-realreal-mp-infonce-adapter.yaml",
+      "sha256": "fd4663a2b7df7d4148ebc5fd4b5239faef1ee4225d5a14a91148e54a666e2c01",
+      "ported_sha256": "0169b39a7f536077f4513ee16143cf5cb3c1f36790d6792d138f87b2c12c340a"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-tuned-rf1500-io1.yaml",
+      "sha256": "815db47b9dfaf7582020cfdbda1d1a2d2cd49789c4a143f2b5078450643b942f",
+      "ported_sha256": "80ced81c68ed2888234ed861e6e11dd7b42125e9f050900a125745cc2eeb5818"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-tuned-rf1500.yaml",
+      "sha256": "8aa414bb1e9f3b6f95b83343a568ffde0a1152c7a0f8301bd359a15040228fb7",
+      "ported_sha256": "7363300a1b392740f3f6481d5c2f91967e2d66b7830d3b50d48b8dd9fbb08d07"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched.yaml",
+      "sha256": "97fe8f7f944a71f88d85e132aaca84d523bfc67a7995893afb3363022ff01ad9",
+      "ported_sha256": "f41aa1cb9ae0e367eb14dd233ec9a0a7bcb5e44e1107e7c7ea1bac2fc9449b9a"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_moco-v2-r50-stage34only-r64g32-mae-matched-genreal-mp-infonce-adapter.yaml",
+      "sha256": "e023051f8e730674c7baa94bede697ef760ecc4bcb83c7bb1f9d116a674ac255",
+      "ported_sha256": "3c810b428eb9574e884efdda9d830eb19d9c417f238418174737eb74252bf035"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_moco-v2-r50-stage34only-r64g32-mae-matched-raw-drift-snr-consistency-adapter.yaml",
+      "sha256": "f9c9d6722ed5fc6f47ef65db5d2af3dac5bfaf08b54d2a30693897ed8e97d3e5",
+      "ported_sha256": "b141ffa0ca11253a665adcd9e0ff5c9369495a7b1936e16bfb421a915ebb6bde"
+    },
+    {
+      "path": "configs/gen/S4_pixel-p32_direct_moco-v2-r50-stage34only-r64g32-mae-matched.yaml",
+      "sha256": "89184a6de1c527f5d0d4dbb160967c1fe3de72fae350a81690dc95662dbc51e6",
+      "ported_sha256": "bc54ad3f11571c1bf86d852257a106f842e2ac607480d0b43b4e810c03ed1b16"
+    },
+    {
+      "path": "configs/gen/S4_replay-rho050_mae256.yaml",
+      "sha256": "353409b2d5f54579b57f7fbe31d89121b62bd6026e008a9997aa34301eef9879",
+      "ported_sha256": "a72628dbe32b764dbbdae0ccd772bcd46abd1a2719c3e57e29099db9c7e0be83"
+    },
+    {
+      "path": "configs/gen/S4_rev-drift_featurecmp_mae256.yaml",
+      "sha256": "dabf44aff516cf0107b6af0b4ca57f39ad3d97a2d6a9bd424d8b897824f8a6d4",
+      "ported_sha256": "15cdaffefeb1c73f83f125670e1721a236517554fdbfda704421aeb344536996"
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "6489261fb8d47c5e99bf3ad795d70e697bca480b4768833bb5e01769a876e5d0",
+      "ported_sha256": "6489261fb8d47c5e99bf3ad795d70e697bca480b4768833bb5e01769a876e5d0"
+    }
+  ],
+  "intentional_differences": {
+    "train_imagenet_gen.py": [
+      "Live DINO adversarial_apply_replay gate",
+      "Live MAE disabled structure teacher gates"
+    ],
+    "configs/gen/*.yaml": [
+      "Repository-relative asset paths; bundled DINO calibration JSON path (hyperparameters unchanged)"
+    ],
+    "tests/test_counterfactual_drift_adapter_objective.py": [
+      "Account for original historical config logging threshold"
+    ],
+    "tests/test_shared_dual_drift.py": [
+      "Use existing float32 loss/gradient tolerance for diagnostics"
+    ],
+    "tests/test_mirror_raw_imagenet_to_ram.py": [
+      "Run fork integration test in a clean CPU subprocess without tqdm monitor thread"
+    ]
+  },
+  "differing_paths": [
+    "train_imagenet_gen.py",
+    "tests/test_counterfactual_drift_adapter_objective.py",
+    "tests/test_mirror_raw_imagenet_to_ram.py",
+    "tests/test_shared_dual_drift.py",
+    "configs/gen/B4_replay-rho050_featurecmp_mae256.yaml",
+    "configs/gen/B4_rev-drift_featurecmp_dino-latent-bridge.yaml",
+    "configs/gen/B4_rev-drift_featurecmp_mae256.yaml",
+    "configs/gen/B4_rev-drift_featurecmp_moco-v2-latent-bridge.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-adversarial-feature-drift.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-cf-drift-realreal-infonce-adapter.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-genreal-mp-infonce-adapter-align-scale.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-genreal-mp-infonce-adapter-align.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-historical-replay-e10-rho035-raw-conditional-gan-d128.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-historical-replay-e10-rho035-raw-conditional-gan-d32.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-historical-replay-e10-rho050.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-mixed-gan-feature-drift-d128-opt4.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-mixed-gan-feature-drift-d32-opt4.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-raw-conditional-gan-d128.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-raw-conditional-gan.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-raw-drift-snr-v2-adapter.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-realreal-infonce-mdino-adapter.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-realreal-mp-infonce-adapter.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-tuned-rf1500-io1.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched-tuned-rf1500.yaml",
+    "configs/gen/S4_pixel-p32_direct_dino-r50-stage34only-r64g32-mae-matched.yaml",
+    "configs/gen/S4_pixel-p32_direct_moco-v2-r50-stage34only-r64g32-mae-matched-genreal-mp-infonce-adapter.yaml",
+    "configs/gen/S4_pixel-p32_direct_moco-v2-r50-stage34only-r64g32-mae-matched-raw-drift-snr-consistency-adapter.yaml",
+    "configs/gen/S4_pixel-p32_direct_moco-v2-r50-stage34only-r64g32-mae-matched.yaml",
+    "configs/gen/S4_replay-rho050_mae256.yaml",
+    "configs/gen/S4_rev-drift_featurecmp_mae256.yaml"
+  ]
+}

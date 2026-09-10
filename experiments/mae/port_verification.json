@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "checked_utc": "2026-09-10T17:46:09.583889+00:00",
+  "passed": true,
+  "device": "cpu; CUDA_VISIBLE_DEVICES was empty for tests and preflight",
+  "source_code_parity": {
+    "latent_direct_gan.py": {
+      "source_sha256": "3a6deffab951138da8a7c61b18c6b81f8b48bc8ff91e76584e97368a41f257cf",
+      "ported_sha256": "3a6deffab951138da8a7c61b18c6b81f8b48bc8ff91e76584e97368a41f257cf",
+      "allowed_text_adaptations": [],
+      "otherwise_text_identical": true
+    },
+    "latent_spatial_gan.py": {
+      "source_sha256": "61ab08283310e106464a5357a01141233f34437a9d1c5c5e23e9cf89c81518e5",
+      "ported_sha256": "a53040ba957f82821c86de09fd4d5ba8693dee37dd0c95fa034b2939cd88310b",
+      "allowed_text_adaptations": [
+        "package-relative import only"
+      ],
+      "otherwise_text_identical": true
+    },
+    "latent_cache.py": {
+      "source_sha256": "04ce894d7ec4db2123a0c6f2afd3fc17913e3919b87ea43ff4410bf5d24b8dab",
+      "ported_sha256": "34b255ca4ec240762c5506022b50c2814f61a34fdccaccd4f074f8bbdd54fe5c",
+      "allowed_text_adaptations": [
+        "remove hardcoded external --repo-root CLI flag and sys.path injection only"
+      ],
+      "otherwise_text_identical": true
+    }
+  },
+  "shared_adversarial_core_sha256": "6554a3fbaa696ba48aaf8c1b5ac88e6d855a521944f4dc649665f25f73cbcbe8",
+  "shared_adversarial_core_matches_original": true,
+  "test_command": "CUDA_VISIBLE_DEVICES='' IDRIFT_MAE_REFERENCE_ROOT=/workspace/mae256_gan_prepare_20260910 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m unittest discover -s tests -p test_mae_experiments.py -v",
+  "tests_run": 17,
+  "tests_seconds": 3.359,
+  "numeric_tolerance": {
+    "rtol": 0.0,
+    "atol": 0.0
+  },
+  "tested": [
+    "Literal live modules vs port: both modes, native maps, logits/features, generator input gradients, D updates at steps 0/1/16, target hard copies, Adam state and live-to-port checkpoint loading",
+    "Literal live trainer_bridge-patched train_step vs port runtime: control/raw/feature tiny complete G+D updates, returned loss/metrics/extras, G/D/target/optimizer states and resulting torch RNG all equal",
+    "R1 analytic reference: logistic discriminator objective plus gamma1 lazy R1 every16 updates in latent coordinates",
+    "All flattened current live config fields match, except five explicit path relocations",
+    "Packed cache vs original .pt loader: exact per-item tensors/labels, RNG states, clean/flip draws, distributed sampler order and loader batches with 0 or 2 workers",
+    "Incomplete/truncated cache refusal, full chunk checksum validation, old RGB/coarse latent checkpoint rejection",
+    "Current raw_gan CLI CPU preflight: complete 1281167/50000 cache coverage, MAE and VAE file hashes match source pins"
+  ],
+  "additional_port_metrics": {
+    "adversarial/replay_enabled": 1.0,
+    "adversarial/history_count": 0.0,
+    "meaning": "Shared DINO gate diagnostics. They are asserted then excluded from old/new metric equality; no historical samples are used in MAE."
+  },
+  "full_size_GPU_training_launched": false,
+  "limitations": [
+    "No new GPU run or full-sized MAE encoder/G training step was performed by this port because all training GPUs were already occupied. End-to-end CPU tests use small frozen MAE/G test doubles and real D32 4x32x32 geometry.",
+    "The verified cache startup path checks metadata/hash/coverage and file sizes; the 41GiB cache chunks were not reread in full during preflight. Full chunk verification is the finalize command."
+  ],
+  "asset_preflight": {
+    "training_started": false,
+    "mode": "raw_gan",
+    "cache_complete": true,
+    "cache_counts": {
+      "train": 1281167,
+      "val": 50000
+    },
+    "checkpoint": "/workspace/mae256_gan_prepare_20260910/artifacts/mae_latent_256/ckpt_ema.pt",
+    "cache_path": "/workspace/I-Drift/data/imagenet/latent_cache_256_mae_gan_20260910",
+    "vae_path": "/workspace/mae256_gan_prepare_20260910/artifacts/sd-vae-ft-mse",
+    "adversarial_vae_decode": false,
+    "architecture": "latent_spatial_844",
+    "asset_hashes_verified": true
+  },
+  "port_source_sha256": {
+    "experiments/mae/runtime.py": "979c189930b95a06c41df540b75c659f6a9802aaf7f39b6319936ab3c59019f2",
+    "tests/test_mae_experiments.py": "54e491d859ef85b5585a088fa951e8ba737d365dabe6251c01f97f30c5d84f19",
+    "experiments/mae/configs/control.yaml": "cf62f40999594967a08580873580815021da1817007fd135204f6df1ce7f0e70",
+    "experiments/mae/configs/raw_gan.yaml": "6e95dfbcbe558717f3b1b595615b409b26ede4e0538e66cee259f4c14e5cac6c",
+    "experiments/mae/configs/feature_drift.yaml": "10da2da6890f82c2832d144c60b751927e9a7f515e9de9768032899d6915ed0a"
+  }
+}

@@ -13,3 +13,4 @@ accelerate>=0.20.0      # required by diffusers
 torchmetrics[image]     # optional: for FID evaluation
 torch-fidelity          # torchmetrics FID backend dependency
 wandb                   # optional: for W&B logging
+zstandard>=0.23,<0.24   # lossless random-access pixel memory bank

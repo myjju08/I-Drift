@@ -1,0 +1,157 @@
+# B/4 generator feature-encoder comparison: MoCo v2 R50 via latent bridge.
+#
+# Final no-VAE latent-bridge surrogate launch configuration.
+# Distance/affinity gates passed; exact decoded-teacher gradients remain an
+# approximation. Temperature was robust-fit to B/4 MAE over seeds 43/44/45.
+#
+# Matched MAE matrix: B=4/rank, G=32, P=64, N=32, two ranks, 40 epochs.
+
+logging:
+  project: "Feature encoder - S4 model"
+  entity: "a01065522071-kaist-digital-humanities-and-social-science"
+  name: "B4-featurecmp-moco-v2-r50-noVAE-bridge-g32p64n32-stage34-eval0-10-40ep"
+  use_wandb: true
+  log_every_k: 10
+  wandb_rewind_on_resume: false
+
+env:
+  imagenet_path: ""
+  cache_path: "data/imagenet/latent_cache_256"
+
+dataset:
+  resolution: 256
+  use_aug: false
+  use_latent: true
+  use_cache: true
+  cache_format: "pt_imagefolder"
+  num_classes: 1000
+  batch_size: 4
+  eval_batch_size: 8
+  num_workers: 8
+  pin_memory: true
+
+model:
+  cond_dim: 768
+  input_size: 32
+  in_channels: 4
+  patch_size: 4
+  hidden_size: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+  out_channels: 4
+  use_qk_norm: true
+  use_swiglu: true
+  use_rope: true
+  use_rmsnorm: true
+  n_cls_tokens: 16
+  noise_classes: 64
+  noise_coords: 32
+  use_bf16: true
+  attn_fp32: false
+  use_remat: true
+
+optimizer:
+  lr: 0.0004
+  weight_decay: 0.0
+  adam_b1: 0.9
+  adam_b2: 0.95
+  warmup_steps: 2000
+  lr_schedule: "const"
+
+train:
+  seed: 43
+  seed_host_rng: true
+  total_steps: 200183
+  total_generated_epochs: 40.0
+  save_per_step: 5000
+  save_per_generated_epochs: 1.0
+  eval_per_step: 400000
+  eval_per_generated_epochs: 10.0
+  eval_samples: 1024
+  eval_at_start: true
+  ema_decay: 0.999
+  max_grad_norm: 2.0
+  keep_every: 3000
+  keep_last: 4
+  pos_per_sample: 64
+  neg_per_sample: 32
+  positive_bank_size: 128
+  negative_bank_size: 1000
+  banks_per_rank: 1
+  push_per_step: 128
+  loader_batch_size: 128
+  push_at_resume: 0
+  gen_per_label: 32
+  cfg_min: 1.0
+  cfg_max: 4.0
+  neg_cfg_pw: 3.0
+  no_cfg_frac: 0.0
+  drift_matching: "rev-drift"
+  R_list: [0.2, 0.05, 0.02]
+  rev_drift_affinity_kernel: "exponential"
+  rev_drift_kernel_shape: 1.0
+  rev_drift_kernel_adaptive_k_pos: 0
+  rev_drift_kernel_adaptive_k_neg: 0
+  rev_drift_force_multiplier: 1.0
+  rev_drift_top_p: 1.0
+  drift_top_p_min_keep: 1
+  drift_top_k_pos: 0
+  drift_top_k_neg: 0
+  drift_top_k_groups: "all"
+  layer_temperature_profile: "mae_matched_bridge_j250_3seed"
+  layer_temperature_profiles:
+    mae_matched_bridge_j250_3seed: {stage3: 0.9962256872, stage4: 0.9675933475}
+  feature_loss_profile: "stage34_only"
+  feature_loss_group_normalize: true
+  prune_skipped_feature_tensors: true
+  feature_loss_profiles:
+    stage34_only:
+      default: 1.0
+      global: 0.0
+      norm_x: 0.0
+      stage1: 0.0
+      stage2: 0.0
+  global_scale_stats: true
+  global_fnorm_stats: true
+  compute_wpos_stats: true
+  compute_wpos_stats_every_k: 1000
+  activation_kwargs:
+    active_stages: [stage3, stage4]
+    patch_mean_size: [2, 4]
+    patch_std_size: [2, 4]
+    use_std: true
+    use_mean: true
+    with_global: false
+    with_norm_x: false
+    every_k_block: 2
+    exclude_terminal_block: true
+  cfg_list: [1.0, 2.0, 3.0]
+  historical_gen_replay: false
+  historical_gen_replay_ratio: 0.0
+  historical_gen_replay_count: 16
+  historical_gen_replay_bank_count: 16
+  historical_gen_replay_start_generated_epochs: 10.0
+  historical_gen_replay_storage_dtype: "float16"
+  historical_gen_replay_source: "frozen_snapshot"
+  historical_gen_replay_ratio_start: null
+  historical_gen_replay_ratio_ramp_start_step: 0
+  historical_gen_replay_ratio_ramp_end_step: 0
+  historical_gen_current_weight: null
+  historical_gen_history_weight: null
+  throughput_opt_level: 3
+
+feature:
+  feature_extractor: "moco_v2_latent_bridge"
+  feature_checkpoint: "weights/pretrained/moco_v2_800ep_pretrain.pth.tar"
+  feature_bridge_checkpoint: "weights/pretrained/moco_v2_r50_latent_bridge_b4_jacobian_w05_eps005_step250.pt"
+  feature_bridge_gate_status: "DISTANCE_AFFINITY_PASS_EXACT_GRADIENT_SURROGATE"
+  feature_bridge_verify_teacher_sha256: true
+  feature_use_bf16: true
+  feature_use_remat: false
+  feature_microbatch_size: 32
+  feature_spatial_pool: 2
+  feature_include_norm_x: false
+  use_convnext: false
+  feature_adapter: false
+  feature_gan: false

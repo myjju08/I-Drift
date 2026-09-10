@@ -1,6 +1,6 @@
 """Generator training for ImageNet — PyTorch port of the official JAX train.py.
 
-Requires a pre-trained MAE checkpoint (--mae_checkpoint or set in config).
+Requires a frozen MAE, DINO, or MoCo feature checkpoint.
 
 Usage (single GPU):
     python train_imagenet_gen.py --config configs/gen/latent_sota_B.yaml \
@@ -16,9 +16,11 @@ import argparse
 import copy
 import datetime
 import gc
+import hashlib
 import json
 import math
 import os
+import tempfile
 import time
 import traceback
 from contextlib import nullcontext
@@ -65,6 +67,101 @@ def _ddp_mean_scalar(value: torch.Tensor | float, device: torch.device) -> float
         dist.all_reduce(scalar, op=dist.ReduceOp.SUM)
         scalar /= float(dist.get_world_size())
     return float(scalar.cpu().item())
+
+
+def _ddp_mean_scalars(
+    values: Dict[str, torch.Tensor | float], device: torch.device
+) -> Dict[str, float]:
+    """Reduce a mapping of logging scalars with one collective and host copy."""
+    if not values:
+        return {}
+    names = sorted(values)
+    packed = torch.stack(
+        [
+            (
+                value.detach().to(device=device, dtype=torch.float64).reshape(())
+                if isinstance(value, torch.Tensor)
+                else torch.tensor(float(value), device=device, dtype=torch.float64)
+            )
+            for value in (values[name] for name in names)
+        ]
+    )
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        packed /= float(dist.get_world_size())
+    host_values = packed.cpu().tolist()
+    return dict(zip(names, (float(value) for value in host_values)))
+
+
+def _configure_level4_cuda_runtime(
+    cfg: dict,
+    throughput_opt_level: int,
+    device: torch.device,
+) -> None:
+    """Enable opt-level-4 CUDA math/autotuning knobs without changing lower levels."""
+    if int(throughput_opt_level) < 4 or device.type != "cuda":
+        return
+
+    allow_tf32 = bool(cfg.get("allow_tf32", True))
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+    if allow_tf32:
+        torch.set_float32_matmul_precision("high")
+
+    cudnn_benchmark = bool(cfg.get("cudnn_benchmark", True))
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    if cudnn_benchmark and hasattr(torch.backends.cudnn, "benchmark_limit"):
+        torch.backends.cudnn.benchmark_limit = int(
+            cfg.get("cudnn_benchmark_limit", 10)
+        )
+
+
+def _collect_mix_alpha_stats_this_step(
+    *,
+    throughput_opt_level: int,
+    collect_diagnostics: bool,
+    drift_matching: str,
+) -> bool:
+    """Whether raw winner stats/tracker updates are needed on this step.
+
+    Fixed reverse/forward objectives never consume MixAlphaTracker state. At
+    level 4 their winner computation and tracker collective are diagnostics
+    only, so they follow the diagnostic cadence. Dual drift keeps its prior
+    every-step behavior, including the adaptive state transition.
+    """
+    fixed_matching = str(drift_matching).lower().strip() in (
+        "rev-drift",
+        "fwd-drift",
+    )
+    return not (
+        int(throughput_opt_level) >= 4
+        and fixed_matching
+        and not collect_diagnostics
+    )
+
+
+def _collect_training_metrics_this_step(
+    *,
+    throughput_opt_level: int,
+    step: int,
+    log_every_k: int,
+) -> bool:
+    """Gate logging-only CUDA syncs/all-reduces on level-4 non-log steps."""
+    return (
+        int(throughput_opt_level) < 4
+        or int(step) % max(1, int(log_every_k)) == 0
+    )
+
+
+def _zero_generator_grad(
+    optimizer: torch.optim.Optimizer,
+    throughput_opt_level: int,
+) -> None:
+    """Use gradient deallocation only in the level-4 runtime stack."""
+    if int(throughput_opt_level) >= 4:
+        optimizer.zero_grad(set_to_none=True)
+    else:
+        optimizer.zero_grad()
 
 
 def _stochastic_round(x):
@@ -368,10 +465,12 @@ from drifting_core.imagenet_loss import (
     drift_loss_imagenet_mixed,
 )
 from drifting_core.topk_diagnostics import diagnose_reverse_topk_heterogeneity
-from memory_bank import ArrayMemoryBank
+from memory_bank import ArrayMemoryBank, CompressedPixelMemoryBank
+from models.adversarial_drift import AdversarialDriftSystem
 from models.feature_adapter import (
     FeatureAdapterSystem,
     canonical_adapter_stages,
+    make_dino_patch_masked_images,
     update_adapter_ema,
 )
 from models.feature_gan import (
@@ -382,7 +481,13 @@ from models.feature_gan import (
 )
 from models.imagenet_generator import DitGen, build_ditgen_from_config
 from models.mae_resnet import MAEResNet, build_mae_from_config
-from train.train_data import create_imagenet_split, infinite_sampler
+from models.ssl_resnet import build_ssl_resnet_from_config, canonical_ssl_backbone
+from models.ssl_latent_bridge import SSLLatentBridgeFeatureExtractor
+from train.train_data import (
+    create_imagenet_split,
+    create_raw_image_io_semaphore,
+    infinite_sampler,
+)
 from utils import EMA
 
 
@@ -777,6 +882,7 @@ def save_checkpoint(
     feature_adapter_optimizer: Optional[torch.optim.Optimizer] = None,
     feature_discriminator: Optional[nn.Module] = None,
     feature_discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
+    adversarial_system: Optional[AdversarialDriftSystem] = None,
 ) -> None:
     ckpt_dir = Path(workdir) / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -813,9 +919,33 @@ def save_checkpoint(
         payload["feature_discriminator_optimizer"] = (
             feature_discriminator_optimizer.state_dict()
         )
-    torch.save(payload, path)
+    if adversarial_system is not None:
+        payload["adversarial_system"] = adversarial_system.state_dict()
     latest = ckpt_dir / "ckpt_latest.pt"
-    torch.save(torch.load(path, map_location="cpu", weights_only=False), latest)
+    if adversarial_system is not None and bool(cfg.get("checkpoint_latest_hardlink", False)):
+        # Publish a new inode before replacing either name: a previous latest
+        # can be hardlinked to a retained numbered checkpoint and must never
+        # be truncated in place, including a repeated save of the same step.
+        save_fd, save_name = tempfile.mkstemp(prefix=".checkpoint-", suffix=".pt", dir=ckpt_dir)
+        os.close(save_fd)
+        save_temp = Path(save_name)
+        link_temp: Optional[Path] = None
+        try:
+            torch.save(payload, save_temp)
+            os.replace(save_temp, path)
+            link_fd, link_name = tempfile.mkstemp(prefix=".latest-", dir=ckpt_dir)
+            os.close(link_fd)
+            link_temp = Path(link_name)
+            link_temp.unlink()
+            os.link(path, link_temp)
+            os.replace(link_temp, latest)
+        finally:
+            save_temp.unlink(missing_ok=True)
+            if link_temp is not None:
+                link_temp.unlink(missing_ok=True)
+    else:
+        torch.save(payload, path)
+        torch.save(torch.load(path, map_location="cpu", weights_only=False), latest)
 
     checkpoints = sorted(ckpt_dir.glob("ckpt_step_*.pt"), key=lambda p: int(p.stem.split("_")[-1]))
     for old in checkpoints[:-keep_last]:
@@ -836,11 +966,19 @@ def load_checkpoint(
     feature_adapter_optimizer: Optional[torch.optim.Optimizer] = None,
     feature_discriminator: Optional[nn.Module] = None,
     feature_discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
+    adversarial_system: Optional[AdversarialDriftSystem] = None,
 ) -> int:
     latest = Path(workdir) / "checkpoints" / "ckpt_latest.pt"
     if not latest.exists():
         return 0
     state = torch.load(latest, map_location=device, weights_only=False)
+    if (adversarial_system is None) != ("adversarial_system" not in state):
+        raise ValueError(
+            "Checkpoint adversarial state does not match the requested experiment; "
+            "resume requires the online discriminator, frozen target, and optimizer."
+        )
+    if adversarial_system is not None:
+        adversarial_system.load_state_dict(state["adversarial_system"])
     raw = model.module if hasattr(model, "module") else model
     raw.load_state_dict(state["model"])
     ema.load_state_dict(state["ema"])
@@ -878,6 +1016,56 @@ def load_checkpoint(
     return int(state.get("step", 0))
 
 
+def build_adversarial_system(
+    cfg: dict, device: torch.device
+) -> Optional[AdversarialDriftSystem]:
+    """Build the optional raw-image branch without consuming the generator RNG."""
+    mode = str(cfg.get("adversarial_mode", "none")).strip().lower()
+    if mode in {"", "none", "off"}:
+        return None
+    if mode not in {"raw_gan", "feature_drift", "mixed"}:
+        raise ValueError(f"Unknown adversarial_mode={mode!r}")
+    if bool(cfg.get("use_latent", True)) or int(cfg.get("in_channels", 3)) != 3:
+        raise ValueError("The adversarial branch requires raw RGB generator outputs")
+    if bool(cfg.get("feature_adapter", False)) or bool(cfg.get("feature_gan", False)):
+        raise ValueError("The adversarial branch requires the unchanged frozen encoder")
+    if resolve_feature_extractor_name(cfg) != "dino_resnet50":
+        raise ValueError("The adversarial experiments require the frozen DINO baseline")
+    samples_per_class = int(cfg.get("adversarial_samples_per_class", 8))
+    if samples_per_class <= 0:
+        raise ValueError("adversarial_samples_per_class must be positive")
+    weight_defaults = {}
+    if mode in {"raw_gan", "mixed"}:
+        weight_defaults["adversarial_loss_weight"] = 0.1
+    if mode in {"feature_drift", "mixed"}:
+        weight_defaults["adversarial_drift_weight"] = 1.0
+    for weight_key, default in weight_defaults.items():
+        weight = float(cfg.get(weight_key, default))
+        if not math.isfinite(weight) or weight <= 0.0:
+            raise ValueError(f"{weight_key} must be finite and positive")
+    fork_devices = (
+        [device.index if device.index is not None else torch.cuda.current_device()]
+        if device.type == "cuda" else []
+    )
+    with torch.random.fork_rng(devices=fork_devices):
+        return AdversarialDriftSystem.from_config(cfg, device)
+
+
+def _require_finite_adversarial(
+    value: torch.Tensor, name: str, *, require_nonzero: bool = False
+) -> None:
+    """Fail all ranks before an optimizer update if one rank has invalid values."""
+    detached = value.detach()
+    good = torch.isfinite(detached).all()
+    if require_nonzero:
+        good = good & detached.abs().sum().gt(0)
+    flag = good.to(dtype=torch.int32)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    if not bool(flag.item()):
+        raise FloatingPointError(f"Invalid adversarial {name} on at least one rank")
+
+
 class Logger:
     def __init__(self, workdir: str, cfg: dict, rank: int):
         self.rank = rank
@@ -885,6 +1073,9 @@ class Logger:
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.use_wandb = bool(cfg.get("use_wandb", False)) and rank == 0
         self.console_log = bool(cfg.get("console_log", True)) and rank == 0
+        self.wandb_log_min_step = int(cfg.get("wandb_log_min_step", 0) or 0)
+        if self.wandb_log_min_step < 0:
+            raise ValueError("wandb_log_min_step must be non-negative")
         self._step = 0
         if self.use_wandb:
             try:
@@ -968,6 +1159,11 @@ class Logger:
                 if forked or not run_id_file.exists():
                     run_id_file.write_text(wandb.run.id)
                 self._wandb = wandb
+                if self.wandb_log_min_step > 0:
+                    print(
+                        "[W&B] Holding cloud metric writes until step "
+                        f"{self.wandb_log_min_step}; local JSONL remains enabled."
+                    )
             except Exception as e:
                 print(f"[W&B] init failed: {e}.")
                 self.use_wandb = False
@@ -1005,15 +1201,24 @@ class Logger:
             parts.append(f"mode={metrics['drift_matching']}")
         print("[train] " + " | ".join(parts), flush=True)
 
-    def log(self, metrics: dict, step: Optional[int] = None) -> None:
+    def log(
+        self,
+        metrics: dict,
+        step: Optional[int] = None,
+        *,
+        commit: bool = True,
+    ) -> None:
         if self.rank != 0:
             return
         s = step if step is not None else self._step
         with open(self.log_file, "a") as f:
             f.write(json.dumps({"step": s, **metrics}) + "\n")
         self._emit_console_summary(s, metrics)
-        if self.use_wandb:
-            self._wandb.log(metrics, step=s)
+        if self.use_wandb and s >= self.wandb_log_min_step:
+            # W&B defaults to commit=False when an explicit step is supplied.
+            # Make commits explicit so a run that stops before the next logging
+            # interval still publishes its latest metrics.
+            self._wandb.log(metrics, step=s, commit=commit)
 
     def set_step(self, step: int) -> None:
         self._step = step
@@ -1139,9 +1344,17 @@ def load_mae(checkpoint_path: str, cfg: dict, device: torch.device) -> MAEResNet
     """Load a pre-trained MAEResNet and freeze it."""
     state: Any = None
     if checkpoint_path:
-        state = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        # This converted checkpoint contains both model and EMA trees.  Keep the
+        # archive CPU-backed while selecting/loading one tree so each DDP rank
+        # does not briefly materialize the full archive on its GPU.
+        state = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
     mae_cfg = _resolve_mae_cfg(cfg, state)
-    mae = build_mae_from_config(mae_cfg).to(device)
+    mae = build_mae_from_config(mae_cfg)
     print(f"[MAE] Build config: {mae_cfg}")
 
     if state is not None:
@@ -1155,6 +1368,8 @@ def load_mae(checkpoint_path: str, cfg: dict, device: torch.device) -> MAEResNet
         if unexpected:
             print(f"[MAE] Unexpected keys ({len(unexpected)}): {unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}")
 
+    mae = mae.to(device)
+
     mae.eval()
     for p in mae.parameters():
         p.requires_grad_(False)
@@ -1162,6 +1377,93 @@ def load_mae(checkpoint_path: str, cfg: dict, device: torch.device) -> MAEResNet
     # when the checkpoint metadata says `use_bf16: true`, matching the JAX setup
     # more closely than converting stored weights to bf16.
     return mae
+
+
+def resolve_feature_extractor_name(cfg: dict) -> str:
+    """Resolve the configured frozen feature encoder to a canonical name."""
+    raw_name = str(cfg.get("feature_extractor", "mae")).lower().strip()
+    normalized = raw_name.replace("-", "_")
+    if normalized in {"mae", "mae_resnet", "mae_resnet256"}:
+        return "mae"
+    bridge_aliases = {
+        "dino_latent_bridge": "dino_latent_bridge",
+        "dino_r50_latent_bridge": "dino_latent_bridge",
+        "moco_latent_bridge": "moco_v2_latent_bridge",
+        "moco_v2_latent_bridge": "moco_v2_latent_bridge",
+        "moco_v2_r50_latent_bridge": "moco_v2_latent_bridge",
+    }
+    if normalized in bridge_aliases:
+        return bridge_aliases[normalized]
+    return canonical_ssl_backbone(normalized)
+
+
+def load_feature_extractor(
+    cfg: dict,
+    device: torch.device,
+) -> nn.Module:
+    """Build the requested frozen feature encoder on ``device``."""
+    extractor_name = resolve_feature_extractor_name(cfg)
+    if extractor_name == "mae":
+        checkpoint_path = (
+            cfg.get("feature_checkpoint")
+            or cfg.get("mae_checkpoint")
+            or os.environ.get("MAE_CHECKPOINT", "")
+        )
+        if not checkpoint_path:
+            raise ValueError("MAE feature extraction requires feature_checkpoint")
+        return load_mae(str(checkpoint_path), cfg, device)
+
+    if extractor_name in {"dino_latent_bridge", "moco_v2_latent_bridge"}:
+        backbone_name = (
+            "dino_resnet50"
+            if extractor_name == "dino_latent_bridge"
+            else "moco_v2_resnet50"
+        )
+        checkpoint_path = cfg.get("feature_checkpoint") or os.environ.get(
+            "FEATURE_CHECKPOINT", ""
+        )
+        bridge_checkpoint = cfg.get("feature_bridge_checkpoint") or os.environ.get(
+            "FEATURE_BRIDGE_CHECKPOINT", ""
+        )
+        if not checkpoint_path:
+            raise ValueError(
+                f"{extractor_name} requires the official feature_checkpoint"
+            )
+        if not bridge_checkpoint:
+            raise ValueError(
+                f"{extractor_name} requires feature_bridge_checkpoint"
+            )
+        model = SSLLatentBridgeFeatureExtractor(
+            backbone_name,
+            str(checkpoint_path),
+            str(bridge_checkpoint),
+            use_bf16=bool(cfg.get("feature_use_bf16", True)),
+            use_remat=bool(cfg.get("feature_use_remat", False)),
+            microbatch_size=int(cfg.get("feature_microbatch_size", 32)),
+            spatial_pool=int(cfg.get("feature_spatial_pool", 2)),
+            include_norm_x=bool(cfg.get("feature_include_norm_x", False)),
+            verify_teacher_sha256=bool(
+                cfg.get("feature_bridge_verify_teacher_sha256", True)
+            ),
+        ).to(device)
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        return model
+
+    checkpoint_path = cfg.get("feature_checkpoint") or os.environ.get(
+        "FEATURE_CHECKPOINT", ""
+    )
+    if not checkpoint_path:
+        raise ValueError(
+            f"{extractor_name} feature extraction requires feature_checkpoint"
+        )
+    return build_ssl_resnet_from_config(
+        extractor_name,
+        str(checkpoint_path),
+        cfg,
+        device,
+    )
 
 
 def build_feature_adapter_system(
@@ -1174,16 +1476,152 @@ def build_feature_adapter_system(
     Optional[FeatureAdapterSystem],
     Optional[torch.optim.Optimizer],
 ]:
-    """Build the real-supervised online adapter and frozen EMA drift target."""
+    """Build the online adapter and its frozen generator-path target copy."""
     if not bool(cfg.get("feature_adapter", False)):
         return None, None, None
 
     objective = str(cfg.get("feature_adapter_objective", "supcon")).lower().strip()
-    if objective not in ("supcon", "supcon_ce"):
+    valid_objectives = {
+        "supcon",
+        "supcon_ce",
+        "real_real_multipos_infonce",
+        "real_real_multipos_infonce_mdino",
+        "gen_real_multipos_infonce",
+        "raw_drift_snr",
+        "raw_drift_snr_consistency",
+        "dino_cf_drift_realreal_infonce",
+    }
+    if objective not in valid_objectives:
         raise ValueError(
-            "feature_adapter_objective must be 'supcon' or 'supcon_ce', "
+            "feature_adapter_objective must be one of "
+            f"{sorted(valid_objectives)}, "
             f"got {objective!r}"
         )
+    if objective in {
+        "raw_drift_snr",
+        "raw_drift_snr_consistency",
+    } and resolve_feature_extractor_name(cfg) not in {
+        "dino_resnet50",
+        "moco_v2_resnet50",
+    }:
+        raise ValueError(
+            f"{objective} currently requires a direct DINO/MoCo "
+            "SSL ResNet feature extractor"
+        )
+    if objective == "raw_drift_snr":
+        positive_count = int(cfg.get("pos_per_sample", 64))
+        generated_count = int(cfg.get("gen_per_label", 32))
+        real_pool_count = int(
+            cfg.get("feature_adapter_real_pool_per_class", 32)
+        )
+        query_count = int(cfg.get("feature_adapter_query_count", 8))
+        bank_count = int(cfg.get("feature_adapter_bank_count", 12))
+        if min(real_pool_count, query_count, bank_count) <= 0:
+            raise ValueError(
+                "raw_drift_snr real-pool/query/bank counts must be positive"
+            )
+        if real_pool_count != query_count + 2 * bank_count:
+            raise ValueError(
+                "raw_drift_snr real pool must equal query/unused count plus "
+                "two support banks"
+            )
+        if positive_count < real_pool_count:
+            raise ValueError(
+                "raw_drift_snr real pool exceeds pos_per_sample: "
+                f"{real_pool_count}>{positive_count}"
+            )
+        if generated_count != query_count + 2 * bank_count:
+            raise ValueError(
+                "raw_drift_snr must partition every generated sample into "
+                "Xq/Qa/Qb"
+            )
+        if bool(cfg.get("feature_adapter_snr_stopgrad_variance", False)):
+            raise ValueError(
+                "raw_drift_snr Version 2 requires differentiable null variance"
+            )
+    if (
+        objective == "dino_cf_drift_realreal_infonce"
+        and resolve_feature_extractor_name(cfg) != "dino_resnet50"
+    ):
+        raise ValueError(
+            "dino_cf_drift_realreal_infonce requires the direct DINO ResNet50 "
+            "feature extractor"
+        )
+    if (
+        objective == "real_real_multipos_infonce_mdino"
+        and resolve_feature_extractor_name(cfg) != "dino_resnet50"
+    ):
+        raise ValueError(
+            "real_real_multipos_infonce_mdino requires the direct DINO "
+            "ResNet50 feature extractor"
+        )
+    if objective == "real_real_multipos_infonce_mdino":
+        resolution = int(cfg.get("resolution", 256))
+        patch_size = int(cfg.get("feature_adapter_mdino_patch_size", 32))
+        mask_ratio = float(cfg.get("feature_adapter_mdino_mask_ratio", 0.4))
+        mdino_samples = int(
+            cfg.get(
+                "feature_adapter_mdino_samples_per_class",
+                cfg.get("pos_per_sample", 64),
+            )
+        )
+        positive_count = int(cfg.get("pos_per_sample", 64))
+        mdino_weight = float(cfg.get("feature_adapter_mdino_weight", 1.0))
+        smooth_weight = float(
+            cfg.get("feature_adapter_mdino_smooth_l1_weight", 1.0)
+        )
+        cosine_weight = float(
+            cfg.get("feature_adapter_mdino_cosine_weight", 0.0)
+        )
+        smooth_beta = float(cfg.get("feature_adapter_mdino_smooth_l1_beta", 1.0))
+        predictor_bottleneck = int(
+            cfg.get("feature_adapter_mdino_predictor_bottleneck", 128)
+        )
+        predictor_lr = float(
+            cfg.get(
+                "feature_adapter_mdino_predictor_lr",
+                cfg.get("feature_adapter_lr", 1.0e-4),
+            )
+        )
+        if patch_size <= 0 or resolution % patch_size:
+            raise ValueError(
+                "masked DINO patch size must be positive and divide the image "
+                f"resolution, got patch={patch_size}, resolution={resolution}"
+            )
+        if not math.isfinite(mask_ratio) or not 0.0 < mask_ratio < 1.0:
+            raise ValueError("masked DINO mask ratio must be finite and in (0, 1)")
+        if mdino_samples <= 0 or mdino_samples > positive_count:
+            raise ValueError(
+                "masked DINO samples_per_class must be in "
+                f"[1,{positive_count}], got {mdino_samples}"
+            )
+        if int(cfg.get("feature_adapter_mdino_teacher_last_k", 1)) != 1:
+            raise ValueError("DINO-R50 masked distillation currently requires K=1")
+        if predictor_bottleneck <= 0 or not math.isfinite(predictor_lr) or predictor_lr <= 0.0:
+            raise ValueError("masked DINO predictor size and learning rate must be positive")
+        if (
+            not math.isfinite(mdino_weight)
+            or mdino_weight <= 0.0
+            or not math.isfinite(smooth_weight)
+            or smooth_weight < 0.0
+            or not math.isfinite(cosine_weight)
+            or cosine_weight < 0.0
+            or smooth_weight + cosine_weight <= 0.0
+            or not math.isfinite(smooth_beta)
+            or smooth_beta <= 0.0
+        ):
+            raise ValueError("masked DINO loss weights/beta are invalid")
+        if len(
+            tuple(
+                cfg.get(
+                    "feature_adapter_mdino_fill_values",
+                    (-0.03, -0.088, -0.188),
+                )
+            )
+        ) != 3:
+            raise ValueError("masked DINO fill values must contain three RGB values")
+        if float(cfg.get("feature_adapter_dropout", 0.0)) != 0.0:
+            raise ValueError("masked DINO causal comparison requires adapter dropout=0")
     stages = canonical_adapter_stages(
         cfg.get("feature_adapter_keys", ["layer3", "layer4"])
     )
@@ -1195,7 +1633,26 @@ def build_feature_adapter_system(
         stage_channels,
         stages,
         bottleneck=int(cfg.get("feature_adapter_bottleneck", 64)),
-        projection_dim=int(cfg.get("feature_adapter_projection_dim", 128)),
+        # The generated-to-real objective acts directly on GAP(adapter(map)).
+        # Do not create an unused train-only projection head that could absorb
+        # the contrastive loss without changing the metric seen by G.
+        projection_dim=(
+            0
+            if objective in {
+                "real_real_multipos_infonce",
+                "real_real_multipos_infonce_mdino",
+                "gen_real_multipos_infonce",
+                "raw_drift_snr",
+                "raw_drift_snr_consistency",
+                "dino_cf_drift_realreal_infonce",
+            }
+            else int(cfg.get("feature_adapter_projection_dim", 128))
+        ),
+        masked_predictor_bottleneck=(
+            int(cfg.get("feature_adapter_mdino_predictor_bottleneck", 128))
+            if objective == "real_real_multipos_infonce_mdino"
+            else 0
+        ),
         num_classes=int(cfg.get("num_classes", 1000)),
         dropout=float(cfg.get("feature_adapter_dropout", 0.0)),
         use_ce=objective == "supcon_ce",
@@ -1218,9 +1675,25 @@ def build_feature_adapter_system(
     for parameter in target.parameters():
         parameter.requires_grad_(False)
 
+    adapter_lr = float(cfg.get("feature_adapter_lr", 1.0e-4))
+    predictor_parameters = list(online_raw.masked_predictors.parameters())
+    predictor_parameter_ids = {id(parameter) for parameter in predictor_parameters}
+    base_parameters = [
+        parameter
+        for parameter in online_raw.parameters()
+        if id(parameter) not in predictor_parameter_ids
+    ]
+    parameter_groups: list[dict[str, Any]] = [{"params": base_parameters}]
+    if predictor_parameters:
+        parameter_groups.append(
+            {
+                "params": predictor_parameters,
+                "lr": float(cfg.get("feature_adapter_mdino_predictor_lr", adapter_lr)),
+            }
+        )
     optimizer = torch.optim.AdamW(
-        online_raw.parameters(),
-        lr=float(cfg.get("feature_adapter_lr", 1.0e-4)),
+        parameter_groups,
+        lr=adapter_lr,
         weight_decay=float(cfg.get("feature_adapter_weight_decay", 1.0e-4)),
         betas=(
             float(cfg.get("feature_adapter_adam_b1", 0.9)),
@@ -1356,6 +1829,7 @@ def compute_drift_loss_from_features(
     mix_R_list_baseline: Tuple[float, ...] = (0.2, 0.05, 0.02),
     compute_raw_winner_stats_flag: bool = False,
     collect_diagnostics: bool = True,
+    fuse_fnorm_across_R: bool = False,
     feature_loss_weights: Optional[Dict[str, float]] = None,
     prune_zero_weight_features: bool = False,
     dual_drift_share_distances: bool = True,
@@ -1616,6 +2090,8 @@ def compute_drift_loss_from_features(
                 kernel_temperature_mix_weights=rev_drift_kernel_temperature_mix_weights,
                 historical_gen=historical_bt,
                 weight_history=w_history,
+                collect_diagnostics=collect_diagnostics,
+                fuse_fnorm_across_R=fuse_fnorm_across_R,
             )
         total_loss = total_loss + feature_loss_weight * loss.mean()
         for k, v in info.items():
@@ -1670,7 +2146,7 @@ def _historical_replay_ratio_for_step(cfg: dict, step: int, active: bool) -> flo
 
 def train_step(
     generator: nn.Module,
-    feature_extractor: MAEResNet,
+    feature_extractor: nn.Module,
     optimizer: torch.optim.Optimizer,
     labels: torch.Tensor,
     pos_samples: torch.Tensor,    # (B, P, C, H, W)
@@ -1682,16 +2158,19 @@ def train_step(
     feature_adapter: Optional[nn.Module] = None,
     feature_adapter_target: Optional[FeatureAdapterSystem] = None,
     feature_adapter_optimizer: Optional[torch.optim.Optimizer] = None,
+    feature_adapter_bank_ready: bool = True,
+    feature_adapter_real_samples: Optional[torch.Tensor] = None,
     feature_discriminator: Optional[nn.Module] = None,
     feature_discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
     historical_samples: Optional[torch.Tensor] = None,
     fresh_historical_count: int = 0,
+    adversarial_system: Optional[AdversarialDriftSystem] = None,
 ) -> Tuple[torch.Tensor, Dict[str, Any], Dict[str, torch.Tensor]]:
     """One generator optimization step.
 
     Args:
         generator:   DitGen wrapped in DDP (or raw).
-        feature_extractor: Frozen MAEResNet.
+        feature_extractor: Frozen MAE/DINO/MoCo feature encoder.
         optimizer:   AdamW.
         labels:      Class labels (B,).
         pos_samples: Real positive images (B, P, C, H, W).
@@ -1708,6 +2187,12 @@ def train_step(
     P = pos_samples.shape[1]
     N = neg_samples.shape[1]
     G = int(cfg.get("gen_per_label", 64))
+    if adversarial_system is not None and (
+        feature_adapter is not None or feature_discriminator is not None
+    ):
+        raise ValueError("Adversarial experiments cannot also change the DINO metric")
+    adversarial_mode = adversarial_system.mode if adversarial_system is not None else None
+    adversarial_teacher_real_features: Optional[Dict[str, torch.Tensor]] = None
     fresh_historical_count = int(fresh_historical_count)
     if fresh_historical_count < 0:
         raise ValueError("fresh_historical_count must be non-negative")
@@ -1730,6 +2215,86 @@ def train_step(
     ):
         raise ValueError(
             "feature adapter, EMA target, and optimizer must be provided together"
+        )
+    adapter_objective = str(
+        cfg.get("feature_adapter_objective", "supcon")
+    ).lower().strip()
+    generated_real_adapter = (
+        feature_adapter is not None
+        and adapter_objective
+        in {
+            "real_real_multipos_infonce",
+            "real_real_multipos_infonce_mdino",
+            "gen_real_multipos_infonce",
+            "raw_drift_snr",
+            "raw_drift_snr_consistency",
+            "dino_cf_drift_realreal_infonce",
+        }
+    )
+    masked_dino_adapter = (
+        feature_adapter is not None
+        and adapter_objective == "real_real_multipos_infonce_mdino"
+    )
+    raw_drift_v2_adapter = (
+        feature_adapter is not None
+        and adapter_objective == "raw_drift_snr"
+    )
+    raw_drift_adapter = (
+        feature_adapter is not None
+        and adapter_objective
+        in {"raw_drift_snr", "raw_drift_snr_consistency"}
+    )
+    counterfactual_drift_adapter = (
+        feature_adapter is not None
+        and adapter_objective == "dino_cf_drift_realreal_infonce"
+    )
+    raw_map_adapter = raw_drift_adapter or counterfactual_drift_adapter
+    adapter_update_frequency = int(cfg.get("feature_adapter_update_freq", 1))
+    adapter_start_step = int(cfg.get("feature_adapter_start_step", 0))
+    adapter_freeze_step = int(
+        cfg.get(
+            "feature_adapter_freeze_step_resolved",
+            cfg.get("feature_adapter_freeze_step", 0),
+        )
+        or 0
+    )
+    if feature_adapter is not None:
+        if adapter_update_frequency <= 0:
+            raise ValueError("feature_adapter_update_freq must be positive")
+        if adapter_start_step < 0:
+            raise ValueError("feature_adapter_start_step must be non-negative")
+        if adapter_freeze_step < 0:
+            raise ValueError("feature_adapter_freeze_step must be non-negative")
+    adapter_update_due = (
+        feature_adapter is not None
+        and bool(feature_adapter_bank_ready)
+        and step >= adapter_start_step
+        and (adapter_freeze_step <= 0 or step < adapter_freeze_step)
+        and (step - adapter_start_step) % adapter_update_frequency == 0
+    )
+    adapter_real_pool_count = int(
+        cfg.get("feature_adapter_real_pool_per_class", 32)
+    )
+    if raw_drift_v2_adapter and adapter_update_due:
+        if feature_adapter_real_samples is None:
+            raise ValueError(
+                "raw_drift_snr update requires a separate distinct-real pool"
+            )
+        if (
+            feature_adapter_real_samples.ndim != pos_samples.ndim
+            or feature_adapter_real_samples.shape[0] != B
+            or feature_adapter_real_samples.shape[1] != adapter_real_pool_count
+            or tuple(feature_adapter_real_samples.shape[2:])
+            != tuple(pos_samples.shape[2:])
+        ):
+            raise ValueError(
+                "raw_drift_snr distinct-real pool must be "
+                f"[B,{adapter_real_pool_count},...], got "
+                f"{tuple(feature_adapter_real_samples.shape)}"
+            )
+    elif feature_adapter_real_samples is not None:
+        raise ValueError(
+            "feature_adapter_real_samples is valid only on a raw_drift_snr update"
         )
     discriminator_parts = (
         feature_discriminator,
@@ -1846,6 +2411,21 @@ def train_step(
         throughput_opt_level < 1
         or step % max(1, diagnostics_every_k) == 0
     )
+    if throughput_opt_level >= 4 and not collect_diagnostics:
+        # W_pos/support summaries are logging-only and contain several device
+        # synchronizations; keep their configured cadence on diagnostic steps.
+        compute_wpos_stats = False
+    collect_mix_alpha_stats = _collect_mix_alpha_stats_this_step(
+        throughput_opt_level=throughput_opt_level,
+        collect_diagnostics=collect_diagnostics,
+        drift_matching=drift_matching,
+    )
+    collect_training_metrics = _collect_training_metrics_this_step(
+        throughput_opt_level=throughput_opt_level,
+        step=step,
+        log_every_k=int(cfg.get("log_every_k", 20)),
+    )
+    fuse_fnorm_across_R = throughput_opt_level >= 4
     stochastic_feature_stage_loss = bool(
         cfg.get("stochastic_feature_stage_loss", False)
     )
@@ -1973,12 +2553,21 @@ def train_step(
         real_parts.append(
             historical_samples.reshape(B * H, *historical_samples.shape[2:])
         )
+    if feature_adapter_real_samples is not None:
+        real_parts.append(
+            feature_adapter_real_samples.reshape(
+                B * adapter_real_pool_count,
+                *feature_adapter_real_samples.shape[2:],
+            )
+        )
     all_real = torch.cat(real_parts, dim=0)
 
     mae_use_bf16 = _mae_use_bf16(feature_extractor)
     real_stage_features: Dict[str, torch.Tensor] = {}
     need_terminal_stage_features = (
-        feature_adapter is not None or feature_discriminator is not None
+        adapter_update_due or feature_discriminator is not None
+        or (adversarial_mode in {"feature_drift", "mixed"}
+            and adversarial_system.structure_weight > 0)
     )
     target_stage_adapters = (
         feature_adapter_target.adapters
@@ -1991,6 +2580,11 @@ def train_step(
             **act_kwargs,
             stage_adapters=target_stage_adapters,
             return_stage_features=need_terminal_stage_features,
+            **(
+                {"return_pre_adapter_maps": True}
+                if raw_map_adapter and adapter_update_due
+                else {}
+            ),
         )
         if need_terminal_stage_features:
             all_real_feats, real_stage_features = real_activation_result
@@ -2003,8 +2597,20 @@ def train_step(
             neg_feats = {k: v[:B * N] for k, v in neg_feats.items()}
         history_offset = B * (P + N)
         historical_feats = (
-            {k: v[history_offset:] for k, v in all_real_feats.items()}
+            {k: v[history_offset : history_offset + B * H] for k, v in all_real_feats.items()}
             if H > 0
+            else None
+        )
+        adapter_real_offset = B * (P + N + H)
+        adapter_real_target_features = (
+            {
+                k: v[
+                    adapter_real_offset : adapter_real_offset
+                    + B * adapter_real_pool_count
+                ]
+                for k, v in all_real_feats.items()
+            }
+            if feature_adapter_real_samples is not None
             else None
         )
         # pos_feats/neg_feats views now own the required storage references.
@@ -2012,15 +2618,116 @@ def train_step(
         # must be able to release a skipped feature once both views are popped.
         del all_real_feats
 
+    if (adversarial_mode in {"feature_drift", "mixed"}
+            and adversarial_system.structure_weight > 0):
+        # Preserve the exact same real examples used by D below. These are
+        # frozen terminal DINO maps from this step, not cached learned features.
+        adversarial_real_count = min(P, int(cfg.get("adversarial_samples_per_class", 8)))
+        adversarial_teacher_real_features = {}
+        for layer in ("layer3", "layer4"):
+            if layer not in real_stage_features:
+                raise KeyError(f"DINO did not emit adversarial structure teacher {layer}")
+            values = real_stage_features[layer][: B * P]
+            adversarial_teacher_real_features[layer] = values.reshape(
+                B, P, *values.shape[1:]
+            )[:, :adversarial_real_count].flatten(0, 1).detach().clone()
+        # The selected small teacher tensors own their storage; release all
+        # unused negative/history terminal maps before the generator forward.
+        del real_stage_features, real_activation_result, values
+
+    adapter_real_stage_features = (
+        {
+            key: value[
+                adapter_real_offset : adapter_real_offset
+                + B * adapter_real_pool_count
+            ]
+            for key, value in real_stage_features.items()
+        }
+        if feature_adapter_real_samples is not None
+        else None
+    )
+    del all_real, real_parts
+    if raw_drift_v2_adapter and feature_adapter_real_samples is not None:
+        del feature_adapter_real_samples
+
     _prof_mark("after_real_mae")
+
+    masked_dino_stage_features: Optional[Dict[str, torch.Tensor]] = None
+    masked_dino_patch_mask: Optional[torch.Tensor] = None
+    if masked_dino_adapter and adapter_update_due:
+        teacher_last_k = int(cfg.get("feature_adapter_mdino_teacher_last_k", 1))
+        if teacher_last_k != 1:
+            raise ValueError(
+                "DINO-R50 masked feature distillation currently supports "
+                "teacher_last_k=1 (the clean terminal map for each stage)"
+            )
+        mdino_samples_per_class = min(
+            int(cfg.get("feature_adapter_mdino_samples_per_class", P)), P
+        )
+        if mdino_samples_per_class <= 0:
+            raise ValueError(
+                "feature_adapter_mdino_samples_per_class must be positive"
+            )
+        # Keep the class-major [B,P,...] ordering used by the clean teacher;
+        # flattening before slicing would take samples from only the first
+        # classes and silently misalign teacher/student pairs.
+        selected_real = pos_samples.reshape(
+            B, P, *pos_samples.shape[2:]
+        )[:, :mdino_samples_per_class].reshape(
+            B * mdino_samples_per_class, *pos_samples.shape[2:]
+        )
+        selected_real = selected_real.to(device, non_blocking=True).detach()
+        rank_for_mask = (
+            dist.get_rank()
+            if dist.is_available() and dist.is_initialized()
+            else 0
+        )
+        mask_seed = (
+            int(cfg.get("seed", 42))
+            + 1_000_003 * int(step)
+            + 97_409 * int(rank_for_mask)
+            + 4_449_668_175
+        ) % (2**63 - 1)
+        selected_real_masked, masked_dino_patch_mask = (
+            make_dino_patch_masked_images(
+                selected_real,
+                patch_size=int(cfg.get("feature_adapter_mdino_patch_size", 32)),
+                mask_ratio=float(cfg.get("feature_adapter_mdino_mask_ratio", 0.4)),
+                seed=mask_seed,
+                fill_values=tuple(
+                    cfg.get(
+                        "feature_adapter_mdino_fill_values",
+                        [-0.03, -0.088, -0.188],
+                    )
+                ),
+            )
+        )
+        with torch.no_grad(), _amp_ctx(mae_use_bf16):
+            _, masked_dino_stage_features = feature_extractor.get_activations(
+                selected_real_masked,
+                patch_mean_size=[],
+                patch_std_size=[],
+                use_std=False,
+                use_mean=False,
+                with_global=False,
+                with_norm_x=False,
+                every_k_block=float("inf"),
+                exclude_terminal_block=False,
+                active_stages=list(
+                    canonical_adapter_stages(
+                        cfg.get("feature_adapter_keys", ["layer3", "layer4"])
+                    )
+                ),
+                stage_adapters=None,
+                return_stage_features=True,
+            )
+        del selected_real, selected_real_masked
+        _prof_mark("after_masked_dino_real")
 
     adapter_info: Dict[str, torch.Tensor] = {}
     adapter_updated = False
-    if feature_adapter is not None:
-        update_frequency = int(cfg.get("feature_adapter_update_freq", 1))
-        if update_frequency <= 0:
-            raise ValueError("feature_adapter_update_freq must be positive")
-        if step % update_frequency == 0:
+    if feature_adapter is not None and not generated_real_adapter:
+        if adapter_update_due:
             feature_adapter.train()
             feature_adapter_optimizer.zero_grad(set_to_none=True)
             with _amp_ctx(mae_use_bf16):
@@ -2038,6 +2745,14 @@ def train_step(
                     ),
                     ce_weight=float(cfg.get("feature_adapter_ce_weight", 0.1)),
                     reg_weight=float(cfg.get("feature_adapter_reg_lambda", 0.01)),
+                    objective=adapter_objective,
+                    gather_distributed=bool(
+                        cfg.get("feature_adapter_global_contrastive", False)
+                    ),
+                    collect_diagnostics=(
+                        adapter_objective != "real_real_multipos_infonce"
+                        or step % max(1, int(cfg.get("log_every_k", 20))) == 0
+                    ),
                 )
             adapter_loss.backward()
             adapter_grad_norm = nn.utils.clip_grad_norm_(
@@ -2047,7 +2762,7 @@ def train_step(
             feature_adapter_optimizer.step()
             adapter_info["adapter/grad_norm"] = adapter_grad_norm.detach()
             adapter_updated = True
-        if feature_discriminator is None:
+        if feature_discriminator is None and need_terminal_stage_features:
             del real_stage_features
     _prof_mark("after_adapter_update")
 
@@ -2106,14 +2821,14 @@ def train_step(
         active_mask_neg = None
 
     max_grad_norm = float(cfg.get("max_grad_norm", 2.0))
-    optimizer.zero_grad()
+    _zero_generator_grad(optimizer, throughput_opt_level)
     def _forward_gen_and_feats() -> Tuple[
         torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]
     ]:
         # Match the JAX generator path: bf16 model compute when enabled, while
         # attention can still upcast internally via attn_fp32.
         with _amp_ctx(gen_use_bf16):
-            out = raw_gen(expanded_labels, cfg_scale=expanded_cfg, train=True)
+            out = generator(expanded_labels, cfg_scale=expanded_cfg, train=True)
         gen_samples_local = out["samples"]
         _prof_mark("after_generator")
         with _amp_ctx(mae_use_bf16):
@@ -2121,9 +2836,20 @@ def train_step(
                 gen_samples_local,
                 **act_kwargs,
                 stage_adapters=target_stage_adapters,
-                return_stage_features=feature_discriminator is not None,
+                return_stage_features=(
+                    feature_discriminator is not None
+                    or (generated_real_adapter and adapter_update_due)
+                ),
+                **(
+                    {"return_pre_adapter_maps": True}
+                    if raw_map_adapter and adapter_update_due
+                    else {}
+                ),
             )
-        if feature_discriminator is not None:
+        if (
+            feature_discriminator is not None
+            or (generated_real_adapter and adapter_update_due)
+        ):
             gen_feats_local, gen_stage_features_local = activation_result
         else:
             gen_feats_local = activation_result
@@ -2250,8 +2976,9 @@ def train_step(
         global_fnorm_stats=global_fnorm_stats,
         mix_alpha=mix_alpha,
         mix_R_list_baseline=mix_R_list_baseline,
-        compute_raw_winner_stats_flag=True,
+        compute_raw_winner_stats_flag=collect_mix_alpha_stats,
         collect_diagnostics=collect_diagnostics,
+        fuse_fnorm_across_R=fuse_fnorm_across_R,
         feature_loss_weights=feature_loss_weights,
         prune_zero_weight_features=prune_skipped_feature_tensors,
         dual_drift_share_distances=dual_drift_share_distances,
@@ -2280,7 +3007,140 @@ def train_step(
     _prof_mark("after_drift_loss")
 
     feature_gan_info: Dict[str, torch.Tensor | float] = {}
+    adversarial_info: Dict[str, torch.Tensor | float] = {}
     total_generator_loss = loss
+    if adversarial_system is not None:
+        adversarial_extra_loss = loss.new_zeros(())
+        adversarial_components = {}
+        if adversarial_mode == "mixed":
+            adversarial_logits, adversarial_gen_feats = adversarial_system.target_logits_and_features(
+                gen_samples, expanded_labels
+            )
+        if adversarial_mode in {"raw_gan", "mixed"}:
+            if adversarial_mode == "raw_gan":
+                adversarial_logits = adversarial_system.target_logits(gen_samples, expanded_labels)
+            adversarial_gan_loss = F.softplus(-adversarial_logits).mean()
+            adversarial_weight = float(cfg.get("adversarial_loss_weight", 0.1))
+            adversarial_components["raw_gan"] = adversarial_weight * adversarial_gan_loss
+            adversarial_extra_loss = adversarial_extra_loss + adversarial_components["raw_gan"]
+            adversarial_info["adversarial/raw_gan_loss"] = adversarial_gan_loss.detach()
+            adversarial_info["adversarial/raw_gan_weight"] = adversarial_weight
+        if adversarial_mode in {"feature_drift", "mixed"}:
+            # Re-encode every particle type with the one frozen pre-update
+            # snapshot. The real memory banks continue to hold raw pixels.
+            adversarial_apply_replay = bool(cfg.get("adversarial_apply_replay", True))
+            with torch.no_grad():
+                adversarial_pos_feats = adversarial_system.target_features(
+                    pos_samples.flatten(0, 1)
+                )
+                adversarial_neg_feats = (
+                    adversarial_system.target_features(neg_samples.flatten(0, 1))
+                    if N > 0 else None
+                )
+                adversarial_history_feats = (
+                    adversarial_system.target_features(historical_samples.flatten(0, 1))
+                    if adversarial_apply_replay and historical_samples is not None else None
+                )
+            if adversarial_mode == "feature_drift":
+                adversarial_gen_feats = adversarial_system.target_features(
+                    gen_samples, expanded_labels
+                )
+            adversarial_feature_loss, adversarial_drift_info = compute_drift_loss_from_features(
+                gen_feats=adversarial_gen_feats,
+                pos_feats=adversarial_pos_feats,
+                neg_feats=adversarial_neg_feats,
+                B=B, G=G, P=P, N=N,
+                weight_neg=weight_neg,
+                R_list=R_list,
+                drift_matching=drift_matching,
+                compute_wpos_stats=compute_wpos_stats,
+                per_sample_fnorm=per_sample_fnorm,
+                active_mask_pos=active_mask_pos,
+                active_mask_neg=active_mask_neg,
+                decouple_weight_from_coupling=decouple_weight_from_coupling,
+                self_mask_on_raw=self_mask_on_raw,
+                global_scale_stats=global_scale_stats,
+                global_fnorm_stats=global_fnorm_stats,
+                mix_alpha=mix_alpha,
+                mix_R_list_baseline=mix_R_list_baseline,
+                collect_diagnostics=collect_diagnostics,
+                fuse_fnorm_across_R=fuse_fnorm_across_R,
+                dual_drift_share_distances=dual_drift_share_distances,
+                rev_drift_top_p=rev_drift_top_p,
+                fwd_drift_top_p=fwd_drift_top_p,
+                drift_top_p_min_keep=drift_top_p_min_keep,
+                drift_top_k_pos=drift_top_k_pos,
+                drift_top_k_neg=drift_top_k_neg,
+                rev_drift_force_multiplier=rev_drift_force_multiplier,
+                rev_drift_affinity_kernel=rev_drift_affinity_kernel,
+                rev_drift_kernel_shape=rev_drift_kernel_shape,
+                rev_drift_kernel_adaptive_k_pos=rev_drift_kernel_adaptive_k_pos,
+                rev_drift_kernel_adaptive_k_neg=rev_drift_kernel_adaptive_k_neg,
+                rev_drift_kernel_adaptive_margin=rev_drift_kernel_adaptive_margin,
+                rev_drift_kernel_mix_weight=rev_drift_kernel_mix_weight,
+                rev_drift_kernel_temperature_mix=rev_drift_kernel_temperature_mix,
+                rev_drift_kernel_temperature_mix_weights=rev_drift_kernel_temperature_mix_weights,
+                historical_feats=adversarial_history_feats,
+                historical_count=H if adversarial_apply_replay else 0,
+                weight_gen=weight_gen_replay if adversarial_apply_replay else None,
+                weight_history=weight_history if adversarial_apply_replay else None,
+            )
+            adversarial_info["adversarial/replay_enabled"] = float(adversarial_apply_replay)
+            adversarial_info["adversarial/history_count"] = float(H if adversarial_apply_replay else 0)
+            adversarial_weight = float(cfg.get("adversarial_drift_weight", 1.0))
+            adversarial_components["feature_drift"] = adversarial_weight * adversarial_feature_loss
+            adversarial_extra_loss = adversarial_extra_loss + adversarial_components["feature_drift"]
+            adversarial_info["adversarial/feature_drift_loss"] = adversarial_feature_loss.detach()
+            adversarial_info["adversarial/feature_drift_weight"] = adversarial_weight
+            adversarial_info.update({
+                f"adversarial/drift/{key}": value
+                for key, value in adversarial_drift_info.items()
+            })
+        if not adversarial_components:
+            raise ValueError(f"Unknown adversarial mode {adversarial_mode!r}")
+        total_generator_loss = loss + adversarial_extra_loss
+        _require_finite_adversarial(total_generator_loss, "generator loss")
+        adversarial_info["adversarial/g_extra_loss"] = adversarial_extra_loss.detach()
+        if adversarial_mode != "mixed":
+            adversarial_info["adversarial/g_weight"] = adversarial_weight
+        adversarial_info["adversarial/g_loss_finite"] = 1.0
+        diagnostic_every = int(cfg.get("adversarial_diagnostics_every", 1000))
+        if step == 0 or (diagnostic_every > 0 and step % diagnostic_every == 0):
+            if adversarial_mode == "mixed":
+                # Check each weighted branch so cancellation or an omitted
+                # objective cannot hide behind a finite combined gradient.
+                auxiliary_pixel_grad = None
+                for component, component_loss in adversarial_components.items():
+                    component_pixel_grad = torch.autograd.grad(
+                        component_loss, gen_samples, retain_graph=True
+                    )[0].detach()
+                    component_pixel_norm = component_pixel_grad.float().norm()
+                    _require_finite_adversarial(
+                        component_pixel_norm, f"{component} pixel gradient", require_nonzero=True
+                    )
+                    adversarial_info[f"adversarial/{component}_pixel_grad_norm"] = component_pixel_norm
+                    auxiliary_pixel_grad = (
+                        component_pixel_grad if auxiliary_pixel_grad is None
+                        else auxiliary_pixel_grad + component_pixel_grad
+                    )
+                del component_pixel_grad
+            else:
+                auxiliary_pixel_grad = torch.autograd.grad(
+                    adversarial_extra_loss, gen_samples, retain_graph=True
+                )[0]
+            dino_pixel_grad = torch.autograd.grad(loss, gen_samples, retain_graph=True)[0]
+            auxiliary_pixel_norm = auxiliary_pixel_grad.detach().float().norm()
+            dino_pixel_norm = dino_pixel_grad.detach().float().norm()
+            _require_finite_adversarial(
+                auxiliary_pixel_norm, "auxiliary pixel gradient", require_nonzero=True
+            )
+            _require_finite_adversarial(dino_pixel_norm, "DINO pixel gradient")
+            adversarial_info["adversarial/g_pixel_grad_norm"] = auxiliary_pixel_norm
+            adversarial_info["adversarial/dino_pixel_grad_norm"] = dino_pixel_norm
+            adversarial_info["adversarial/g_to_dino_pixel_grad_ratio"] = (
+                auxiliary_pixel_norm / dino_pixel_norm.clamp_min(1.0e-12)
+            )
+            del auxiliary_pixel_grad, dino_pixel_grad
     if feature_discriminator is not None:
         raw_discriminator: FrozenFeatureDiscriminator = (
             feature_discriminator.module
@@ -2435,13 +3295,283 @@ def train_step(
             ),
             "feature_gan/calibrated": float(calibrate),
         }
-        del real_stage_features, gen_stage_features
+        if not (generated_real_adapter and adapter_update_due):
+            del real_stage_features, gen_stage_features
 
     total_generator_loss.backward()
     _prof_mark("after_backward")
 
     g_norm = nn.utils.clip_grad_norm_(generator.parameters(), max_grad_norm)
+    if adversarial_system is not None:
+        _require_finite_adversarial(g_norm, "generator gradient norm")
+        adversarial_info["adversarial/g_grad_finite"] = 1.0
     optimizer.step()
+
+    if adversarial_system is not None:
+        # The G graph has been released. Update D using detached particles
+        # from that same G forward, then advance the frozen snapshot for the
+        # next iteration. This cannot backpropagate into G or frozen DINO.
+        discriminator_real_count = min(P, int(cfg.get("adversarial_samples_per_class", 8)))
+        discriminator_fake_count = min(G, int(cfg.get("adversarial_samples_per_class", 8)))
+        discriminator_reals = pos_samples[:, :discriminator_real_count].flatten(0, 1).detach()
+        discriminator_fakes = gen_samples.detach().reshape(
+            B, G, *gen_samples.shape[1:]
+        )[:, :discriminator_fake_count].flatten(0, 1)
+        adversarial_info.update(adversarial_system.discriminator_step(
+            discriminator_reals,
+            discriminator_fakes,
+            labels[:, None].expand(B, discriminator_real_count).reshape(-1),
+            labels[:, None].expand(B, discriminator_fake_count).reshape(-1),
+            step,
+            teacher_real_features=adversarial_teacher_real_features,
+        ))
+        del adversarial_teacher_real_features, discriminator_reals, discriminator_fakes
+        _prof_mark("after_adversarial_update")
+
+    # Strict alternating adapter update.  The generator step above used only
+    # the frozen target copy. Reuse the already-computed selected pre-adapter
+    # encoder maps here, but detach both branches so this backward can update
+    # only the online adapter (never G or the frozen DINO/MoCo encoder).
+    if generated_real_adapter and adapter_update_due:
+        adapter_collect_diagnostics = (
+            step % max(1, int(cfg.get("log_every_k", 20))) == 0
+        )
+        feature_adapter.train()
+        feature_adapter_optimizer.zero_grad(set_to_none=True)
+        drift_options = None
+        if raw_map_adapter:
+            drift_options = {
+                "R_list": R_list,
+                "patch_mean_size": act_kwargs.get("patch_mean_size", [2, 4]),
+                "patch_std_size": act_kwargs.get("patch_std_size", [2, 4]),
+                "use_mean": bool(act_kwargs.get("use_mean", True)),
+                "use_std": bool(act_kwargs.get("use_std", True)),
+                "feature_loss_weights": (
+                    {} if feature_loss_weights is None else feature_loss_weights
+                ),
+                "temperature_multipliers": feature_temperature_multipliers,
+                "global_scale_stats": global_scale_stats,
+                "global_statistics": bool(
+                    cfg.get("feature_adapter_global_statistics", True)
+                ),
+                "top_p": rev_drift_top_p,
+                "top_p_min_keep": drift_top_p_min_keep,
+                "top_k_pos": drift_top_k_pos,
+                "top_k_neg": drift_top_k_neg,
+                "affinity_kernel": rev_drift_affinity_kernel,
+                "kernel_shape": rev_drift_kernel_shape,
+                "kernel_adaptive_k_pos": rev_drift_kernel_adaptive_k_pos,
+                "kernel_adaptive_k_neg": rev_drift_kernel_adaptive_k_neg,
+                "kernel_adaptive_margin": rev_drift_kernel_adaptive_margin,
+                "kernel_mix_weight": rev_drift_kernel_mix_weight,
+                "kernel_temperature_mix": rev_drift_kernel_temperature_mix,
+                "kernel_temperature_mix_weights": (
+                    rev_drift_kernel_temperature_mix_weights
+                ),
+                "expected_feature_count": int(
+                    cfg.get("feature_adapter_expected_feature_count", 42)
+                ),
+                "expected_raw_map_count": int(
+                    cfg.get("feature_adapter_expected_raw_map_count", 6)
+                ),
+            }
+            if raw_drift_adapter:
+                drift_options.update(
+                    {
+                        "snr_epsilon": float(
+                            cfg.get("feature_adapter_snr_epsilon", 1.0e-8)
+                        ),
+                        "stopgrad_variance": bool(
+                            cfg.get(
+                                "feature_adapter_snr_stopgrad_variance", False
+                            )
+                        ),
+                        "snr_weight": float(
+                            cfg.get("feature_adapter_drift_snr_weight", 1.0)
+                        ),
+                        "consistency_weight": float(
+                            cfg.get("feature_adapter_consistency_weight", 0.1)
+                        ),
+                    }
+                )
+                if raw_drift_v2_adapter:
+                    drift_options.update(
+                        {
+                            "real_pool_count": int(
+                                cfg.get(
+                                    "feature_adapter_real_pool_per_class", 32
+                                )
+                            ),
+                            "query_count": int(
+                                cfg.get("feature_adapter_query_count", 8)
+                            ),
+                            "bank_count": int(
+                                cfg.get("feature_adapter_bank_count", 12)
+                            ),
+                            "consistency_epsilon": float(
+                                cfg.get(
+                                    "feature_adapter_consistency_epsilon",
+                                    1.0e-8,
+                                )
+                            ),
+                            "split_seed": int(
+                                cfg.get(
+                                    "feature_adapter_split_seed",
+                                    cfg.get("seed", 43),
+                                )
+                            ),
+                        }
+                    )
+            else:
+                drift_options.update(
+                    {
+                        "cf_epsilon": float(
+                            cfg.get("feature_adapter_cf_epsilon", 1.0e-8)
+                        ),
+                        "cf_rho": float(
+                            cfg.get("feature_adapter_cf_rho", 1.0)
+                        ),
+                        "cf_weight": float(
+                            cfg.get("feature_adapter_cf_weight", 1.0)
+                        ),
+                        "null_weight": float(
+                            cfg.get("feature_adapter_null_weight", 1.0)
+                        ),
+                        "relation_weight": float(
+                            cfg.get("feature_adapter_relation_weight", 1.0)
+                        ),
+                    }
+                )
+        adapter_update_index = (
+            (step - adapter_start_step) // adapter_update_frequency
+        )
+        adapter_stage_input = (
+            adapter_real_stage_features
+            if raw_drift_v2_adapter
+            else real_stage_features
+        )
+        adapter_positive_count = (
+            adapter_real_pool_count if raw_drift_v2_adapter else P
+        )
+        adapter_negative_count = 0 if raw_drift_v2_adapter else N
+        adapter_target_positive = (
+            adapter_real_target_features
+            if raw_drift_v2_adapter
+            else pos_feats
+        )
+        with _amp_ctx(mae_use_bf16):
+            adapter_loss, adapter_info = feature_adapter(
+                adapter_stage_input,
+                labels,
+                batch_size=B,
+                positive_count=adapter_positive_count,
+                samples_per_class=(
+                    adapter_real_pool_count
+                    if raw_drift_v2_adapter
+                    else int(cfg.get("feature_adapter_samples_per_class", 8))
+                ),
+                temperature=float(cfg.get("feature_adapter_temp", 0.1)),
+                supcon_weight=float(
+                    cfg.get("feature_adapter_loss_weight", 1.0)
+                ),
+                ce_weight=0.0,
+                reg_weight=float(cfg.get("feature_adapter_reg_lambda", 0.01)),
+                drift_align_weight=float(
+                    cfg.get("feature_adapter_drift_align_lambda", 0.0)
+                ),
+                distance_scale_weight=float(
+                    cfg.get("feature_adapter_distance_scale_lambda", 0.0)
+                ),
+                distance_mean_weight=float(
+                    cfg.get("feature_adapter_distance_mean_lambda", 0.0)
+                ),
+                objective=adapter_objective,
+                generated_stage_features=gen_stage_features,
+                generated_count=G,
+                generated_samples_per_class=int(
+                    cfg.get("feature_adapter_generated_samples_per_class", G)
+                ),
+                gather_distributed=bool(
+                    cfg.get(
+                        "feature_adapter_global_statistics"
+                        if raw_map_adapter
+                        else "feature_adapter_global_contrastive",
+                        raw_map_adapter,
+                    )
+                ),
+                collect_diagnostics=adapter_collect_diagnostics,
+                negative_count=adapter_negative_count,
+                weight_neg=None if raw_drift_v2_adapter else weight_neg,
+                target_positive_features=(
+                    adapter_target_positive if raw_drift_adapter else None
+                ),
+                target_negative_features=(
+                    neg_feats
+                    if adapter_objective == "raw_drift_snr_consistency"
+                    else None
+                ),
+                target_generated_features=gen_feats if raw_drift_adapter else None,
+                drift_options=drift_options,
+                masked_stage_features=masked_dino_stage_features,
+                masked_patch_mask=masked_dino_patch_mask,
+                mdino_options={
+                    "weight": float(cfg.get("feature_adapter_mdino_weight", 1.0)),
+                    "mask_ratio": float(
+                        cfg.get("feature_adapter_mdino_mask_ratio", 0.4)
+                    ),
+                    "smooth_l1_weight": float(
+                        cfg.get("feature_adapter_mdino_smooth_l1_weight", 1.0)
+                    ),
+                    "cosine_weight": float(
+                        cfg.get("feature_adapter_mdino_cosine_weight", 0.0)
+                    ),
+                    "smooth_l1_beta": float(
+                        cfg.get("feature_adapter_mdino_smooth_l1_beta", 1.0)
+                    ),
+                    "samples_per_class": int(
+                        cfg.get("feature_adapter_mdino_samples_per_class", P)
+                    ),
+                },
+                view_swap=bool(adapter_update_index % 2),
+                split_index=adapter_update_index,
+            )
+        adapter_loss.backward()
+        if adapter_collect_diagnostics and masked_dino_adapter:
+            raw_online_adapter = (
+                feature_adapter.module
+                if isinstance(feature_adapter, DDP)
+                else feature_adapter
+            )
+
+            def component_grad_norm(module: nn.Module) -> torch.Tensor:
+                squared = [
+                    parameter.grad.detach().float().square().sum()
+                    for parameter in module.parameters()
+                    if parameter.grad is not None
+                ]
+                if not squared:
+                    return adapter_loss.detach().new_zeros(())
+                return torch.stack(squared).sum().sqrt()
+
+            adapter_info["adapter/spatial_grad_norm_unclipped"] = (
+                component_grad_norm(raw_online_adapter.adapters).detach()
+            )
+            adapter_info["adapter/predictor_grad_norm_unclipped"] = (
+                component_grad_norm(raw_online_adapter.masked_predictors).detach()
+            )
+        adapter_grad_norm = nn.utils.clip_grad_norm_(
+            feature_adapter.parameters(),
+            float(cfg.get("feature_adapter_max_grad_norm", 1.0)),
+        )
+        feature_adapter_optimizer.step()
+        if adapter_collect_diagnostics:
+            adapter_info["adapter/grad_norm"] = adapter_grad_norm.detach()
+        adapter_updated = True
+        _prof_mark("after_generated_real_adapter_update")
+        del real_stage_features, gen_stage_features
+        if masked_dino_stage_features is not None:
+            del masked_dino_stage_features, masked_dino_patch_mask
+
     if adapter_updated:
         update_adapter_ema(
             feature_adapter_target,
@@ -2450,71 +3580,103 @@ def train_step(
         )
     _prof_mark("after_optimizer")
 
-    metrics = {
-        "loss": _ddp_mean_scalar(total_generator_loss, device),
-        "drift_loss": _ddp_mean_scalar(loss, device),
-        "g_norm": g_norm.item() if isinstance(g_norm, torch.Tensor) else float(g_norm),
-        "cfg_mean": cfg_scales.mean().item(),
-        "drift_matching": drift_matching,
-    }
-    for name, value in adapter_info.items():
-        metrics[name] = _ddp_mean_scalar(value, device)
-    for name, value in feature_gan_info.items():
-        metrics[name] = _ddp_mean_scalar(value, device)
-    for stage_name in _STOCHASTIC_FEATURE_STAGES:
-        metrics[f"drift_temperature/{stage_name}_multiplier"] = float(
-            feature_temperature_multipliers.get(
-                stage_name,
-                feature_temperature_multipliers.get("default", 1.0),
+    metrics = {"drift_matching": drift_matching}
+    if collect_training_metrics:
+        # These reductions and scalar extractions exist only for logging. Skip
+        # them on level-4 steps whose metrics will not be consumed by Logger.
+        metrics.update(
+            {
+                "loss": _ddp_mean_scalar(total_generator_loss, device),
+                "drift_loss": _ddp_mean_scalar(loss, device),
+                "g_norm": (
+                    g_norm.item()
+                    if isinstance(g_norm, torch.Tensor)
+                    else float(g_norm)
+                ),
+                "cfg_mean": cfg_scales.mean().item(),
+            }
+        )
+        metrics.update(_ddp_mean_scalars(adapter_info, device))
+        metrics.update(_ddp_mean_scalars(adversarial_info, device))
+        if feature_adapter is not None:
+            metrics["adapter/updated"] = float(adapter_updated)
+            metrics["adapter/start_step"] = float(adapter_start_step)
+            metrics["adapter/freeze_step"] = float(adapter_freeze_step)
+            metrics["adapter/frozen"] = float(
+                adapter_freeze_step > 0 and step >= adapter_freeze_step
             )
-        )
-    if feature_loss_weights is not None:
-        for group_name in _FEATURE_LOSS_GROUPS:
-            group_values = [
-                weight
-                for name, weight in feature_loss_weights.items()
-                if _feature_loss_group(name) == group_name
-            ]
-            if group_values:
-                metrics[f"feature_loss/{group_name}_weight"] = float(
-                    sum(group_values) / len(group_values)
-                )
-    if selected_feature_stages is not None:
-        selected = set(selected_feature_stages)
-        metrics["stochastic_stage/selected_count"] = float(len(selected))
-        metrics["stochastic_stage/inverse_probability"] = float(
-            len(_STOCHASTIC_FEATURE_STAGES) / len(selected)
-        )
+            metrics["adapter/bank_ready"] = float(feature_adapter_bank_ready)
+        for name, value in feature_gan_info.items():
+            metrics[name] = _ddp_mean_scalar(value, device)
         for stage_name in _STOCHASTIC_FEATURE_STAGES:
-            metrics[f"stochastic_stage/selected_{stage_name}"] = float(
-                stage_name in selected
+            metrics[f"drift_temperature/{stage_name}_multiplier"] = float(
+                feature_temperature_multipliers.get(
+                    stage_name,
+                    feature_temperature_multipliers.get("default", 1.0),
+                )
             )
+        if feature_loss_weights is not None:
+            for group_name in _FEATURE_LOSS_GROUPS:
+                group_values = [
+                    weight
+                    for name, weight in feature_loss_weights.items()
+                    if _feature_loss_group(name) == group_name
+                ]
+                if group_values:
+                    metrics[f"feature_loss/{group_name}_weight"] = float(
+                        sum(group_values) / len(group_values)
+                    )
+        if selected_feature_stages is not None:
+            selected = set(selected_feature_stages)
+            metrics["stochastic_stage/selected_count"] = float(len(selected))
+            metrics["stochastic_stage/inverse_probability"] = float(
+                len(_STOCHASTIC_FEATURE_STAGES) / len(selected)
+            )
+            for stage_name in _STOCHASTIC_FEATURE_STAGES:
+                metrics[f"stochastic_stage/selected_{stage_name}"] = float(
+                    stage_name in selected
+                )
     # Log raw coverage and the capacity-normalized ratios used by Hedge,
     # regardless of drift_matching. Tracker is created unconditionally.
     if mix_alpha_tracker is not None:
-        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-        mix_alpha_tracker.update(loss_info, world_size=world_size, device=device)
-        metrics["mix_alpha_tracker/alpha1"] = float(mix_alpha_tracker.alpha1)
-        metrics["mix_alpha_tracker/beta1"] = float(mix_alpha_tracker.beta1)
-        metrics["mix_alpha_tracker/alpha1_capacity"] = float(
-            mix_alpha_tracker.alpha1_capacity
-        )
-        metrics["mix_alpha_tracker/beta1_capacity"] = float(
-            mix_alpha_tracker.beta1_capacity
-        )
-        metrics["mix_alpha_tracker/versionb_coef"] = float(1.0 - mix_alpha)
+        if collect_mix_alpha_stats:
+            world_size = (
+                dist.get_world_size()
+                if dist.is_available() and dist.is_initialized()
+                else 1
+            )
+            mix_alpha_tracker.update(
+                loss_info,
+                world_size=world_size,
+                device=device,
+            )
+        if collect_training_metrics and collect_mix_alpha_stats:
+            metrics["mix_alpha_tracker/alpha1"] = float(
+                mix_alpha_tracker.alpha1
+            )
+            metrics["mix_alpha_tracker/beta1"] = float(
+                mix_alpha_tracker.beta1
+            )
+            metrics["mix_alpha_tracker/alpha1_capacity"] = float(
+                mix_alpha_tracker.alpha1_capacity
+            )
+            metrics["mix_alpha_tracker/beta1_capacity"] = float(
+                mix_alpha_tracker.beta1_capacity
+            )
+            metrics["mix_alpha_tracker/versionb_coef"] = float(1.0 - mix_alpha)
         # Strip lower-level mix keys; their useful values are represented by
         # the tracker metrics above.
         for _k in ("raw/pos_winner_count", "raw/pos_winner_total",
                    "raw/gen_winner_count", "raw/gen_winner_total",
                    "mix_alpha", "mix_scale_v", "mix_scale_b"):
             loss_info.pop(_k, None)
-    if profile_train_step and len(prof_marks) >= 2:
+    if collect_training_metrics and profile_train_step and len(prof_marks) >= 2:
         for i in range(1, len(prof_marks)):
             a, ta = prof_marks[i - 1]
             b, tb = prof_marks[i]
             metrics[f"prof_ms/{a}__{b}"] = (tb - ta) * 1000.0
-    metrics.update({k: float(v) for k, v in loss_info.items()})
+    if collect_training_metrics:
+        metrics.update({k: float(v) for k, v in loss_info.items()})
     extras = {
         "gen_samples_detached": gen_samples.detach(),
         "expanded_labels": expanded_labels.detach(),
@@ -2793,7 +3955,475 @@ def eval_fid_is(
 # Main training function
 # ---------------------------------------------------------------------------
 
+_RAW_IMAGENET_EXPECTED = {
+    "classes": 1_000,
+    "train_files": 1_281_167,
+    "val_files": 50_000,
+    "train_archive_bytes": 147_897_477_120,
+    "val_archive_bytes": 6_744_924_160,
+}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_raw_temperature_calibration(cfg: dict) -> None:
+    """Fail closed unless a raw DINO/MoCo tau artifact matches this run."""
+    status = str(cfg.get("temperature_calibration_status", "pending")).strip().lower()
+    if status == "calibration_capture":
+        capture_invariants = {
+            "use_wandb=false": not bool(cfg.get("use_wandb", False)),
+            "eval_at_start=false": not bool(cfg.get("eval_at_start", False)),
+            "total_generated_epochs=0": float(
+                cfg.get("total_generated_epochs", -1.0)
+            )
+            == 0.0,
+            "train_max_step_exclusive=1": int(
+                cfg.get("train_max_step_exclusive", -1)
+            )
+            == 1,
+        }
+        failed = [name for name, valid in capture_invariants.items() if not valid]
+        if failed:
+            raise RuntimeError(
+                "Unsafe temperature calibration capture config: " + ", ".join(failed)
+            )
+        return
+    if status != "ready":
+        raise RuntimeError(
+            "Raw-pixel temperature calibration is pending; refusing to start "
+            "production training with placeholder tau multipliers."
+        )
+
+    production_invariants = {
+        "use_wandb=true": bool(cfg.get("use_wandb", False)),
+        "wandb_project": cfg.get("project") == "Feature encoder - S4 model",
+        "require_complete_raw_imagenet=true": bool(
+            cfg.get("require_complete_raw_imagenet", False)
+        ),
+        "use_latent=false": not bool(cfg.get("use_latent", True)),
+        "use_cache=false": not bool(cfg.get("use_cache", True)),
+        "resolution=256": int(cfg.get("resolution", -1)) == 256,
+        "pixel_uint8_bank": str(cfg.get("memory_bank_storage_mode", ""))
+        == "pixel_uint8",
+        "S4_hidden=384": int(cfg.get("hidden_size", -1)) == 384,
+        "S4_depth=12": int(cfg.get("depth", -1)) == 12,
+        "S4_heads=6": int(cfg.get("num_heads", -1)) == 6,
+        "pixel_input=256x3_p32": int(cfg.get("input_size", -1)) == 256
+        and int(cfg.get("in_channels", -1)) == 3
+        and int(cfg.get("out_channels", -1)) == 3
+        and int(cfg.get("patch_size", -1)) == 32,
+        "R_list": [float(value) for value in cfg.get("R_list", ())]
+        == [0.2, 0.05, 0.02],
+        "B/G/P/N": (
+            int(cfg.get("batch_size", -1)),
+            int(cfg.get("gen_per_label", -1)),
+            int(cfg.get("pos_per_sample", -1)),
+            int(cfg.get("neg_per_sample", -1)),
+        )
+        == (4, 32, 64, 32),
+    }
+    failed_production = [
+        name for name, valid in production_invariants.items() if not valid
+    ]
+    if failed_production:
+        raise RuntimeError(
+            "Raw DINO/MoCo production config changed after calibration: "
+            + ", ".join(failed_production)
+        )
+
+    profile_name = str(cfg.get("layer_temperature_profile", ""))
+    if profile_name != "raw_imagenet_dino_moco_symmetric_3seed_p32_v2":
+        raise RuntimeError(
+            f"Unexpected production temperature profile: {profile_name!r}"
+        )
+    role = str(cfg.get("temperature_calibration_role", "")).strip().lower()
+    if role not in {"dino", "moco"}:
+        raise RuntimeError(f"Invalid temperature_calibration_role={role!r}")
+    artifact_path = Path(
+        str(cfg.get("temperature_calibration_artifact", ""))
+    ).resolve()
+    if not artifact_path.is_file():
+        raise FileNotFoundError(f"Temperature calibration artifact missing: {artifact_path}")
+    expected_artifact_sha = str(
+        cfg.get("temperature_calibration_artifact_sha256", "")
+    ).strip().lower()
+    actual_artifact_sha = _sha256_file(artifact_path)
+    if len(expected_artifact_sha) != 64 or actual_artifact_sha != expected_artifact_sha:
+        raise RuntimeError(
+            "Temperature calibration artifact SHA256 mismatch: "
+            f"{actual_artifact_sha} != {expected_artifact_sha or '<missing>'}"
+        )
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    if (
+        int(artifact.get("schema_version", 0)) != 3
+        or artifact.get("calibration_kind")
+        != "symmetric_raw_imagenet_dino_moco"
+        or artifact.get("centering") != "geometric_mean_one"
+        or artifact.get("required_seeds") != [43, 44, 45]
+        or float(artifact.get("min_distance", -1.0)) != 0.02
+        or float(artifact.get("huber_tuning", -1.0)) != 1.5
+        or float(artifact.get("trim_fraction", -1.0)) != 0.1
+    ):
+        raise RuntimeError("Temperature calibration artifact protocol is invalid")
+
+    capture_protocol = artifact.get("capture_protocol") or {}
+    capture_generator_geometry = capture_protocol.get("generator_geometry") or {}
+    capture_batch = capture_protocol.get("batch") or {}
+    capture_r_values = [
+        float(value) for value in capture_protocol.get("R_list", ())
+    ]
+    feature_layout = capture_protocol.get("feature_layout") or {}
+    feature_stage_counts = {
+        stage: sum(
+            1 for value in feature_layout.values() if value.get("stage") == stage
+        )
+        for stage in ("stage3", "stage4")
+    }
+    feature_layout_valid = (
+        len(feature_layout) == 42
+        and feature_stage_counts == {"stage3": 28, "stage4": 14}
+        and all(
+            int(value.get("dimension", -1))
+            == (1024 if value.get("stage") == "stage3" else 2048)
+            for value in feature_layout.values()
+        )
+    )
+    fixed_input = artifact.get("fixed_input_feature_multipliers") or {}
+    if (
+        capture_generator_geometry
+        != {
+            "input_size": 256,
+            "in_channels": 3,
+            "out_channels": 3,
+            "patch_size": 32,
+            "image_tokens": 64,
+            "class_tokens": 16,
+        }
+        or capture_batch != {"B": 4, "G": 32, "P": 64, "N": 32}
+        or capture_r_values != [0.2, 0.05, 0.02]
+        or int(capture_protocol.get("max_token_rows_per_feature", -1)) != 64
+        or not feature_layout_valid
+        or float(fixed_input.get("global", float("nan"))) != 1.0
+        or float(fixed_input.get("norm_x", float("nan"))) != 1.0
+    ):
+        raise RuntimeError("Temperature calibration capture protocol is invalid")
+
+    reciprocity = artifact.get("reciprocity_validation") or {}
+    if reciprocity.get("verified") is not True:
+        raise RuntimeError("Temperature calibration reciprocity was not verified")
+    max_log_error = float(
+        reciprocity.get("max_log_reciprocity_error", float("nan"))
+    )
+    if not math.isfinite(max_log_error) or max_log_error > 1e-10:
+        raise RuntimeError("Temperature calibration reciprocity tolerance is invalid")
+    reciprocity_stages = reciprocity.get("stages") or {}
+    for stage in ("stage3", "stage4"):
+        validation = reciprocity_stages.get(stage) or {}
+        stage_log_error = float(validation.get("abs_log_product", float("nan")))
+        stage_product = float(validation.get("product", float("nan")))
+        if (
+            not math.isfinite(stage_log_error)
+            or stage_log_error > max_log_error
+            or not math.isfinite(stage_product)
+            or not math.isclose(
+                stage_product, math.exp(stage_log_error), rel_tol=0.0, abs_tol=1e-10
+            )
+            and not math.isclose(
+                stage_product, math.exp(-stage_log_error), rel_tol=0.0, abs_tol=1e-10
+            )
+        ):
+            raise RuntimeError(f"{stage} temperature reciprocity evidence is invalid")
+
+    raw_root = Path(str(cfg.get("imagenet_path", ""))).resolve()
+    raw_manifest = raw_root / "raw_imagenet_manifest.json"
+    if not raw_manifest.is_file():
+        raise FileNotFoundError(f"Raw ImageNet manifest missing: {raw_manifest}")
+    current_manifest_sha = _sha256_file(raw_manifest)
+    configured_manifest_sha = str(
+        cfg.get("temperature_calibration_raw_manifest_sha256", "")
+    ).strip().lower()
+    artifact_dataset = artifact.get("dataset_provenance") or {}
+    artifact_manifest_sha = str(artifact_dataset.get("manifest_sha256", "")).lower()
+    if not (
+        len(configured_manifest_sha) == 64
+        and current_manifest_sha == configured_manifest_sha == artifact_manifest_sha
+    ):
+        raise RuntimeError(
+            "Raw ImageNet manifest is not the one used for tau calibration"
+        )
+
+    extractor_name = resolve_feature_extractor_name(cfg)
+    expected_extractor = "dino_resnet50" if role == "dino" else "moco_v2_resnet50"
+    if extractor_name != expected_extractor:
+        raise RuntimeError(
+            f"Calibration role {role} does not match extractor {extractor_name}"
+        )
+    checkpoint_value = cfg.get("feature_checkpoint")
+    checkpoint = Path(str(checkpoint_value or "")).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Feature checkpoint missing: {checkpoint}")
+    encoder_provenance = (artifact.get("encoder_provenance") or {}).get(role) or {}
+    if (
+        "temperature_calibration_inheritance_manifest" in cfg
+        or "temperature_calibration_inheritance_manifest_sha256" in cfg
+    ):
+        from temperature_calibration_inheritance import validate_dino_temperature_inheritance
+
+        validate_dino_temperature_inheritance(cfg, artifact, checkpoint)
+        print(
+            "[raw-tau] verified tuned-DINO weights-only ablation; "
+            "inheriting baseline numeric temperatures without refitting",
+            flush=True,
+        )
+    elif (
+        encoder_provenance.get("feature_extractor") != expected_extractor
+        or int(encoder_provenance.get("checkpoint_bytes", -1))
+        != checkpoint.stat().st_size
+        or str(encoder_provenance.get("checkpoint_sha256", "")).lower()
+        != _sha256_file(checkpoint)
+    ):
+        raise RuntimeError(
+            f"{role} feature checkpoint differs from the calibrated checkpoint"
+        )
+
+    profiles = artifact.get("symmetric_profiles") or {}
+    if set(profiles) != {"dino", "moco"}:
+        raise RuntimeError("Calibration artifact lacks the DINO/MoCo pair profiles")
+    configured = _resolve_layer_temperature_multipliers(cfg)
+    for stage in ("default", "stage3", "stage4"):
+        expected = float(profiles[role][stage])
+        actual = float(configured.get(stage, float("nan")))
+        if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=5e-11):
+            raise RuntimeError(
+                f"Configured {role} {stage} tau multiplier {actual} != artifact {expected}"
+            )
+    for stage in ("stage3", "stage4"):
+        dino_value = float(profiles["dino"][stage])
+        moco_value = float(profiles["moco"][stage])
+        ratio = float(
+            artifact["candidates"]["moco"]["stages"][stage][
+                "selected_multiplier"
+            ]
+        )
+        if not math.isclose(dino_value * moco_value, 1.0, abs_tol=5e-11):
+            raise RuntimeError(f"{stage} symmetric tau product is not one")
+        if not math.isclose(
+            moco_value / dino_value, ratio, rel_tol=0.0, abs_tol=5e-11
+        ):
+            raise RuntimeError(f"{stage} symmetric tau ratio is inconsistent")
+
+    capture_validation = artifact.get("capture_validation") or {}
+    for seed in ("43", "44", "45"):
+        dino_hashes = (
+            (capture_validation.get("dino") or {}).get(seed) or {}
+        ).get("tensor_sha256")
+        moco_hashes = (
+            (capture_validation.get("moco") or {}).get(seed) or {}
+        ).get("tensor_sha256")
+        required_hashes = {
+            "labels",
+            "positive_samples",
+            "negative_samples",
+            "generated_samples",
+            "cfg_scales",
+        }
+        if (
+            not isinstance(dino_hashes, dict)
+            or not isinstance(moco_hashes, dict)
+            or not required_hashes.issubset(dino_hashes)
+            or any(dino_hashes[key] != moco_hashes.get(key) for key in required_hashes)
+        ):
+            raise RuntimeError(f"Seed {seed} calibration input hashes do not match")
+
+    activation_kwargs = cfg.get("activation_kwargs") or {}
+    feature_profile = _resolve_feature_loss_group_weights(cfg)
+    feature_default = float(feature_profile.get("default", 1.0))
+    effective_feature_weight = {
+        group: float(feature_profile.get(group, feature_default))
+        for group in ("global", "norm_x", "stage1", "stage2", "stage3", "stage4")
+    }
+    if (
+        list(activation_kwargs.get("active_stages", ())) != ["stage3", "stage4"]
+        or activation_kwargs.get("with_global") is not True
+        or activation_kwargs.get("with_norm_x") is not True
+        or bool(activation_kwargs.get("exclude_terminal_block", False))
+        or int(activation_kwargs.get("every_k_block", -1)) != 2
+        or effective_feature_weight
+        != {
+            "global": 1.0,
+            "norm_x": 2.0,
+            "stage1": 0.0,
+            "stage2": 0.0,
+            "stage3": 1.0,
+            "stage4": 1.0,
+        }
+        or not bool(cfg.get("feature_loss_group_normalize", False))
+        or not bool(cfg.get("prune_skipped_feature_tensors", False))
+        or not bool(cfg.get("feature_include_norm_x", False))
+    ):
+        raise RuntimeError(
+            "Production feature set must keep global+norm_x+stage3+stage4 and "
+            "remove only stage1+stage2"
+        )
+
+
+def _load_complete_raw_imagenet_manifest(imagenet_path: str) -> dict:
+    """Load and validate the provenance manifest for raw ILSVRC2012.
+
+    The downloader publishes this file only after checking every class/file in
+    train and validation against the official devkit.  Keep the checks here
+    deliberately strict so a partial transfer cannot silently become a run.
+    """
+    root = Path(imagenet_path).resolve()
+    manifest_path = root / "raw_imagenet_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Required raw-ImageNet manifest is missing: {manifest_path}"
+        )
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict) or manifest.get("complete") is not True:
+        raise RuntimeError(
+            f"Raw ImageNet manifest is not complete: {manifest_path}"
+        )
+    if int(manifest.get("schema_version", 0)) != 1:
+        raise RuntimeError(
+            f"Unsupported raw ImageNet manifest schema: {manifest.get('schema_version')!r}"
+        )
+    manifest_root = Path(str(manifest.get("output_root", ""))).resolve()
+    if manifest_root != root:
+        raise RuntimeError(
+            f"Raw ImageNet manifest root mismatch: {manifest_root} != {root}"
+        )
+
+    expected = manifest.get("expected")
+    if not isinstance(expected, dict):
+        raise RuntimeError(f"Raw ImageNet manifest lacks expected counts: {manifest_path}")
+    for key in ("classes", "train_files", "val_files"):
+        actual = int(expected.get(key, -1))
+        canonical = _RAW_IMAGENET_EXPECTED[key]
+        if actual != canonical:
+            raise RuntimeError(
+                f"Raw ImageNet manifest {key} mismatch: {actual:,} != {canonical:,}"
+            )
+
+    mapping = manifest.get("mapping")
+    if not isinstance(mapping, dict) or mapping.get(
+        "train_val_devkit_wnids_identical"
+    ) is not True:
+        raise RuntimeError("Raw ImageNet train/val/devkit mappings are not verified")
+    class_to_idx = mapping.get("imagefolder_class_to_index")
+    official_id_to_wnid = mapping.get("official_imagenet_id_to_wnid")
+    if not isinstance(class_to_idx, dict) or not isinstance(
+        official_id_to_wnid, dict
+    ):
+        raise RuntimeError("Raw ImageNet manifest lacks canonical class mappings")
+    sorted_wnids = sorted(class_to_idx)
+    if (
+        len(sorted_wnids) != _RAW_IMAGENET_EXPECTED["classes"]
+        or any(
+            len(wnid) != 9
+            or not wnid.startswith("n")
+            or not wnid[1:].isdigit()
+            for wnid in sorted_wnids
+        )
+        or class_to_idx != {wnid: index for index, wnid in enumerate(sorted_wnids)}
+        or set(official_id_to_wnid.values()) != set(sorted_wnids)
+    ):
+        raise RuntimeError("Raw ImageNet manifest contains an invalid WNID mapping")
+
+    source = manifest.get("source")
+    if not isinstance(source, dict):
+        raise RuntimeError("Raw ImageNet manifest lacks source archive provenance")
+    for split, size_key in (
+        ("train", "train_archive_bytes"),
+        ("val", "val_archive_bytes"),
+    ):
+        remote = source.get(split)
+        if not isinstance(remote, dict):
+            raise RuntimeError(f"Raw ImageNet manifest lacks {split} source metadata")
+        actual_size = int(remote.get("total_bytes", -1))
+        canonical_size = _RAW_IMAGENET_EXPECTED[size_key]
+        if actual_size != canonical_size:
+            raise RuntimeError(
+                f"Official {split} archive size mismatch: "
+                f"{actual_size:,} != {canonical_size:,}"
+            )
+
+    for split, count_key in (("train", "train_files"), ("val", "val_files")):
+        split_manifest = manifest.get(split)
+        if not isinstance(split_manifest, dict) or split_manifest.get(
+            "complete"
+        ) is not True:
+            raise RuntimeError(f"Raw ImageNet {split} split is not verified complete")
+        if int(split_manifest.get("class_count", -1)) != _RAW_IMAGENET_EXPECTED[
+            "classes"
+        ]:
+            raise RuntimeError(f"Raw ImageNet {split} class count is invalid")
+        if int(split_manifest.get("file_count", -1)) != _RAW_IMAGENET_EXPECTED[
+            count_key
+        ]:
+            raise RuntimeError(f"Raw ImageNet {split} file count is invalid")
+        per_class = split_manifest.get("per_class_file_count")
+        if (
+            not isinstance(per_class, dict)
+            or set(per_class) != set(sorted_wnids)
+            or sum(int(value) for value in per_class.values())
+            != _RAW_IMAGENET_EXPECTED[count_key]
+        ):
+            raise RuntimeError(
+                f"Raw ImageNet {split} per-class counts are incomplete"
+            )
+    return manifest
+
+
+def _validate_raw_imagefolder_dataset(dataset, split: str, manifest: dict) -> None:
+    """Match torchvision's live ImageFolder scan to the verified manifest."""
+    count_key = "train_files" if split == "train" else "val_files"
+    expected_count = _RAW_IMAGENET_EXPECTED[count_key]
+    if len(dataset) != expected_count:
+        raise RuntimeError(
+            f"Raw ImageNet {split} live file count mismatch: "
+            f"{len(dataset):,} != {expected_count:,}"
+        )
+    expected_mapping = manifest["mapping"]["imagefolder_class_to_index"]
+    if getattr(dataset, "class_to_idx", None) != expected_mapping:
+        raise RuntimeError(
+            f"Raw ImageNet {split} live ImageFolder mapping differs from the devkit"
+        )
+    targets = np.asarray(getattr(dataset, "targets", ()), dtype=np.int64)
+    if targets.size != expected_count:
+        raise RuntimeError(f"Raw ImageNet {split} ImageFolder targets are incomplete")
+    live_counts = np.bincount(
+        targets, minlength=_RAW_IMAGENET_EXPECTED["classes"]
+    )
+    expected_per_class = manifest[split]["per_class_file_count"]
+    ordered_expected = np.asarray(
+        [
+            int(expected_per_class[wnid])
+            for wnid, _ in sorted(expected_mapping.items(), key=lambda item: item[1])
+        ],
+        dtype=np.int64,
+    )
+    if not np.array_equal(live_counts, ordered_expected):
+        mismatched = np.flatnonzero(live_counts != ordered_expected)[:10].tolist()
+        raise RuntimeError(
+            f"Raw ImageNet {split} live per-class counts differ; "
+            f"mismatched class indices={mismatched}"
+        )
+
 def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch.device) -> None:
+    if bool(cfg.get("require_raw_temperature_calibration", False)):
+        _validate_raw_temperature_calibration(cfg)
     process_seed = int(cfg.get("seed", 42)) + rank
     torch.manual_seed(process_seed)
     if bool(cfg.get("seed_host_rng", False)):
@@ -2805,6 +4435,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     # --- Build generator ---
     raw_cfg = cfg.get("_raw", {})
     throughput_opt_level = int(cfg.get("throughput_opt_level", 0))
+    _configure_level4_cuda_runtime(cfg, throughput_opt_level, device)
     gen_raw = build_ditgen_from_config(raw_cfg.get("model", cfg), raw_cfg.get("dataset", cfg))
     gen_raw = gen_raw.to(device)
     if world_size > 1:
@@ -2834,21 +4465,39 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     warmup    = int(cfg.get("warmup_steps", 10000))
     warmup_init_lr = float(cfg.get("warmup_init_lr", 1e-6))
 
-    # --- Load frozen MAE ---
-    mae_ckpt = cfg.get("mae_checkpoint") or os.environ.get("MAE_CHECKPOINT", "")
-    if not mae_ckpt:
-        print("[WARNING] mae_checkpoint is not set. Feature extraction will use random weights.")
-    mae = load_mae(mae_ckpt, cfg, device)
-    feature_extractor: MAEResNet = mae
+    # --- Load frozen feature encoder ---
+    # Construction consumes different amounts of RNG for MAE and torchvision
+    # ResNets. Preserve the post-generator RNG state so the three causal
+    # comparisons draw the same labels, CFG values, and generator noise.
+    fork_devices = (
+        [device.index if device.index is not None else torch.cuda.current_device()]
+        if device.type == "cuda"
+        else []
+    )
+    with torch.random.fork_rng(devices=fork_devices):
+        feature_extractor = load_feature_extractor(cfg, device)
+    if is_main_process(rank):
+        print(
+            f"[feature] extractor={resolve_feature_extractor_name(cfg)} "
+            f"checkpoint={cfg.get('feature_checkpoint') or cfg.get('mae_checkpoint')}",
+            flush=True,
+        )
     (
         feature_adapter,
         feature_adapter_target,
         feature_adapter_optimizer,
-    ) = build_feature_adapter_system(mae, cfg, device, world_size)
+    ) = build_feature_adapter_system(feature_extractor, cfg, device, world_size)
     (
         feature_discriminator,
         feature_discriminator_optimizer,
-    ) = build_feature_discriminator_system(mae, cfg, device, world_size)
+    ) = build_feature_discriminator_system(feature_extractor, cfg, device, world_size)
+    adversarial_system = build_adversarial_system(cfg, device)
+    if adversarial_system is not None and is_main_process(rank):
+        print(
+            f"[adversarial] mode={adversarial_system.mode} "
+            "frozen DINO drift unchanged; generator uses the previous target snapshot",
+            flush=True,
+        )
 
     # --- Data ---
     imagenet_path = cfg.get("imagenet_path") or os.environ.get("IMAGENET_PATH", "")
@@ -2859,6 +4508,92 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     resolution    = int(cfg.get("resolution", 256))
     batch_size    = int(cfg.get("batch_size", 128))
     eval_bsz      = int(cfg.get("eval_batch_size", 256))
+    memory_bank_storage_mode = str(
+        cfg.get("memory_bank_storage_mode", "raw")
+    ).strip().lower()
+    raw_train_uint8 = bool(cfg.get("raw_train_uint8", False))
+    if memory_bank_storage_mode == "pixel_uint8" and (use_latent or use_cache):
+        raise ValueError(
+            "memory_bank_storage_mode='pixel_uint8' requires a direct pixel "
+            "dataset (use_latent=false, use_cache=false)."
+        )
+    if raw_train_uint8 and memory_bank_storage_mode != "pixel_uint8":
+        raise ValueError(
+            "raw_train_uint8=true requires "
+            "memory_bank_storage_mode='pixel_uint8'."
+        )
+
+    prefetch_factor = int(cfg.get("prefetch_factor", 2))
+    eval_prefetch_factor = int(
+        cfg.get("eval_prefetch_factor", prefetch_factor)
+    )
+
+    if bool(cfg.get("require_complete_pixel_cache", False)):
+        if use_latent or use_cache:
+            raise ValueError(
+                "require_complete_pixel_cache is only valid for direct pixel "
+                "ImageFolder datasets."
+            )
+        manifest_path = Path(imagenet_path) / "_pixel_cache_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"Required pixel-cache manifest is missing: {manifest_path}"
+            )
+        with manifest_path.open("r", encoding="utf-8") as manifest_handle:
+            pixel_manifest = json.load(manifest_handle)
+        split_status = pixel_manifest.get("split_status", {})
+        incomplete_splits = [
+            split
+            for split in ("train", "val")
+            if not bool(split_status.get(split, {}).get("complete", False))
+        ]
+        if not bool(pixel_manifest.get("complete_requested", False)) or incomplete_splits:
+            raise RuntimeError(
+                "Pixel cache is incomplete; refusing to train from a partial "
+                f"ImageFolder. incomplete_splits={incomplete_splits} "
+                f"manifest={manifest_path}"
+            )
+        expected_quality = int(cfg.get("pixel_cache_jpeg_quality", 0) or 0)
+        actual_quality = int(pixel_manifest.get("jpeg_quality", 0) or 0)
+        if expected_quality and actual_quality != expected_quality:
+            raise ValueError(
+                "Pixel-cache JPEG quality does not match the experiment "
+                f"config: expected={expected_quality}, actual={actual_quality}."
+            )
+        if is_main_process(rank):
+            print(
+                "[pixel-cache] verified complete "
+                f"train={split_status['train']['output_count']} "
+                f"val={split_status['val']['output_count']} "
+                f"jpeg_quality={actual_quality} manifest={manifest_path}",
+                flush=True,
+            )
+
+    raw_imagenet_manifest = None
+    if bool(cfg.get("require_complete_raw_imagenet", False)):
+        if use_latent or use_cache:
+            raise ValueError(
+                "require_complete_raw_imagenet requires direct pixels "
+                "(use_latent=false, use_cache=false)."
+            )
+        raw_imagenet_manifest = _load_complete_raw_imagenet_manifest(imagenet_path)
+
+    raw_image_io_concurrency = int(
+        cfg.get("raw_image_io_concurrency_per_rank", 0)
+    )
+    if raw_image_io_concurrency < 0:
+        raise ValueError(
+            "raw_image_io_concurrency_per_rank must be non-negative"
+        )
+    if raw_image_io_concurrency > 0 and (use_latent or use_cache):
+        raise ValueError(
+            "raw_image_io_concurrency_per_rank is only valid for direct raw inputs"
+        )
+    # Rank 0's train and eval loaders share this gate so an evaluation cannot
+    # temporarily double the rank's raw-image read/decode concurrency.
+    raw_image_io_semaphore = create_raw_image_io_semaphore(
+        raw_image_io_concurrency
+    )
 
     train_loader, preprocess_fn, postprocess_fn = create_imagenet_split(
         imagenet_path=imagenet_path,
@@ -2870,11 +4605,22 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         use_cache=use_cache,
         cache_path=cache_path,
         num_workers=int(cfg.get("num_workers", 8)),
+        prefetch_factor=prefetch_factor,
         pin_memory=bool(cfg.get("pin_memory", True)),
+        persistent_workers=bool(cfg.get("persistent_workers", True)),
         distributed=(world_size > 1),
         rank=rank,
         world_size=world_size,
         latent_device=device,
+        vae_model_id=str(cfg.get("feature_vae_model_id", "stabilityai/sd-vae-ft-mse")),
+        vae_revision=(
+            str(cfg["feature_vae_revision"])
+            if cfg.get("feature_vae_revision")
+            else None
+        ),
+        return_uint8=raw_train_uint8,
+        raw_image_io_concurrency=raw_image_io_concurrency,
+        raw_image_io_semaphore=raw_image_io_semaphore,
     )
     eval_loader = None
     eval_postprocess_fn = None
@@ -2891,12 +4637,50 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             use_cache=use_cache,
             cache_path=cache_path,
             num_workers=int(cfg.get("num_workers", 8)),
+            prefetch_factor=eval_prefetch_factor,
             pin_memory=bool(cfg.get("pin_memory", True)),
+            persistent_workers=bool(cfg.get("eval_persistent_workers", False)),
             distributed=False,
             rank=0,
             world_size=1,
             latent_device=device,
+            vae_model_id=str(cfg.get("feature_vae_model_id", "stabilityai/sd-vae-ft-mse")),
+            vae_revision=(
+                str(cfg["feature_vae_revision"])
+                if cfg.get("feature_vae_revision")
+                else None
+            ),
+            raw_image_io_concurrency=raw_image_io_concurrency,
+            raw_image_io_semaphore=raw_image_io_semaphore,
         )
+        print(
+            "[data-loader] "
+            f"train_workers={int(cfg.get('num_workers', 8))} "
+            f"train_prefetch={prefetch_factor} "
+            f"train_persistent={bool(cfg.get('persistent_workers', True))} "
+            f"raw_train_uint8={raw_train_uint8}; "
+            f"raw_image_io_concurrency_per_rank={raw_image_io_concurrency}; "
+            f"eval_prefetch={eval_prefetch_factor} "
+            f"eval_persistent={bool(cfg.get('eval_persistent_workers', False))}",
+            flush=True,
+        )
+
+    if raw_imagenet_manifest is not None:
+        _validate_raw_imagefolder_dataset(
+            train_loader.dataset, "train", raw_imagenet_manifest
+        )
+        if is_main_process(rank):
+            if eval_loader is None:
+                raise RuntimeError("Raw ImageNet validation loader was not constructed")
+            _validate_raw_imagefolder_dataset(
+                eval_loader.dataset, "val", raw_imagenet_manifest
+            )
+            print(
+                "[raw-imagenet] verified live ImageFolder scan "
+                "train=1,281,167 val=50,000 classes=1,000; "
+                "input=official JPEG -> ADM center-crop 256 -> train-only hflip -> [-1,1]",
+                flush=True,
+            )
 
     # --- Memory banks ---
     positive_bank_size = int(cfg.get("positive_bank_size", 128))
@@ -2904,14 +4688,60 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     num_classes        = int(cfg.get("num_classes", 1000))
     banks_per_rank     = max(1, int(cfg.get("banks_per_rank", 1)))
     bank_batch_sizes   = _split_evenly(batch_size, banks_per_rank)
+    positive_bank_backend = str(
+        cfg.get("positive_memory_bank_backend", "dense")
+    ).lower().strip()
+    if positive_bank_backend not in {"dense", "zstd_delta"}:
+        raise ValueError(
+            "positive_memory_bank_backend must be 'dense' or 'zstd_delta', got "
+            f"{positive_bank_backend!r}."
+        )
+    if (
+        positive_bank_backend == "zstd_delta"
+        and memory_bank_storage_mode != "pixel_uint8"
+    ):
+        raise ValueError(
+            "positive_memory_bank_backend='zstd_delta' requires "
+            "memory_bank_storage_mode='pixel_uint8'."
+        )
+    positive_bank_zstd_level = int(
+        cfg.get("positive_memory_bank_zstd_level", 1)
+    )
+    positive_bank_codec_workers = int(
+        cfg.get("positive_memory_bank_codec_workers", 1)
+    )
     pos_banks = [
-        ArrayMemoryBank(num_classes=num_classes, max_size=positive_bank_size)
+        (
+            CompressedPixelMemoryBank(
+                num_classes=num_classes,
+                max_size=positive_bank_size,
+                compression_level=positive_bank_zstd_level,
+                codec_workers=positive_bank_codec_workers,
+            )
+            if positive_bank_backend == "zstd_delta"
+            else ArrayMemoryBank(
+                num_classes=num_classes,
+                max_size=positive_bank_size,
+                storage_mode=memory_bank_storage_mode,
+            )
+        )
         for _ in range(banks_per_rank)
     ]
     neg_banks = [
-        ArrayMemoryBank(num_classes=1, max_size=negative_bank_size)
+        ArrayMemoryBank(
+            num_classes=1,
+            max_size=negative_bank_size,
+            storage_mode=memory_bank_storage_mode,
+        )
         for _ in range(banks_per_rank)
     ]
+    if is_main_process(rank):
+        print(
+            f"[banks] storage_mode={memory_bank_storage_mode} "
+            f"positive_backend={positive_bank_backend} "
+            f"positive={positive_bank_size}/class negative={negative_bank_size}",
+            flush=True,
+        )
     if is_main_process(rank) and banks_per_rank > 1:
         print(
             f"[banks] using {banks_per_rank} independent bank pairs per rank; "
@@ -3063,16 +4893,79 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             trainable_parameters = sum(
                 parameter.numel() for parameter in raw_adapter.parameters()
             )
+            adapter_objective_name = str(
+                cfg.get("feature_adapter_objective", "supcon")
+            ).lower().strip()
+            adapter_global_name = (
+                "global_statistics"
+                if adapter_objective_name
+                in {
+                    "raw_drift_snr",
+                    "raw_drift_snr_consistency",
+                    "dino_cf_drift_realreal_infonce",
+                }
+                else "global_contrastive"
+            )
+            adapter_global_enabled = bool(
+                cfg.get(
+                    "feature_adapter_global_statistics"
+                    if adapter_objective_name
+                    in {
+                        "raw_drift_snr",
+                        "raw_drift_snr_consistency",
+                        "dino_cf_drift_realreal_infonce",
+                    }
+                    else "feature_adapter_global_contrastive",
+                    adapter_objective_name
+                    in {
+                        "raw_drift_snr",
+                        "raw_drift_snr_consistency",
+                        "dino_cf_drift_realreal_infonce",
+                    },
+                )
+            )
             print(
                 "[feature-adapter] enabled "
-                f"objective={cfg.get('feature_adapter_objective', 'supcon')} "
+                f"objective={adapter_objective_name} "
                 f"stages={','.join(raw_adapter.stages)} "
                 f"bottleneck={int(cfg.get('feature_adapter_bottleneck', 64))} "
                 f"samples_per_class={int(cfg.get('feature_adapter_samples_per_class', 8))} "
+                f"generated_samples_per_class={int(cfg.get('feature_adapter_generated_samples_per_class', cfg.get('gen_per_label', 64)))} "
+                f"start_step={int(cfg.get('feature_adapter_start_step', 0))} "
+                f"update_freq={int(cfg.get('feature_adapter_update_freq', 1))} "
+                f"require_unique_reals={str(bool(cfg.get('feature_adapter_require_unique_reals', False))).lower()} "
+                f"{adapter_global_name}={str(adapter_global_enabled).lower()} "
                 f"lr={float(cfg.get('feature_adapter_lr', 1.0e-4)):g} "
+                f"temp={float(cfg.get('feature_adapter_temp', 0.1)):g} "
+                f"loss_weight={float(cfg.get('feature_adapter_loss_weight', 1.0)):g} "
+                f"drift_align_lambda={float(cfg.get('feature_adapter_drift_align_lambda', 0.0)):g} "
+                f"distance_scale_lambda={float(cfg.get('feature_adapter_distance_scale_lambda', 0.0)):g} "
+                f"distance_mean_lambda={float(cfg.get('feature_adapter_distance_mean_lambda', 0.0)):g} "
+                f"cf_weight={float(cfg.get('feature_adapter_cf_weight', 0.0)):g} "
+                f"cf_rho={float(cfg.get('feature_adapter_cf_rho', 1.0)):g} "
+                f"null_weight={float(cfg.get('feature_adapter_null_weight', 0.0)):g} "
+                f"relation_weight={float(cfg.get('feature_adapter_relation_weight', 0.0)):g} "
+                f"mdino_weight={float(cfg.get('feature_adapter_mdino_weight', 0.0)):g} "
+                f"mdino_mask_ratio={float(cfg.get('feature_adapter_mdino_mask_ratio', 0.0)):g} "
+                f"mdino_patch={int(cfg.get('feature_adapter_mdino_patch_size', 0))} "
+                f"mdino_samples={int(cfg.get('feature_adapter_mdino_samples_per_class', 0))} "
+                f"mdino_predictor_lr={float(cfg.get('feature_adapter_mdino_predictor_lr', cfg.get('feature_adapter_lr', 1.0e-4))):g} "
                 f"ema={float(cfg.get('feature_adapter_ema_decay', 0.999)):g} "
                 f"parameters={trainable_parameters}"
             )
+            if adapter_objective_name == "raw_drift_snr":
+                print(
+                    "[feature-adapter-v2] "
+                    f"real_pool={int(cfg.get('feature_adapter_real_pool_per_class', 32))} "
+                    f"query={int(cfg.get('feature_adapter_query_count', 8))} "
+                    f"bank_a={int(cfg.get('feature_adapter_bank_count', 12))} "
+                    f"bank_b={int(cfg.get('feature_adapter_bank_count', 12))} "
+                    "different_class_negatives=0 "
+                    f"snr_epsilon={float(cfg.get('feature_adapter_snr_epsilon', 1.0e-6)):g} "
+                    f"consistency_weight={float(cfg.get('feature_adapter_consistency_weight', 0.25)):g} "
+                    f"consistency_epsilon={float(cfg.get('feature_adapter_consistency_epsilon', 1.0e-8)):g} "
+                    "null_variance_detached=false"
+                )
         if feature_discriminator is None:
             print("[feature-gan] disabled")
         else:
@@ -3098,6 +4991,26 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     generated_per_step = (
         batch_size * world_size * int(cfg.get("gen_per_label", 64))
     )
+    adapter_freeze_epochs = float(
+        cfg.get("feature_adapter_freeze_generated_epochs", 0.0) or 0.0
+    )
+    if adapter_freeze_epochs < 0.0 or not math.isfinite(adapter_freeze_epochs):
+        raise ValueError(
+            "feature_adapter_freeze_generated_epochs must be finite and non-negative"
+        )
+    if adapter_freeze_epochs > 0.0:
+        adapter_freeze_step_resolved = _steps_for_generated_epochs(
+            dataset_size=generated_epoch_size,
+            generated_per_step=generated_per_step,
+            epochs=adapter_freeze_epochs,
+        )
+        cfg["feature_adapter_freeze_step_resolved"] = adapter_freeze_step_resolved
+        if is_main_process(rank):
+            print(
+                "[feature-adapter] late freeze at generated epoch "
+                f"{adapter_freeze_epochs:g} (step {adapter_freeze_step_resolved})",
+                flush=True,
+            )
     historical_replay_enabled = bool(cfg.get("historical_gen_replay", False))
     historical_replay_ratio = float(
         cfg.get("historical_gen_replay_ratio", 0.0)
@@ -3201,6 +5114,16 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             "save_per_generated_epochs must be finite and >= 0, got "
             f"{save_per_generated_epochs}"
         )
+    eval_per_generated_epochs = float(
+        cfg.get("eval_per_generated_epochs", 0.0)
+    )
+    if eval_per_generated_epochs < 0.0 or not math.isfinite(
+        eval_per_generated_epochs
+    ):
+        raise ValueError(
+            "eval_per_generated_epochs must be finite and >= 0, got "
+            f"{eval_per_generated_epochs}"
+        )
     if is_main_process(rank):
         target_summary = (
             f" target_epochs={total_generated_epochs:g}"
@@ -3212,11 +5135,16 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             if save_per_generated_epochs > 0.0
             else ""
         )
+        eval_summary = (
+            f" eval_every_epochs={eval_per_generated_epochs:g}"
+            if eval_per_generated_epochs > 0.0
+            else ""
+        )
         print(
             "[generated-epochs] "
             f"dataset_size={generated_epoch_size} "
             f"generated_per_step={generated_per_step}"
-            f"{target_summary}{save_summary} "
+            f"{target_summary}{save_summary}{eval_summary} "
             f"total_steps={int(cfg.get('total_steps', 200000))}"
         )
 
@@ -3234,6 +5162,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         feature_adapter_optimizer=feature_adapter_optimizer,
         feature_discriminator=feature_discriminator,
         feature_discriminator_optimizer=feature_discriminator_optimizer,
+        adversarial_system=adversarial_system,
     )
     if is_main_process(rank):
         print(f"Resuming from step {start_step}")
@@ -3273,13 +5202,6 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     # Within-epoch skip would iterate (and load) thousands of batches just to discard them.
     _epoch_at_resume = start_step // max(len(train_loader), 1) if start_step > 0 else 0
     train_iter = infinite_sampler(train_loader, _epoch_at_resume * max(len(train_loader), 1))
-    pbar = (
-        tqdm(range(start_step, total_steps), initial=start_step, total=total_steps)
-        if is_main_process(rank)
-        else range(start_step, total_steps)
-    )
-
-    start_time_all = time.time()
     is_first_step = True
     bank_stream_phase = 0
 
@@ -3293,16 +5215,28 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 print("[eval] Step-0 eval skipped: eval_loader/eval_postprocess_fn is None.")
             else:
                 print("[eval] Running step-0 baseline eval...")
+                for bank in pos_banks:
+                    if isinstance(bank, CompressedPixelMemoryBank):
+                        bank.suspend_codec_workers()
                 try:
-                    generator.to("cpu")
-                    mae.to("cpu")
-                    if feature_discriminator is not None:
+                    # DDP reducers retain parameter/bucket references created
+                    # at construction time. Moving a rank-0-only DDP module
+                    # CPU -> CUDA invalidates those references and desynchronizes
+                    # the next backward pass from the waiting rank(s). Keep DDP
+                    # modules on their construction device; 48 GiB A6000 jobs
+                    # have ample headroom for the temporary eval models.
+                    if world_size == 1:
+                        generator.to("cpu")
+                    feature_extractor.to("cpu")
+                    if feature_discriminator is not None and world_size == 1:
                         feature_discriminator.to("cpu")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     ema.shadow.to(device)
                     ema.shadow.eval()
-                    log_eval: Dict[str, float] = {}
+                    # Keep an explicit generated-epoch axis beside the W&B
+                    # step so baseline/10-epoch evaluations are unambiguous.
+                    log_eval: Dict[str, float] = {"eval/generated_epochs": 0.0}
                     for eval_cfg_scale in cfg_list[:3]:
                         eval_stats = eval_fid_is(
                             ema.shadow, eval_postprocess_fn, eval_loader, device,
@@ -3324,7 +5258,9 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                             if eval_stats.get("is_std") is not None:
                                 log_eval[f"is_std/cfg{eval_cfg_scale}"] = float(eval_stats["is_std"])
                     if log_eval:
-                        logger.log(log_eval, step=0)
+                        # Merge baseline metrics into the first training row;
+                        # the step-0 train log below commits the combined row.
+                        logger.log(log_eval, step=0, commit=False)
                 except Exception as e:
                     print(f"[eval] Step-0 eval failed: {e}")
                     traceback.print_exc()
@@ -3337,14 +5273,18 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     ema.shadow.to(device)
-                    mae.to(device)
-                    generator.to(device)
-                    if feature_discriminator is not None:
+                    feature_extractor.to(device)
+                    if world_size == 1:
+                        generator.to(device)
+                    if feature_discriminator is not None and world_size == 1:
                         feature_discriminator.to(device)
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.synchronize(device)
                         torch.cuda.empty_cache()
+                    for bank in pos_banks:
+                        if isinstance(bank, CompressedPixelMemoryBank):
+                            bank.resume_codec_workers()
         if world_size > 1:
             dist.barrier()
         if torch.cuda.is_available() and device.type == "cuda":
@@ -3354,6 +5294,40 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     elif start_step == 0 and is_main_process(rank):
         print("[eval] Skipping step-0 eval (eval_at_start=false).")
 
+    # Start progress and average-step timing only after the optional baseline
+    # evaluation. Otherwise the first displayed iteration includes several
+    # minutes of FID/IS work and falsely reports training as ~100x slower.
+    pbar = (
+        tqdm(range(start_step, total_steps), initial=start_step, total=total_steps)
+        if is_main_process(rank)
+        else range(start_step, total_steps)
+    )
+    start_time_all = time.time()
+
+    adapter_requires_unique_reals = (
+        feature_adapter is not None
+        and str(cfg.get("feature_adapter_objective", "")).lower().strip()
+        in {
+            "real_real_multipos_infonce",
+            "real_real_multipos_infonce_mdino",
+            "gen_real_multipos_infonce",
+            "raw_drift_snr",
+            "raw_drift_snr_consistency",
+            "dino_cf_drift_realreal_infonce",
+        }
+        and bool(cfg.get("feature_adapter_require_unique_reals", False))
+    )
+    adapter_unique_real_count = (
+        int(cfg.get("feature_adapter_real_pool_per_class", 32))
+        if str(cfg.get("feature_adapter_objective", "")).lower().strip()
+        == "raw_drift_snr"
+        else pos_per_sample
+    )
+    # Positive-bank counts are monotonic during a process lifetime. Keep this
+    # latched once every rank has the objective's distinct-real requirement for
+    # every class. On resume the latch resets with the empty in-memory banks.
+    feature_adapter_bank_ready = not adapter_requires_unique_reals
+
     step_limit = int(cfg.get("train_max_step_exclusive", 0) or 0)
     for step in pbar:
         if step_limit > 0 and step >= step_limit:
@@ -3361,6 +5335,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 print(f"[train] stopping early: train_max_step_exclusive={step_limit}")
             break
         logger.set_step(step)
+        iteration_t0 = time.time()
 
         # LR update
         lr = get_lr(step, warmup, base_lr, init_lr=warmup_init_lr)
@@ -3404,10 +5379,51 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             if n_pushed >= push_goal:
                 break
 
+        if adapter_requires_unique_reals and not feature_adapter_bank_ready:
+            local_ready = all(
+                bank.is_ready(adapter_unique_real_count) for bank in pos_banks
+            )
+            ready_tensor = torch.tensor(
+                int(local_ready), device=device, dtype=torch.int32
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(ready_tensor, op=dist.ReduceOp.MIN)
+            feature_adapter_bank_ready = bool(ready_tensor.item())
+            if feature_adapter_bank_ready and is_main_process(rank):
+                print(
+                    "[feature-adapter] positive banks ready with "
+                    f">={adapter_unique_real_count} distinct samples/class on every rank; "
+                    "enabling adapter updates",
+                    flush=True,
+                )
+
+        adapter_sampling_due = (
+            feature_adapter is not None
+            and feature_adapter_bank_ready
+            and step >= int(cfg.get("feature_adapter_start_step", 0))
+            and (
+                int(cfg.get("feature_adapter_freeze_step_resolved", 0) or 0)
+                <= 0
+                or step
+                < int(cfg.get("feature_adapter_freeze_step_resolved", 0) or 0)
+            )
+            and (
+                step - int(cfg.get("feature_adapter_start_step", 0))
+            )
+            % int(cfg.get("feature_adapter_update_freq", 1))
+            == 0
+        )
+        sample_distinct_adapter_reals = (
+            adapter_sampling_due
+            and str(cfg.get("feature_adapter_objective", "")).lower().strip()
+            == "raw_drift_snr"
+        )
+
         # --- Sample batch labels from the latest pushed batch, matching official JAX. ---
         labels_parts: List[np.ndarray] = []
         pos_parts: List[torch.Tensor] = []
         neg_parts: List[torch.Tensor] = []
+        adapter_pos_parts: List[torch.Tensor] = []
         for bank_idx, bank_batch_size in enumerate(bank_batch_sizes):
             if bank_batch_size <= 0:
                 continue
@@ -3424,7 +5440,11 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             labels_sel = labels_pool[rng_idx]
             labels_parts.append(labels_sel)
             pos_parts.append(
-                pos_banks[bank_idx].sample(labels_sel, n_samples=pos_per_sample, device=device)
+                pos_banks[bank_idx].sample(
+                    labels_sel,
+                    n_samples=pos_per_sample,
+                    device=device,
+                )
             )
             neg_parts.append(
                 neg_banks[bank_idx].sample(
@@ -3433,6 +5453,26 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                     device=device,
                 )
             )
+            if sample_distinct_adapter_reals:
+                adapter_pos_parts.append(
+                    pos_banks[bank_idx].sample(
+                        labels_sel,
+                        n_samples=adapter_unique_real_count,
+                        device=device,
+                        rng=np.random.default_rng(
+                            np.random.SeedSequence(
+                                [
+                                    int(cfg.get("feature_adapter_split_seed", 43)),
+                                    int(rank),
+                                    int(step) & 0xFFFFFFFF,
+                                    (int(step) >> 32) & 0xFFFFFFFF,
+                                    int(bank_idx),
+                                    0x56325245,
+                                ]
+                            )
+                        ),
+                    )
+                )
 
         if not labels_parts:
             if is_main_process(rank):
@@ -3444,6 +5484,11 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         labels_t = torch.from_numpy(labels_sel).long().to(device)
         pos_smp = torch.cat(pos_parts, dim=0)
         neg_smp = torch.cat(neg_parts, dim=0)
+        adapter_pos_smp = (
+            torch.cat(adapter_pos_parts, dim=0)
+            if adapter_pos_parts
+            else None
+        )
         historical_smp = None
         if historical_replay_bank is not None and step >= historical_replay_start_step:
             if not historical_replay_bank.is_ready(historical_replay_count):
@@ -3489,10 +5534,13 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             feature_adapter=feature_adapter,
             feature_adapter_target=feature_adapter_target,
             feature_adapter_optimizer=feature_adapter_optimizer,
+            feature_adapter_bank_ready=feature_adapter_bank_ready,
+            feature_adapter_real_samples=adapter_pos_smp,
             feature_discriminator=feature_discriminator,
             feature_discriminator_optimizer=feature_discriminator_optimizer,
             historical_samples=historical_smp,
             fresh_historical_count=fresh_historical_count,
+            adversarial_system=adversarial_system,
         )
         ema.update(gen_raw)
         if historical_replay_bank is not None and step < historical_replay_start_step:
@@ -3545,8 +5593,36 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
 
         # --- Logging ---
         if step % log_every == 0 and is_main_process(rank):
+            compressed_pos_banks = [
+                bank
+                for bank in pos_banks
+                if isinstance(bank, CompressedPixelMemoryBank)
+            ]
+            if compressed_pos_banks:
+                compressed_bytes = sum(
+                    bank.payload_bytes for bank in compressed_pos_banks
+                )
+                raw_bytes = sum(
+                    bank.raw_equivalent_bytes for bank in compressed_pos_banks
+                )
+                metrics["bank/positive_payload_gib_rank0"] = (
+                    compressed_bytes / (1024 ** 3)
+                )
+                metrics["bank/positive_raw_equivalent_gib_rank0"] = (
+                    raw_bytes / (1024 ** 3)
+                )
+                metrics["bank/positive_compression_ratio_rank0"] = (
+                    raw_bytes / max(1, compressed_bytes)
+                )
+                metrics["bank/positive_codec_add_seconds_rank0"] = sum(
+                    bank.last_add_seconds for bank in compressed_pos_banks
+                )
+                metrics["bank/positive_codec_sample_seconds_rank0"] = sum(
+                    bank.last_sample_seconds for bank in compressed_pos_banks
+                )
             metrics["lr"]             = lr
             metrics["time/step"]      = step_time
+            metrics["time/iteration"] = time.time() - iteration_t0
             metrics["time/per_step"]  = (time.time() - start_time_all) / (step - start_step + 1)
             metrics["kimg"]           = (step - start_step + 1) * batch_size * world_size / 1000.0
             metrics["generated_kimg"] = (step + 1) * generated_per_step / 1000.0
@@ -3582,10 +5658,20 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                     feature_adapter_optimizer=feature_adapter_optimizer,
                     feature_discriminator=feature_discriminator,
                     feature_discriminator_optimizer=feature_discriminator_optimizer,
+                    adversarial_system=adversarial_system,
                 )
 
         # --- FID / IS evaluation ---
-        if (step + 1) % eval_per == 0 or (step + 1) == total_steps:
+        if eval_per_generated_epochs > 0.0:
+            eval_due = _crosses_generated_epoch_interval(
+                completed_steps=step + 1,
+                generated_per_step=generated_per_step,
+                dataset_size=generated_epoch_size,
+                interval_epochs=eval_per_generated_epochs,
+            )
+        else:
+            eval_due = (step + 1) % eval_per == 0
+        if eval_due or (step + 1) == total_steps:
             # Barrier: ensure all ranks finish the current training step before
             # rank 0 starts eval. Without this, other ranks proceed to the next
             # train_step (which triggers a DDP all_reduce) while rank 0 is still
@@ -3596,20 +5682,29 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 if eval_loader is None or eval_postprocess_fn is None:
                     print("[eval] eval_loader/eval_postprocess_fn is None. Skipping eval.")
                 else:
-                    # Offload training models to CPU to free GPU memory for eval.
-                    # FID/IS requires VAE decoder + Inception V3 on top of the
-                    # generator, which would OOM if training models stay on GPU.
-                    print(f"[eval] Offloading training models to CPU for eval at step {step+1}...")
+                    # Keep DDP modules on the devices where their reducers were
+                    # constructed. Rank-0-only CPU round trips corrupt reducer
+                    # bucket state and deadlock the following backward pass.
+                    print(f"[eval] Preparing rank-0 eval at step {step+1}...")
+                    for bank in pos_banks:
+                        if isinstance(bank, CompressedPixelMemoryBank):
+                            bank.suspend_codec_workers()
                     try:
-                        generator.to("cpu")
-                        mae.to("cpu")
-                        if feature_discriminator is not None:
+                        if world_size == 1:
+                            generator.to("cpu")
+                        feature_extractor.to("cpu")
+                        if feature_discriminator is not None and world_size == 1:
                             feature_discriminator.to("cpu")
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                         ema.shadow.to(device)
                         ema.shadow.eval()
-                        log_eval: Dict[str, float] = {}
+                        log_eval: Dict[str, float] = {
+                            "eval/generated_epochs": (
+                                (step + 1) * generated_per_step
+                                / generated_epoch_size
+                            )
+                        }
                         for eval_cfg_scale in cfg_list[:3]:  # limit to first 3 during training
                             eval_stats = eval_fid_is(
                                 ema.shadow, eval_postprocess_fn, eval_loader, device,
@@ -3645,10 +5740,14 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
+                        for bank in pos_banks:
+                            if isinstance(bank, CompressedPixelMemoryBank):
+                                bank.resume_codec_workers()
                         ema.shadow.to(device)
-                        mae.to(device)
-                        generator.to(device)
-                        if feature_discriminator is not None:
+                        feature_extractor.to(device)
+                        if world_size == 1:
+                            generator.to(device)
+                        if feature_discriminator is not None and world_size == 1:
                             feature_discriminator.to(device)
                         gc.collect()
                         if torch.cuda.is_available():
@@ -3674,6 +5773,18 @@ def main() -> None:
     parser.add_argument("--workdir", type=str, default="runs/gen", help="Working directory for checkpoints and logs.")
     parser.add_argument("--mae_checkpoint", type=str, default="", help="Override MAE checkpoint path.")
     parser.add_argument(
+        "--feature_extractor",
+        type=str,
+        default="",
+        help="Override frozen encoder: mae, dino_resnet50, or moco_v2_resnet50.",
+    )
+    parser.add_argument(
+        "--feature_checkpoint",
+        type=str,
+        default="",
+        help="Override the selected frozen encoder checkpoint path.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=-1,
@@ -3686,11 +5797,28 @@ def main() -> None:
         help="If >0, stop before this global step index (debug / smoke). 0 = run full total_steps from config.",
     )
     parser.add_argument(
+        "--skip_eval_at_start",
+        action="store_true",
+        help="Skip only the step-0 evaluation (useful for launch smoke tests).",
+    )
+    parser.add_argument(
+        "--smoke_adapter_updates",
+        action="store_true",
+        help=(
+            "Debug-only: allow adapter updates before each class has unique "
+            "positive-bank coverage and disable W&B. Requires --max_steps."
+        ),
+    )
+    parser.add_argument(
         "--throughput_opt_level",
         type=int,
         default=-1,
-        choices=(0, 1, 2, 3),
-        help="Benchmark/runtime stack: 0=baseline, 1=diagnostic gating, 2=+fused MAE stats, 3=+DDP/optimizer/EMA fast paths.",
+        choices=(0, 1, 2, 3, 4),
+        help=(
+            "Benchmark/runtime stack: 0=baseline, 1=diagnostic gating, "
+            "2=+fused MAE stats, 3=+DDP/optimizer/EMA fast paths, "
+            "4=+packed reverse f-norm reductions/runtime fast paths."
+        ),
     )
     parser.add_argument(
         "--benchmark_throughput",
@@ -3816,6 +5944,9 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_yaml_config(args.config)
+    wandb_name_override = os.environ.get("IDRIFT_WANDB_NAME", "").strip()
+    if wandb_name_override:
+        cfg["name"] = wandb_name_override
     if int(args.throughput_opt_level) >= 0:
         cfg["throughput_opt_level"] = int(args.throughput_opt_level)
     if int(args.seed) >= 0:
@@ -3865,6 +5996,13 @@ def main() -> None:
         cfg["eval_per_step"] = int(args.eval_per_step)
     if int(getattr(args, "max_steps", 0) or 0) > 0:
         cfg["train_max_step_exclusive"] = int(args.max_steps)
+    if args.skip_eval_at_start:
+        cfg["eval_at_start"] = False
+    if args.smoke_adapter_updates:
+        if int(getattr(args, "max_steps", 0) or 0) <= 0:
+            parser.error("--smoke_adapter_updates requires --max_steps")
+        cfg["feature_adapter_require_unique_reals"] = False
+        cfg["eval_at_start"] = False
 
     for top_p_key in ("rev_drift_top_p", "fwd_drift_top_p"):
         top_p_value = float(cfg.get(top_p_key, 1.0))
@@ -3900,6 +6038,16 @@ def main() -> None:
         cfg["cache_path"] = os.environ.get("IMAGENET_CACHE_PATH", "")
     if args.mae_checkpoint:
         cfg["mae_checkpoint"] = args.mae_checkpoint
+        cfg["feature_checkpoint"] = args.mae_checkpoint
+    if args.feature_extractor:
+        cfg["feature_extractor"] = args.feature_extractor
+    if args.feature_checkpoint:
+        cfg["feature_checkpoint"] = args.feature_checkpoint
+
+    try:
+        resolve_feature_extractor_name(cfg)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     rank, world_size, device = setup_distributed()
     Path(args.workdir).mkdir(parents=True, exist_ok=True)

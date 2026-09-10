@@ -196,6 +196,18 @@ class VaeDecodeModule(nn.Module):
         return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
 
 
+class PixelDecodeModule(nn.Module):
+    """Map direct RGB generator outputs from training space to [0, 1]."""
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError(
+                "Pixel-space evaluation expects BCHW RGB generator outputs, "
+                f"got {tuple(images.shape)}"
+            )
+        return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
+
+
 class InceptionFeatureBundle(nn.Module):
     """PyTorch-GPU analogue of the official Drifting JAX Inception path.
 
@@ -721,7 +733,14 @@ def main() -> None:
 
     generator, step_loaded = _build_generator(cfg, args.ckpt, device)
     generator = _maybe_dataparallel(generator)
-    decoder = _maybe_dataparallel(VaeDecodeModule(device).to(device).eval())
+    if bool(cfg.get("use_latent", True)):
+        decoder_kind = "sd_vae"
+        decoder_module: nn.Module = VaeDecodeModule(device)
+    else:
+        decoder_kind = "direct_pixel"
+        decoder_module = PixelDecodeModule()
+    print(f"[eval] generator_output={decoder_kind}")
+    decoder = _maybe_dataparallel(decoder_module.to(device).eval())
     feature_model = InceptionFeatureBundle(device).to(device).eval()
     ref_stats = _load_ref_stats(fid_ref_npz)
 

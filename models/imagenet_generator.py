@@ -117,6 +117,7 @@ class Attention(nn.Module):
         use_rope: bool = False,
         use_rmsnorm: bool = True,
         attn_fp32: bool = True,
+        use_sdpa: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -124,6 +125,7 @@ class Attention(nn.Module):
         self.scale     = self.head_dim ** -0.5
         self.use_rope  = use_rope
         self.attn_fp32 = attn_fp32
+        self.use_sdpa  = use_sdpa
 
         self.qkv  = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
@@ -158,8 +160,21 @@ class Attention(nn.Module):
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)
-        out  = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        if self.use_sdpa:
+            # q already carries head_dim**-0.5, so disable SDPA's default scale.
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=1.0,
+            )
+        else:
+            attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)
+            out = attn @ v
+        out = out.transpose(1, 2).reshape(B, N, C)
         return self.proj(out.to(x.dtype))
 
 
@@ -174,12 +189,21 @@ class LightningDiTBlock(nn.Module):
         use_rope: bool = True,
         use_rmsnorm: bool = True,
         attn_fp32: bool = True,
+        use_sdpa: bool = False,
     ):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size) if use_rmsnorm else nn.LayerNorm(hidden_size, elementwise_affine=False)
         self.norm2 = RMSNorm(hidden_size) if use_rmsnorm else nn.LayerNorm(hidden_size, elementwise_affine=False)
 
-        self.attn = Attention(hidden_size, num_heads, use_qk_norm, use_rope, use_rmsnorm, attn_fp32=attn_fp32)
+        self.attn = Attention(
+            hidden_size,
+            num_heads,
+            use_qk_norm,
+            use_rope,
+            use_rmsnorm,
+            attn_fp32=attn_fp32,
+            use_sdpa=use_sdpa,
+        )
 
         mlp_hidden = int(hidden_size * mlp_ratio)
         if use_swiglu:
@@ -286,6 +310,7 @@ class LightningDiT(nn.Module):
         n_cls_tokens: int = 0,
         use_remat: bool = False,       # gradient checkpointing
         attn_fp32: bool = True,
+        use_sdpa: bool = False,
     ):
         super().__init__()
         self.patch_size   = patch_size
@@ -311,7 +336,17 @@ class LightningDiT(nn.Module):
             nn.init.normal_(self.cls_embed, std=0.02)
 
         self.blocks = nn.ModuleList([
-            LightningDiTBlock(hidden_size, num_heads, mlp_ratio, use_qk_norm, use_swiglu, use_rope, use_rmsnorm, attn_fp32=attn_fp32)
+            LightningDiTBlock(
+                hidden_size,
+                num_heads,
+                mlp_ratio,
+                use_qk_norm,
+                use_swiglu,
+                use_rope,
+                use_rmsnorm,
+                attn_fp32=attn_fp32,
+                use_sdpa=use_sdpa,
+            )
             for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, out_channels, use_rmsnorm)
@@ -398,6 +433,7 @@ class DitGen(nn.Module):
         use_bf16: bool = True,
         use_remat: bool = False,
         attn_fp32: bool = True,
+        use_sdpa: bool = False,
     ):
         super().__init__()
         self.cond_dim    = cond_dim
@@ -440,6 +476,7 @@ class DitGen(nn.Module):
             n_cls_tokens=n_cls_tokens,
             use_remat=use_remat,
             attn_fp32=attn_fp32,
+            use_sdpa=use_sdpa,
         )
 
     def _build_cond(

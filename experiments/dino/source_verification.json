@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "checked_at_utc": "2026-09-10",
+  "cuda_initialized": false,
+  "presets": {
+    "dino_only_replay_feature": {
+      "runtime_config_path": "/workspace/I-Drift/runs/DINO_S4_dino_only_replay_e10_rho035_cnn_drift_no_replay_hardcopy_scratch_20260909/effective_config.json",
+      "runtime_config_sha256": "ea423a6eefff357deb780f346dadaaf95ee47cd13c35ab8ffe2552cf511b8b89",
+      "expected_field_count": 150,
+      "differing_expected_keys": [],
+      "runtime_extra_keys": [],
+      "passed": true
+    },
+    "replay_feature_hardcopy": {
+      "runtime_config_path": "/workspace/I-Drift/runs/DINO_S4_replay_e10_rho035_adversarial_feature_drift_no_structure_hardcopy_scratch_20260909/effective_config.json",
+      "runtime_config_sha256": "d949d7aae25544a628b8675d836c1a8f3a2d81cf5142240c939b6b5f0802c8bf",
+      "expected_field_count": 149,
+      "differing_expected_keys": [],
+      "runtime_extra_keys": [],
+      "passed": true
+    },
+    "replay_raw_gan_d32": {
+      "runtime_config_path": "/workspace/I-Drift/runs/IDrift2_replay_dino_raw_gan_d32_20260908_online/wandb/run-20260908_083244-4dea03a6/files/config.yaml",
+      "runtime_config_sha256": "cbc56f1bf3c2c46c331ad150dc661acb6739b33128ec7efa4aee73d8ec238e7a",
+      "expected_field_count": 149,
+      "differing_expected_keys": [],
+      "runtime_extra_keys": [
+        "_wandb"
+      ],
+      "checkpoint_step": 200183,
+      "checkpoint_config_key": "config",
+      "checkpoint_differing_expected_keys": [],
+      "checkpoint_runtime_extra_keys": [],
+      "passed": true
+    },
+    "replay_raw_gan_d128": {
+      "runtime_config_path": "/workspace/I-Drift/runs/IDrift2_replay_dino_raw_gan_d128_20260908_online/wandb/run-20260908_083244-07f37dd8/files/config.yaml",
+      "runtime_config_sha256": "2a618d3f9b9e3e6d74c65d0c973ae7e2d24d54ff235c09ed7d6344db5613446d",
+      "expected_field_count": 149,
+      "differing_expected_keys": [],
+      "runtime_extra_keys": [
+        "_wandb"
+      ],
+      "checkpoint_step": 200183,
+      "checkpoint_config_key": "config",
+      "checkpoint_differing_expected_keys": [],
+      "checkpoint_runtime_extra_keys": [],
+      "passed": true
+    }
+  },
+  "passed": true
+}
