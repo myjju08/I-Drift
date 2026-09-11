@@ -1,6 +1,6 @@
 # I-Drift
 
-### MAE drift, historical replay, Double Drift, and adversarial supervision
+### MAE drift, Replay, Double Drift, force balance, and adversarial supervision
 
 ReplayDrift is a follow-up to [Drifting](https://github.com/lambertae/drifting)
 and DualDrift. It lets a generator learn not only from real data, but also from
@@ -16,10 +16,12 @@ experiment runtimes used by the source I-Drift instance on **2026-09-10**.
 The implementation is local to this checkout; datasets, pretrained weights
 and checkpoints are supplied separately.
 
-Double Drift is ported from
+Replay memory policies, Double Drift, and attraction/repulsion balance are ported from
 [`cosmosjhj/I-Drift` at `27a0e4f`](https://github.com/cosmosjhj/I-Drift/commit/27a0e4fb54c8ed04e2538831a9df86a85c8c25ef).
 The [Corrective Field experiment guide](docs/CORRECTIVE_FIELD.md) describes
 the matched S4 / MAE-256 comparison, exact assets, equations, and launch steps.
+[The upstream comparison](docs/UPSTREAM_PARITY.md) records what matches the source
+and the remaining differences beyond DINO/GAN.
 
 ## Corrective Field: three S4 experiments
 
@@ -44,6 +46,50 @@ through `double_drift_mode: sample`; its coefficients and latent probe RMS
 have a different interpretation. See the guide before changing modes.
 New run metrics are logged online to W&B project **Corrective Field**.
 The historical result tables below are separate experiments.
+
+## Replay and attraction/repulsion controls
+
+These settings go under `train:` in YAML, using the upstream names:
+
+```yaml
+train:
+  historical_gen_replay: true
+  historical_gen_replay_ratio: 0.35
+  historical_gen_replay_count: 16
+  historical_gen_replay_bank_count: 16
+  historical_gen_replay_start_generated_epochs: 10.0
+  historical_gen_replay_source: frozen_snapshot
+  historical_gen_replay_policy: frozen  # frozen | fifo | reservoir | usage_budget
+  historical_gen_replay_update_count: 2
+  historical_gen_replay_update_interval_steps: 1
+  historical_gen_replay_usage_budget: 4
+  double_drift_mode: feature            # off | feature | sample
+  double_drift_c0: 1.0
+  double_drift_c1: 1.0
+  rev_drift_balance_delta: 0.0
+  rev_drift_balance_anneal_steps: 0
+  rev_drift_balance_diagnostics: false
+```
+
+The coefficients are **attraction = 1 + delta**, **repulsion = 1 - delta**, with
+`-1 < delta < 1`. For example, `delta: -0.05` selects 0.95 and 1.05. They scale
+the positive and negative force components **after** mutual-mass coupling and
+before per-temperature RMS normalization. Both Double Drift field evaluations
+receive the same coefficients. `rev_drift_force_multiplier` separately scales
+the resulting force; it does not change the attraction/repulsion balance.
+
+A positive `rev_drift_balance_anneal_steps` linearly reduces delta to zero using
+the absolute training step. The default zero keeps delta constant. Optional
+diagnostics report radial alignment, centered feature RMS, and component RMS.
+Nonunit balance and Double Drift require reverse drift. Double Drift with
+learned feature adapters or GAN/adversarial systems is still unsupported and
+raises an error; the separate DINO/GAN implementations remain available.
+
+`frozen` retains the epoch-10 bank. `fifo`, `reservoir`, and `usage_budget` start
+from that bank and stream detached candidates from the existing generator
+forward pass on the configured cadence. These policies, their sampling and
+serialized state match upstream. The current S4 comparison uses **frozen** and
+**delta 0** for both replay arms, so the comparison changes only Double Drift.
 
 ## Implemented experiment families
 
@@ -77,8 +123,9 @@ For each current generated query, the reverse-drift target pool contains
 [current generated | real negative | historical generated | real positive]
 ```
 
-The historical samples come from a frozen, class-conditioned generator
-snapshot. At replay ratio `rho`, generated repulsion is divided as
+The historical samples come from a class-conditioned generator bank,
+frozen at the configured epoch by default; rolling policies optionally replace
+entries after that boundary. At replay ratio `rho`, generated repulsion is divided as
 
 ```text
 current weight = 1 - rho

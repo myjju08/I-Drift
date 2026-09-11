@@ -1,17 +1,25 @@
 {
-  "cases": 72,
-  "exact_comparisons": 1880,
+  "cases": 360,
+  "exact_comparisons": 25080,
   "max_absolute_error": 0.0,
   "mismatches": [],
   "extra_fields": [],
   "scope": "all",
+  "balance_cases": [
+    "delta=0",
+    "delta=+0.05",
+    "delta=-0.05",
+    "delta=-0.1 annealed halfway",
+    "delta=+0.1 annealed to zero"
+  ],
   "feature_dtype": "float32 (canonical upstream core; outer sample graph float32 and float64)",
   "source_commit": "27a0e4fb54c8ed04e2538831a9df86a85c8c25ef",
-  "target_base_commit": "80fa84bf07685bda5fb67ef16e97c3a5e0042b62",
+  "target_base_commit": "4c26125a6acdd1cff488b6904025996bbb6b8dc5",
   "validated_files_sha256": {
     "drifting_core/double_drift.py": "c806c94b3bb13409d1ee5cc3ac8192a2ca3f2f9ae79bd49a716ba9b1c43a2a05",
-    "drifting_core/imagenet_loss.py": "364e3c9e09eeadb2b84d9a8876f2fd43ea923549dbd9c9e02bb38eca93454c41",
-    "train_imagenet_gen.py": "a2cfc0b846f5b648a205cb49eb272e9c6d47f6ef86ee6614f839fffd0cbc73c9"
+    "drifting_core/force_balance.py": "693156325df8b9e48c1a778383a5e7fcfe05e4b434aa759758e1f10ea127eea1",
+    "drifting_core/imagenet_loss.py": "3dffb227777ffeecd5e9c2e5d3da223ee037f769b6faaf3dae65891aa9db263d",
+    "train_imagenet_gen.py": "ef6af959729567e26463c7a3fcc7415b037eca30445ff0dea0770eeabb3fd41b"
   },
   "command": "python scripts/verify_double_drift_port.py --source /path/to/cosmosjhj-I-Drift-at-27a0e4f"
 }

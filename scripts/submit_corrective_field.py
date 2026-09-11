@@ -1,4 +1,4 @@
-"""Snapshot committed source and submit the three matched srv02 experiments."""
+"""Snapshot committed source and submit selected matched srv02 experiments."""
 from __future__ import annotations
 
 import argparse
@@ -80,28 +80,34 @@ def validation_command(snapshot, python):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--submit", action="store_true", help="Snapshot committed source, queue validation and three dependent jobs; otherwise only show the plan.")
+    parser.add_argument("--submit", action="store_true", help="Snapshot committed source, queue validation and selected dependent jobs; otherwise only show the plan.")
+    parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS),
+                        help="Production arms to queue (default: all three). Validation always checks all three arms on two GPUs.")
     parser.add_argument("--snapshot-root", type=Path, default=ROOT / "runs/corrective-field-submissions")
     parser.add_argument("--run-root", type=Path, default=Path("/home/juhyeong/corrective-field-runs"))
     parser.add_argument("--python", type=Path, default=Path("/home/juhyeong/.venvs/replay-drift/bin/python"))
     args = parser.parse_args()
+    if len(set(args.variants)) != len(args.variants):
+        parser.error("--variants must not contain duplicates")
     validate_suite(ROOT / "configs/corrective_field")
     suite_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     snapshot = args.snapshot_root.resolve() / suite_id
-    commands = {name: submission_command(snapshot, name, args.run_root, args.python) for name in VARIANTS}
+    commands = {name: submission_command(snapshot, name, args.run_root, args.python) for name in args.variants}
     validate_command = validation_command(snapshot, args.python)
-    print("Corrective Field: 3 fresh runs; each srv02 / 2 RTX3090 / 6 CPUs / 80 GB / 3 days.")
-    print("Arms: MAE baseline; MAE + Replay + authentic Double Drift; MAE + Replay only. GAN disabled.")
+    print(f"Corrective Field: {len(commands)} fresh runs; each srv02 / 2 RTX3090 / 6 CPUs / 80 GB / 3 days.")
+    print(f"Selected arms: {', '.join(args.variants)}. GAN disabled. Launch policy: Slurm only.")
+    print("Validation checks all three arms on two GPUs before production starts.")
     if not args.submit:
         print(f"validation: {shlex.join(validate_command)}")
         for name, command in commands.items():
             print(f"{name}: {shlex.join([*command[:2], '--dependency=afterok:VALIDATION_JOB_ID', *command[2:]])}")
-        print("Plan only. Commit the final source, then add --submit to snapshot and queue all three arms.")
+        print("Plan only. Commit the final source, then add --submit to snapshot and queue the selected arms.")
         return
     manifest = make_snapshot(ROOT, snapshot, suite_id)
     submission = {
         "suite_id": suite_id, "commit": manifest["commit"],
         "snapshot": str(snapshot), "run_root": str(args.run_root),
+        "launch_policy": "slurm_only", "selected_variants": list(args.variants),
         "validation": None, "jobs": {}, "status": "submitting",
     }
     submission_path = snapshot / "submission.json"
@@ -117,7 +123,10 @@ def main():
         validation_id = response.split(";", 1)[0]
         if not validation_id.isdigit():
             raise ValueError(f"Unexpected validation sbatch response: {response!r}")
-        submission["validation"] = {"job_id": validation_id, "command": validate_command}
+        submission["validation"] = {
+            "job_id": validation_id, "command": validate_command,
+            "variants": list(VARIANTS),
+        }
         record()
         print(f"Submitted validation: {validation_id}", flush=True)
         for name, command in commands.items():

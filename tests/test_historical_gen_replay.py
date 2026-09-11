@@ -6,14 +6,152 @@ import numpy as np
 import torch
 
 from drifting_core.imagenet_loss import drift_loss_imagenet
-from memory_bank import ArrayMemoryBank
+from memory_bank import ArrayMemoryBank, HistoricalReplayMemoryBank
 from train_imagenet_gen import (
+    _historical_replay_update_due,
     _historical_replay_ratio_for_step,
     compute_drift_loss_from_features,
 )
 
 
 class HistoricalGeneratedReplayTest(unittest.TestCase):
+    def test_rolling_update_cadence_is_relative_to_snapshot_step(self):
+        due = [
+            step
+            for step in range(99, 111)
+            if _historical_replay_update_due(
+                step=step,
+                start_step=100,
+                interval_steps=4,
+            )
+        ]
+        self.assertEqual(due, [100, 104, 108])
+        with self.assertRaises(ValueError):
+            _historical_replay_update_due(
+                step=100,
+                start_step=100,
+                interval_steps=0,
+            )
+
+    @staticmethod
+    def _policy_bank(policy: str, *, usage_budget: int = 2):
+        bank = HistoricalReplayMemoryBank(
+            num_classes=1,
+            max_size=4,
+            dtype=np.float32,
+            policy=policy,
+            usage_budget=usage_budget,
+        )
+        bank.add(
+            torch.arange(4, dtype=torch.float32).reshape(4, 1),
+            torch.zeros(4, dtype=torch.long),
+            step=10,
+        )
+        return bank
+
+    def test_frozen_policy_ignores_stream_updates(self):
+        bank = self._policy_bank("frozen")
+        before = bank.bank.copy()
+        bank.update(
+            torch.tensor([[99.0]]),
+            torch.tensor([0]),
+            step=20,
+            rng=np.random.default_rng(1),
+        )
+        np.testing.assert_array_equal(bank.bank, before)
+        self.assertEqual(bank.replacement_count, 0)
+
+    def test_fifo_policy_replaces_ring_order(self):
+        bank = self._policy_bank("fifo")
+        bank.update(
+            torch.tensor([[10.0], [11.0]]),
+            torch.tensor([0, 0]),
+            step=20,
+        )
+        np.testing.assert_array_equal(
+            bank.bank[0, :, 0], np.array([10.0, 11.0, 2.0, 3.0])
+        )
+        np.testing.assert_array_equal(bank.insert_step[0], [20, 20, 10, 10])
+        self.assertEqual(bank.replacement_count, 2)
+
+    def test_reservoir_policy_is_deterministic_and_counts_stream(self):
+        first = self._policy_bank("reservoir")
+        second = self._policy_bank("reservoir")
+        samples = torch.arange(20, 30, dtype=torch.float32).reshape(10, 1)
+        labels = torch.zeros(10, dtype=torch.long)
+        first.update(
+            samples,
+            labels,
+            step=20,
+            rng=np.random.default_rng(7),
+        )
+        second.update(
+            samples,
+            labels,
+            step=20,
+            rng=np.random.default_rng(7),
+        )
+        np.testing.assert_array_equal(first.bank, second.bank)
+        self.assertEqual(first.seen_count[0], 14)
+        self.assertEqual(
+            first.replacement_count + first.discard_count,
+            10,
+        )
+
+    def test_usage_budget_retires_only_expired_anchors(self):
+        bank = self._policy_bank("usage_budget", usage_budget=2)
+        bank.use_count[0] = np.array([2, 1, 0, 0], dtype=np.int32)
+        bank.update(
+            torch.tensor([[99.0], [98.0]]),
+            torch.tensor([0, 0]),
+            step=20,
+        )
+        self.assertEqual(bank.bank[0, 0, 0], 99.0)
+        self.assertNotIn(98.0, bank.bank[0, :, 0])
+        self.assertEqual(bank.use_count[0, 0], 0)
+        self.assertEqual(bank.replacement_count, 1)
+        self.assertEqual(bank.discard_count, 1)
+
+    def test_policy_metadata_round_trip_and_legacy_migration(self):
+        bank = self._policy_bank("fifo")
+        bank.sample(
+            np.array([0]),
+            n_samples=2,
+            rng=np.random.default_rng(3),
+        )
+        bank.update(torch.tensor([[9.0]]), torch.tensor([0]), step=21)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "policy.npz"
+            bank.save_npz(path)
+            restored = HistoricalReplayMemoryBank(
+                num_classes=1,
+                max_size=4,
+                policy="fifo",
+            )
+            restored.load_npz(path, default_step=10)
+            np.testing.assert_array_equal(restored.bank, bank.bank)
+            np.testing.assert_array_equal(restored.use_count, bank.use_count)
+            np.testing.assert_array_equal(restored.insert_step, bank.insert_step)
+            self.assertEqual(restored.sample_count, bank.sample_count)
+            self.assertEqual(restored.replacement_count, bank.replacement_count)
+
+            legacy_path = Path(tmpdir) / "legacy.npz"
+            legacy = ArrayMemoryBank(num_classes=1, max_size=4)
+            legacy.add(
+                torch.arange(4, dtype=torch.float32).reshape(4, 1),
+                torch.zeros(4, dtype=torch.long),
+            )
+            legacy.save_npz(legacy_path)
+            migrated = HistoricalReplayMemoryBank(
+                num_classes=1,
+                max_size=4,
+                policy="usage_budget",
+            )
+            migrated.load_npz(legacy_path, default_step=123)
+        np.testing.assert_array_equal(migrated.use_count, 0)
+        np.testing.assert_array_equal(migrated.insert_step, 123)
+        self.assertEqual(migrated.seen_count[0], 4)
+
     def test_replay_ratio_linear_ramp(self):
         cfg = {
             "historical_gen_replay_ratio": 0.5,
@@ -140,6 +278,28 @@ class HistoricalGeneratedReplayTest(unittest.TestCase):
         self.assertIsNotNone(gen.grad)
         self.assertGreater(float(gen.grad.abs().sum()), 0.0)
         self.assertFalse(torch.allclose(baseline, replay))
+
+    def test_current_repulsion_ablation_weights_are_finite_and_match_masses(self):
+        torch.manual_seed(17)
+        pos, neg, history = torch.randn(1, 32, 5), torch.randn(1, 32, 5), torch.randn(1, 16, 5)
+        for current_weight, history_weight in ((0.25, 2.0), (0.0, 2.0), (0.25, 3.0), (0.0, 4.0)):
+            with self.subTest(current=current_weight, history=history_weight):
+                gen = torch.randn(1, 64, 5, requires_grad=True)
+                loss, info = drift_loss_imagenet(
+                    gen, pos, neg,
+                    historical_gen=history,
+                    weight_gen=torch.full((1, 64), current_weight),
+                    weight_history=torch.full((1, 16), history_weight),
+                    R_list=(0.2,),
+                    global_scale_stats=False,
+                    global_fnorm_stats=False,
+                )
+                self.assertEqual(info["history/current_mass"], 64 * current_weight)
+                self.assertEqual(info["history/replay_mass"], 16 * history_weight)
+                self.assertTrue(torch.isfinite(loss).all())
+                loss.mean().backward()
+                self.assertTrue(torch.isfinite(gen.grad).all())
+                self.assertGreater(float(gen.grad.abs().sum()), 0.0)
 
     def test_feature_wrapper_routes_replay_as_detached_targets(self):
         torch.manual_seed(11)

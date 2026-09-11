@@ -264,6 +264,292 @@ class ArrayMemoryBank:
         self.count = count.copy()
 
 
+class HistoricalReplayMemoryBank(ArrayMemoryBank):
+    """Class-wise historical bank with pluggable replacement policies.
+
+    The initial snapshot is populated with :meth:`add`, exactly like an
+    :class:`ArrayMemoryBank`.  After replay starts, :meth:`update` applies one
+    of four policies while :meth:`sample` records actual anchor usage:
+
+    ``frozen``
+        Never replace the epoch-boundary snapshot.
+    ``fifo``
+        Replace the oldest entries through the per-class ring pointer.
+    ``reservoir``
+        Maintain a uniform reservoir over the post-snapshot candidate stream.
+    ``usage_budget``
+        Retire anchors only after they have actually been replayed the
+        configured number of times.
+    """
+
+    POLICIES = ("frozen", "fifo", "reservoir", "usage_budget")
+
+    def __init__(
+        self,
+        num_classes: int = 1000,
+        max_size: int = 16,
+        dtype=np.float16,
+        *,
+        policy: str = "frozen",
+        usage_budget: int = 4,
+    ) -> None:
+        super().__init__(num_classes=num_classes, max_size=max_size, dtype=dtype)
+        policy = str(policy).lower().strip()
+        if policy not in self.POLICIES:
+            raise ValueError(
+                f"Unknown historical replay policy {policy!r}; "
+                f"choose one of {self.POLICIES}."
+            )
+        if int(usage_budget) <= 0:
+            raise ValueError("usage_budget must be positive")
+        self.policy = policy
+        self.usage_budget = int(usage_budget)
+        self.use_count = np.zeros(
+            (self.num_classes, self.max_size), dtype=np.int32
+        )
+        self.insert_step = np.full(
+            (self.num_classes, self.max_size), -1, dtype=np.int64
+        )
+        self.seen_count = np.zeros(self.num_classes, dtype=np.int64)
+        self.sample_count = 0
+        self.replacement_count = 0
+        self.discard_count = 0
+
+    def _write_entry(
+        self,
+        label: int,
+        index: int,
+        sample: np.ndarray,
+        *,
+        step: int,
+        replacement: bool,
+    ) -> None:
+        if self.bank is None:
+            raise RuntimeError("Historical bank storage is not initialized.")
+        self.bank[label, index] = sample
+        self.use_count[label, index] = 0
+        self.insert_step[label, index] = int(step)
+        if replacement:
+            self.replacement_count += 1
+
+    def add(
+        self,
+        samples: torch.Tensor | np.ndarray,
+        labels: torch.Tensor | np.ndarray,
+        *,
+        step: int = 0,
+    ) -> None:
+        """Populate or refresh the pre-replay snapshot ring."""
+        if isinstance(samples, torch.Tensor):
+            samples = samples.detach().cpu().numpy()
+        if isinstance(labels, torch.Tensor):
+            labels = labels.detach().cpu().numpy()
+        samples_np = np.asarray(samples, dtype=self.dtype)
+        labels_np = np.asarray(labels, dtype=np.int32)
+        if self.bank is None:
+            self._init_bank(samples_np.shape[1:])
+        for sample, raw_label in zip(samples_np, labels_np):
+            label = int(raw_label)
+            index = int(self.ptr[label])
+            replacing = int(self.count[label]) >= self.max_size
+            self._write_entry(
+                label, index, sample, step=step, replacement=replacing
+            )
+            self.ptr[label] = (index + 1) % self.max_size
+            if self.count[label] < self.max_size:
+                self.count[label] += 1
+            self.seen_count[label] += 1
+
+    def sample(
+        self,
+        labels: torch.Tensor | np.ndarray,
+        n_samples: int,
+        device: Optional[torch.device] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> torch.Tensor:
+        """Sample anchors and increment their per-entry replay counters."""
+        if self.bank is None or self.feature_shape is None:
+            raise RuntimeError("MemoryBank is empty. Call add() before sample().")
+        if isinstance(labels, torch.Tensor):
+            labels_np = labels.detach().cpu().numpy().astype(np.int32)
+        else:
+            labels_np = np.asarray(labels, dtype=np.int32)
+        sample_indices = np.empty(
+            (labels_np.shape[0], int(n_samples)), dtype=np.int32
+        )
+        for row, raw_label in enumerate(labels_np):
+            label = int(raw_label)
+            valid = int(self.count[label])
+            if valid <= 0:
+                raise RuntimeError(f"Historical class {label} has no anchors.")
+            choice = np.random.choice if rng is None else rng.choice
+            indices = choice(
+                valid, int(n_samples), replace=(valid < int(n_samples))
+            ).astype(np.int32, copy=False)
+            sample_indices[row] = indices
+            np.add.at(self.use_count[label], indices, 1)
+        self.sample_count += int(sample_indices.size)
+        out = self.bank[labels_np[:, None], sample_indices]
+        tensor = torch.from_numpy(out.copy())
+        if device is not None:
+            tensor = tensor.to(device)
+        return tensor
+
+    def update(
+        self,
+        samples: torch.Tensor | np.ndarray,
+        labels: torch.Tensor | np.ndarray,
+        *,
+        step: int,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        """Stream current detached candidates through the selected policy."""
+        if self.policy == "frozen":
+            return
+        if isinstance(samples, torch.Tensor):
+            samples = samples.detach().cpu().numpy()
+        if isinstance(labels, torch.Tensor):
+            labels = labels.detach().cpu().numpy()
+        samples_np = np.asarray(samples, dtype=self.dtype)
+        labels_np = np.asarray(labels, dtype=np.int32)
+        if self.bank is None:
+            self._init_bank(samples_np.shape[1:])
+        random = np.random if rng is None else rng
+
+        for sample, raw_label in zip(samples_np, labels_np):
+            label = int(raw_label)
+            self.seen_count[label] += 1
+            valid = int(self.count[label])
+            if valid < self.max_size:
+                index = valid
+                self._write_entry(
+                    label, index, sample, step=step, replacement=False
+                )
+                self.count[label] += 1
+                self.ptr[label] = int(self.count[label]) % self.max_size
+                continue
+
+            if self.policy == "fifo":
+                index = int(self.ptr[label])
+                self._write_entry(
+                    label, index, sample, step=step, replacement=True
+                )
+                self.ptr[label] = (index + 1) % self.max_size
+            elif self.policy == "reservoir":
+                seen = int(self.seen_count[label])
+                index = int(random.integers(seen) if rng is not None else random.randint(seen))
+                if index < self.max_size:
+                    self._write_entry(
+                        label, index, sample, step=step, replacement=True
+                    )
+                else:
+                    self.discard_count += 1
+            elif self.policy == "usage_budget":
+                expired = np.flatnonzero(
+                    self.use_count[label, :valid] >= self.usage_budget
+                )
+                if expired.size == 0:
+                    self.discard_count += 1
+                    continue
+                expired_uses = self.use_count[label, expired]
+                max_uses = int(expired_uses.max())
+                candidates = expired[expired_uses == max_uses]
+                if candidates.size > 1:
+                    ages = self.insert_step[label, candidates]
+                    index = int(candidates[np.argmin(ages)])
+                else:
+                    index = int(candidates[0])
+                self._write_entry(
+                    label, index, sample, step=step, replacement=True
+                )
+            else:  # pragma: no cover - constructor validation protects this.
+                raise AssertionError(self.policy)
+
+    def metrics(self, *, step: int) -> Dict[str, float]:
+        """Return inexpensive cumulative policy telemetry."""
+        slots = np.arange(self.max_size)[None, :]
+        valid = slots < self.count[:, None]
+        valid_count = int(valid.sum())
+        if valid_count:
+            uses = self.use_count[valid]
+            inserted = self.insert_step[valid]
+            mean_uses = float(uses.mean())
+            mean_age = float((int(step) - inserted).mean())
+            used_fraction = float((uses > 0).mean())
+        else:
+            mean_uses = 0.0
+            mean_age = 0.0
+            used_fraction = 0.0
+        policy_id = float(self.POLICIES.index(self.policy))
+        return {
+            "historical_replay/policy_id": policy_id,
+            "historical_replay/bank_fill_fraction": (
+                valid_count / float(self.num_classes * self.max_size)
+            ),
+            "historical_replay/mean_anchor_uses": mean_uses,
+            "historical_replay/used_anchor_fraction": used_fraction,
+            "historical_replay/mean_anchor_age_steps": mean_age,
+            "historical_replay/samples_total": float(self.sample_count),
+            "historical_replay/replacements_total": float(
+                self.replacement_count
+            ),
+            "historical_replay/discards_total": float(self.discard_count),
+        }
+
+    def save_npz(self, path: str | Path) -> None:
+        if self.bank is None or self.feature_shape is None:
+            raise RuntimeError("Cannot save an empty MemoryBank.")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            path,
+            bank=self.bank,
+            ptr=self.ptr,
+            count=self.count,
+            use_count=self.use_count,
+            insert_step=self.insert_step,
+            seen_count=self.seen_count,
+            sample_count=np.asarray(self.sample_count, dtype=np.int64),
+            replacement_count=np.asarray(
+                self.replacement_count, dtype=np.int64
+            ),
+            discard_count=np.asarray(self.discard_count, dtype=np.int64),
+        )
+
+    def load_npz(self, path: str | Path, *, default_step: int = 0) -> None:
+        """Load new policy state or migrate an older frozen snapshot."""
+        super().load_npz(path)
+        with np.load(path, allow_pickle=False) as state:
+            files = set(state.files)
+            if "use_count" in files:
+                use_count = np.asarray(state["use_count"], dtype=np.int32)
+                insert_step = np.asarray(state["insert_step"], dtype=np.int64)
+                seen_count = np.asarray(state["seen_count"], dtype=np.int64)
+                expected = (self.num_classes, self.max_size)
+                if use_count.shape != expected or insert_step.shape != expected:
+                    raise ValueError("Historical metadata shape does not match bank.")
+                if seen_count.shape != (self.num_classes,):
+                    raise ValueError("Historical seen-count shape does not match bank.")
+                self.use_count = use_count.copy()
+                self.insert_step = insert_step.copy()
+                self.seen_count = seen_count.copy()
+                self.sample_count = int(state["sample_count"])
+                self.replacement_count = int(state["replacement_count"])
+                self.discard_count = int(state["discard_count"])
+                return
+
+        self.use_count.fill(0)
+        self.insert_step.fill(-1)
+        for label in range(self.num_classes):
+            valid = int(self.count[label])
+            self.insert_step[label, :valid] = int(default_step)
+        self.seen_count = self.count.astype(np.int64, copy=True)
+        self.sample_count = 0
+        self.replacement_count = 0
+        self.discard_count = 0
+
+
+
 class CompressedPixelMemoryBank(ArrayMemoryBank):
     """Exact ``pixel_uint8`` ring bank with per-image lossless compression.
 
@@ -563,4 +849,4 @@ class CompressedPixelMemoryBank(ArrayMemoryBank):
         )
 
 
-__all__ = ["ArrayMemoryBank", "CompressedPixelMemoryBank"]
+__all__ = ["ArrayMemoryBank", "HistoricalReplayMemoryBank", "CompressedPixelMemoryBank"]

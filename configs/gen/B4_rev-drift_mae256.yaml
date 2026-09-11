@@ -85,6 +85,12 @@ train:
   neg_cfg_pw: 3.0
   no_cfg_frac: 0.0
   drift_matching: "rev-drift"
+  # Opt-in detached two-step corrections. "sample" updates generated latents
+  # through MAE input gradients and re-encodes them for the second field.
+  double_drift_mode: "off"  # off | feature | sample
+  double_drift_c0: 0.75
+  double_drift_c1: 0.25
+  double_drift_sample_step_rms: 0.1  # RMS latent displacement before c0
   # Optional temporal self-repulsion. When enabled, each rank collects a
   # class-conditioned latent snapshot during warmup, freezes it at the chosen
   # generated-sample epoch, and uses it as an additional detached generated
@@ -98,6 +104,12 @@ train:
   historical_gen_replay_start_generated_epochs: 10.0
   historical_gen_replay_storage_dtype: "float16"
   historical_gen_replay_source: "frozen_snapshot"
+  # Memory-management ablations after the snapshot boundary. Rolling policies
+  # stream detached candidates already produced by the main generator pass.
+  historical_gen_replay_policy: "frozen"
+  historical_gen_replay_update_count: 2
+  historical_gen_replay_update_interval_steps: 1
+  historical_gen_replay_usage_budget: 4
   # Optional linear mass ramp. Null ratio_start preserves a static ratio.
   historical_gen_replay_ratio_start: null
   historical_gen_replay_ratio_ramp_start_step: 0

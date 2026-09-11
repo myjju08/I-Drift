@@ -46,6 +46,34 @@ def _softmax_np(logits: np.ndarray) -> np.ndarray:
     return probs
 
 
+def _within_class_feature_diversity(features: np.ndarray, labels: np.ndarray) -> Dict:
+    """Equal-class mean squared pairwise distance in Inception pool3 space.
+
+    Twice the summed unbiased coordinate variance equals the mean squared
+    distance over distinct sample pairs. This avoids materializing pair matrices.
+    Singleton classes cannot contribute and are excluded.
+    """
+    features, labels = np.asarray(features), np.asarray(labels)
+    if features.ndim != 2 or labels.ndim != 1 or len(features) != len(labels):
+        raise ValueError("Expected aligned (N,D) features and (N,) labels")
+    distances, counts = [], []
+    for class_id in np.unique(labels):
+        class_features = features[labels == class_id].astype(np.float64, copy=False)
+        if len(class_features) < 2:
+            continue
+        distances.append(float(2.0 * class_features.var(axis=0, ddof=1).sum()))
+        counts.append(len(class_features))
+    if not distances:
+        raise ValueError("Need at least one class with two samples for diversity")
+    return {
+        "feature_space": "inception_pool3",
+        "mean_pairwise_squared_distance": float(np.mean(distances)),
+        "p10_class_pairwise_squared_distance": float(np.percentile(distances, 10)),
+        "num_classes": len(distances),
+        "min_samples_per_class": min(counts),
+    }
+
+
 def _compute_inception_score_from_logits(logits: np.ndarray, splits: int = 10) -> Tuple[float, float]:
     rng = np.random.RandomState(2020)
     logits = np.asarray(logits)
@@ -302,15 +330,36 @@ def _load_imagenet_val_labels(cfg: dict) -> np.ndarray:
             "Set LABEL_SOURCE=balanced to use the old class-balanced labels."
         ) from exc
 
-    imagenet_path = str(cfg.get("imagenet_path") or os.environ.get("IMAGENET_PATH", ""))
-    cache_path = str(cfg.get("cache_path") or os.environ.get("IMAGENET_CACHE_PATH", ""))
+    # Explicit environment settings describe the current machine and must win
+    # over paths embedded in a portable training config/checkpoint.
+    imagenet_path = str(os.environ.get("IMAGENET_PATH") or cfg.get("imagenet_path") or "")
+    cache_path = str(os.environ.get("IMAGENET_CACHE_PATH") or cfg.get("cache_path") or "")
     use_cache = bool(cfg.get("use_cache", False))
 
     if use_cache and cache_path:
         split_root = os.path.join(cache_path, "val")
         if os.path.isdir(split_root):
-            ds = datasets.DatasetFolder(root=split_root, loader=str, extensions=(".pt",))
-            return np.asarray([target for _, target in ds.samples], dtype=np.int64)
+            # Legacy class-directory .pt cache.
+            if any(Path(split_root).rglob("*.pt")):
+                ds = datasets.DatasetFolder(root=split_root, loader=str, extensions=(".pt",))
+                if ds.samples:
+                    return np.asarray([target for _, target in ds.samples], dtype=np.int64)
+
+            # srv08 uses the flat latent-cache layout produced by
+            # prepare_imagenet_latent_cache.py: one numeric <index>.npy label
+            # per validation image. Numeric ordering matches ImageFolder's
+            # original validation ordering before official epoch-0 shuffling.
+            labels_root = Path(split_root) / "imagenet256_labels"
+            if labels_root.is_dir():
+                label_files = sorted(
+                    labels_root.glob("*.npy"),
+                    key=lambda path: int(path.stem),
+                )
+                if label_files:
+                    return np.asarray(
+                        [int(np.asarray(np.load(path)).reshape(-1)[0]) for path in label_files],
+                        dtype=np.int64,
+                    )
 
     split_root = os.path.join(imagenet_path, "val")
     if not os.path.isdir(split_root):
@@ -678,6 +727,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pr_nhood", type=int, default=3)
     parser.add_argument("--pr_row_batch_size", type=int, default=1024)
     parser.add_argument("--pr_col_batch_size", type=int, default=8192)
+    parser.add_argument(
+        "--report_class_diversity",
+        action="store_true",
+        help="Report equal-class mean squared pairwise distance in sample Inception features.",
+    )
     return parser.parse_args()
 
 
@@ -782,6 +836,10 @@ def main() -> None:
         col_batch_size=int(args.pr_col_batch_size),
     )
 
+    class_diversity = (
+        _within_class_feature_diversity(sample_pool3, labels_np)
+        if args.report_class_diversity else None
+    )
     elapsed = time.time() - t_start
     results = {
         "ckpt": args.ckpt,
@@ -803,6 +861,9 @@ def main() -> None:
         "recall": float(recall),
         "elapsed_sec": float(elapsed),
     }
+    if class_diversity is not None:
+        results["class_diversity"] = class_diversity
+        print(f"[eval] Class diversity = {class_diversity}")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
 

@@ -123,6 +123,59 @@ class CorrectiveFieldSuiteTests(unittest.TestCase):
         self.assertEqual(record["status"], "submitted")
         self.assertEqual(record["validation"]["job_id"], "9001")
         self.assertEqual(set(record["jobs"]), set(preflight.VARIANTS))
+        self.assertEqual(record["launch_policy"], "slurm_only")
+        self.assertEqual(record["selected_variants"], list(preflight.VARIANTS))
+        self.assertEqual(record["validation"]["variants"], list(preflight.VARIANTS))
+
+    def test_selected_replay_arms_never_submit_baseline_and_keep_full_validation(self):
+        def fake_snapshot(root, destination, suite_id):
+            destination.mkdir(parents=True)
+            return {"commit": "a" * 40}
+
+        commands = []
+
+        def fake_sbatch(command, **kwargs):
+            commands.append(command)
+            return str(9100 + len(commands)) + "\n"
+
+        selected = ["replay_only", "replay_double"]
+        with (patch.object(submit, "ROOT", self.root),
+              patch.object(submit, "make_snapshot", side_effect=fake_snapshot),
+              patch.object(submit.subprocess, "check_output", side_effect=fake_sbatch),
+              patch("sys.argv", ["submit_corrective_field.py", "--submit", "--variants", *selected]),
+              redirect_stdout(io.StringIO())):
+            submit.main()
+        self.assertEqual(len(commands), 3)
+        self.assertIn("--job-name=CF-validate", commands[0])
+        self.assertTrue(any(command.endswith("validate_corrective_field.sbatch") for command in commands[0]))
+        self.assertNotIn("--variants", commands[0])
+        for name, command in zip(selected, commands[1:]):
+            self.assertIn(f"--job-name=CF-{name}", command)
+            self.assertIn("--dependency=afterok:9101", command)
+        self.assertFalse(any("--job-name=CF-baseline" in command for command in commands))
+        record = json.loads(next(self.root.rglob("submission.json")).read_text())
+        self.assertEqual(record["launch_policy"], "slurm_only")
+        self.assertEqual(record["selected_variants"], selected)
+        self.assertEqual(list(record["jobs"]), selected)
+        self.assertEqual(record["validation"]["variants"], list(preflight.VARIANTS))
+
+    def test_selected_plan_does_not_submit_and_duplicate_variants_are_rejected(self):
+        output = io.StringIO()
+        with (patch.object(submit, "ROOT", self.root),
+              patch.object(submit, "make_snapshot") as snapshot,
+              patch.object(submit.subprocess, "check_output") as run,
+              patch("sys.argv", ["submit_corrective_field.py", "--variants", "replay_only"]),
+              redirect_stdout(output)):
+            submit.main()
+        snapshot.assert_not_called()
+        run.assert_not_called()
+        self.assertIn("--job-name=CF-replay_only", output.getvalue())
+        self.assertNotIn("--job-name=CF-baseline", output.getvalue())
+        self.assertNotIn("--job-name=CF-replay_double", output.getvalue())
+        with (patch("sys.argv", ["submit_corrective_field.py", "--variants", "baseline", "baseline"]),
+              patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as error):
+            submit.main()
+        self.assertEqual(error.exception.code, 2)
 
     def test_requeue_reuses_only_original_workdir_and_configuration(self):
         snapshot = self.root / "snapshot"
@@ -157,6 +210,57 @@ class CorrectiveFieldSuiteTests(unittest.TestCase):
             state["feature_discriminator"] = {}
             with self.assertRaisesRegex(ValueError, "discriminator state"):
                 runtime.validate_checkpoint(workdir, config)
+
+    def test_requeue_accepts_checkpoint_paired_postboundary_replay_state(self):
+        workdir = self.root / "paired_resume"
+        (workdir / "checkpoints").mkdir(parents=True)
+        (workdir / "checkpoints/ckpt_latest.pt").write_bytes(b"placeholder")
+        (workdir / "wandb_run_id.txt").write_text("same-wandb-run")
+        config = self.suite / "replay_only.yaml"
+        cfg = preflight.read_config(config)
+        state = {"step": 30000, "model": {}, "ema": {}, "optimizer": {}, "config": cfg}
+        with patch.dict("sys.modules", {"torch": Mock(load=Mock(return_value=state))}):
+            # A state from another checkpoint cannot satisfy this resume.
+            for rank in range(2):
+                (workdir / f"historical_gen_replay_state_step0029999_rank{rank:02d}.npz").write_bytes(b"wrong-step")
+            with self.assertRaisesRegex(ValueError, "requires matching replay state"):
+                runtime.validate_checkpoint(workdir, config)
+            for rank in range(2):
+                (workdir / f"historical_gen_replay_state_step0030000_rank{rank:02d}.npz").write_bytes(b"paired-state")
+            self.assertEqual(runtime.validate_checkpoint(workdir, config), 30000)
+            # Prefer the paired state even if an older immutable bank exists.
+            for rank in range(2):
+                (workdir / f"historical_gen_replay_rank{rank:02d}.npz").write_bytes(b"legacy")
+            (workdir / "historical_gen_replay_state_step0030000_rank00.npz").write_bytes(b"")
+            with self.assertRaisesRegex(ValueError, "state_step0030000_rank00"):
+                runtime.validate_checkpoint(workdir, config)
+            # Frozen replay retains the trainer's old-checkpoint compatibility.
+            for path in workdir.glob("historical_gen_replay_state_step0030000_rank*.npz"):
+                path.unlink()
+            self.assertEqual(runtime.validate_checkpoint(workdir, config), 30000)
+
+    def test_rolling_replay_requires_paired_state_but_fresh_current_needs_no_bank(self):
+        workdir = self.root / "rolling_resume"
+        (workdir / "checkpoints").mkdir(parents=True)
+        (workdir / "checkpoints/ckpt_latest.pt").write_bytes(b"placeholder")
+        (workdir / "wandb_run_id.txt").write_text("same-wandb-run")
+        config = self.suite / "replay_only.yaml"
+        self.edit("replay_only", "train", "historical_gen_replay_policy", "fifo")
+        cfg = preflight.read_config(config)
+        state = {"step": 30000, "model": {}, "ema": {}, "optimizer": {}, "config": cfg}
+        for rank in range(2):
+            (workdir / f"historical_gen_replay_rank{rank:02d}.npz").write_bytes(b"legacy")
+        with patch.dict("sys.modules", {"torch": Mock(load=Mock(return_value=state))}):
+            with self.assertRaisesRegex(ValueError, "state_step0030000_rank00"):
+                runtime.validate_checkpoint(workdir, config)
+            for rank in range(2):
+                (workdir / f"historical_gen_replay_state_step0030000_rank{rank:02d}.npz").write_bytes(b"paired-state")
+            self.assertEqual(runtime.validate_checkpoint(workdir, config), 30000)
+            self.edit("replay_only", "train", "historical_gen_replay_source", "fresh_current")
+            state["config"] = preflight.read_config(config)
+            for path in workdir.glob("historical_gen_replay_*.npz"):
+                path.unlink()
+            self.assertEqual(runtime.validate_checkpoint(workdir, config), 30000)
 
     def test_gpu_gate_checks_authentic_double_and_excludes_gan_metrics(self):
         metrics = {"loss": 1.0, "drift_loss": 1.0, "g_norm": 2.0}

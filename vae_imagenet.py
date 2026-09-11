@@ -17,6 +17,22 @@ import torch.nn as nn
 _vae_cache: dict = {}
 
 
+def resolve_vae_model_id(
+    model_id: Optional[str] = None, variant: str = "mse",
+) -> str:
+    """Keep upstream mse/ema shorthand and explicit local/model-id overrides."""
+    variant = str(variant).strip().lower()
+    if variant not in {"mse", "ema"}:
+        raise ValueError(f"Unknown SD-VAE variant {variant!r}; expected 'mse' or 'ema'.")
+    if model_id is None or not str(model_id).strip():
+        return f"stabilityai/sd-vae-ft-{variant}"
+    # The upstream second positional argument was the variant. Full model IDs
+    # and local paths retain the target repository's more specific override.
+    if str(model_id).strip().lower() in {"mse", "ema"}:
+        return f"stabilityai/sd-vae-ft-{str(model_id).strip().lower()}"
+    return str(model_id)
+
+
 def load_vae(
     device: Optional[torch.device] = None,
     model_id: str = "stabilityai/sd-vae-ft-mse",
@@ -38,9 +54,9 @@ def load_vae(
     return vae
 
 
-def _load_vae(device: Optional[torch.device] = None):
-    """Backward-compatible default VAE loader."""
-    return load_vae(device=device)
+def _load_vae(device: Optional[torch.device] = None, variant: str = "mse"):
+    """Backward-compatible upstream VAE loader with mse/ema selection."""
+    return load_vae(device=device, model_id=resolve_vae_model_id(variant=variant))
 
 
 def vae_encode(
@@ -86,14 +102,16 @@ def vae_decode(
 
 def get_vae_enc_dec(
     device: Optional[torch.device] = None,
-    model_id: str = "stabilityai/sd-vae-ft-mse",
+    model_id: Optional[str] = None,
     revision: Optional[str] = None,
+    *,
+    variant: str = "mse",
 ) -> Tuple[Callable, Callable]:
     """Return (encode_fn, decode_fn) bound to a shared VAE instance.
 
     Both callables accept torch tensors on `device` and return tensors on the same device.
     """
-    vae = load_vae(device=device, model_id=model_id, revision=revision)
+    vae = load_vae(device=device, model_id=resolve_vae_model_id(model_id, variant), revision=revision)
     return (
         partial(vae_encode, vae=vae),
         partial(vae_decode, vae=vae),
@@ -193,6 +211,7 @@ def build_latent_cache(
 
 __all__ = [
     "load_vae",
+    "resolve_vae_model_id",
     "vae_encode",
     "vae_decode",
     "get_vae_enc_dec",

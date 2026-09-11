@@ -469,7 +469,7 @@ from drifting_core.double_drift import (
     validate_double_drift_coefficients,
 )
 from drifting_core.topk_diagnostics import diagnose_reverse_topk_heterogeneity
-from memory_bank import ArrayMemoryBank, CompressedPixelMemoryBank
+from memory_bank import ArrayMemoryBank, CompressedPixelMemoryBank, HistoricalReplayMemoryBank
 from models.adversarial_drift import AdversarialDriftSystem
 from models.feature_adapter import (
     FeatureAdapterSystem,
@@ -818,6 +818,18 @@ def _crosses_generated_epoch_interval(
     return int(current_samples // interval_samples) > int(
         previous_samples // interval_samples
     )
+
+
+def _historical_replay_update_due(
+    *,
+    step: int,
+    start_step: int,
+    interval_steps: int,
+) -> bool:
+    """Apply rolling-bank updates on a deterministic post-snapshot cadence."""
+    if interval_steps <= 0:
+        raise ValueError(f"interval_steps must be positive, got {interval_steps}")
+    return step >= start_step and (step - start_step) % interval_steps == 0
 
 
 def _split_bank_stream(
@@ -1908,6 +1920,9 @@ def compute_drift_loss_from_features(
     weight_history: Optional[torch.Tensor] = None,
     double_drift_c0: float = 1.0,
     double_drift_c1: float = 0.0,
+    rev_drift_attraction_scale: float = 1.0,
+    rev_drift_repulsion_scale: float = 1.0,
+    rev_drift_balance_diagnostics: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute total drift loss by summing over all feature maps.
 
@@ -2137,6 +2152,9 @@ def compute_drift_loss_from_features(
                 top_k_pos=feature_top_k_pos,
                 top_k_neg=feature_top_k_neg,
                 force_multiplier=rev_drift_force_multiplier,
+                attraction_scale=rev_drift_attraction_scale,
+                repulsion_scale=rev_drift_repulsion_scale,
+                balance_diagnostics=rev_drift_balance_diagnostics and collect_diagnostics,
                 double_drift_c0=double_drift_c0,
                 double_drift_c1=double_drift_c1,
                 affinity_kernel=rev_drift_affinity_kernel,
@@ -2406,6 +2424,13 @@ def train_step(
     rev_drift_force_multiplier = float(
         cfg.get("rev_drift_force_multiplier", 1.0)
     )
+    from drifting_core.force_balance import balance_coefficients
+    attraction_scale, repulsion_scale = balance_coefficients(
+        cfg.get("rev_drift_balance_delta", 0.0), step,
+        cfg.get("rev_drift_balance_anneal_steps", 0),
+    )
+    if (attraction_scale, repulsion_scale) != (1.0, 1.0) and drift_matching != "rev-drift":
+        raise ValueError("force balance currently supports rev-drift only")
     rev_drift_affinity_kernel = str(
         cfg.get("rev_drift_affinity_kernel", "exponential")
     )
@@ -3061,6 +3086,9 @@ def train_step(
         drift_top_k_groups=drift_top_k_groups,
         feature_temperature_multipliers=feature_temperature_multipliers,
         rev_drift_force_multiplier=rev_drift_force_multiplier,
+        rev_drift_attraction_scale=attraction_scale,
+        rev_drift_repulsion_scale=repulsion_scale,
+        rev_drift_balance_diagnostics=bool(cfg.get("rev_drift_balance_diagnostics", False)),
         rev_drift_affinity_kernel=rev_drift_affinity_kernel,
         rev_drift_kernel_shape=rev_drift_kernel_shape,
         rev_drift_kernel_adaptive_k_pos=rev_drift_kernel_adaptive_k_pos,
@@ -3175,6 +3203,9 @@ def train_step(
                 drift_top_k_pos=drift_top_k_pos,
                 drift_top_k_neg=drift_top_k_neg,
                 rev_drift_force_multiplier=rev_drift_force_multiplier,
+                rev_drift_attraction_scale=attraction_scale,
+                rev_drift_repulsion_scale=repulsion_scale,
+                rev_drift_balance_diagnostics=bool(cfg.get("rev_drift_balance_diagnostics", False)),
                 rev_drift_affinity_kernel=rev_drift_affinity_kernel,
                 rev_drift_kernel_shape=rev_drift_kernel_shape,
                 rev_drift_kernel_adaptive_k_pos=rev_drift_kernel_adaptive_k_pos,
@@ -4722,8 +4753,8 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         )
 
     # --- Data ---
-    imagenet_path = cfg.get("imagenet_path") or os.environ.get("IMAGENET_PATH", "")
-    cache_path    = cfg.get("cache_path") or os.environ.get("IMAGENET_CACHE_PATH", "")
+    imagenet_path = os.environ.get("IMAGENET_PATH") or cfg.get("imagenet_path", "")
+    cache_path = os.environ.get("IMAGENET_CACHE_PATH") or cfg.get("cache_path", "")
     use_latent    = bool(cfg.get("use_latent", True))
     use_cache     = bool(cfg.get("use_cache", True))
     use_aug       = bool(cfg.get("use_aug", False))
@@ -4839,7 +4870,8 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         rank=rank,
         world_size=world_size,
         latent_device=device,
-        vae_model_id=str(cfg.get("feature_vae_model_id", "stabilityai/sd-vae-ft-mse")),
+        vae_model_id=cfg.get("feature_vae_model_id"),
+        vae_variant=str(cfg.get("vae_variant", "mse")),
         vae_revision=(
             str(cfg["feature_vae_revision"])
             if cfg.get("feature_vae_revision")
@@ -4876,7 +4908,8 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             rank=0,
             world_size=1,
             latent_device=device,
-            vae_model_id=str(cfg.get("feature_vae_model_id", "stabilityai/sd-vae-ft-mse")),
+            vae_model_id=cfg.get("feature_vae_model_id"),
+            vae_variant=str(cfg.get("vae_variant", "mse")),
             vae_revision=(
                 str(cfg["feature_vae_revision"])
                 if cfg.get("feature_vae_revision")
@@ -5260,7 +5293,19 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     historical_replay_source = str(
         cfg.get("historical_gen_replay_source", "frozen_snapshot")
     ).lower().strip()
-    historical_replay_bank: Optional[ArrayMemoryBank] = None
+    historical_replay_policy = str(
+        cfg.get("historical_gen_replay_policy", "frozen")
+    ).lower().strip()
+    historical_replay_update_count = int(
+        cfg.get("historical_gen_replay_update_count", 2)
+    )
+    historical_replay_update_interval_steps = int(
+        cfg.get("historical_gen_replay_update_interval_steps", 1)
+    )
+    historical_replay_usage_budget = int(
+        cfg.get("historical_gen_replay_usage_budget", 4)
+    )
+    historical_replay_bank: Optional[HistoricalReplayMemoryBank] = None
     historical_replay_start_step = 0
     historical_replay_path = (
         Path(workdir) / f"historical_gen_replay_rank{rank:02d}.npz"
@@ -5292,6 +5337,24 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 "historical_gen_replay_source must be frozen_snapshot or "
                 f"fresh_current, got {historical_replay_source!r}"
             )
+        if historical_replay_policy not in HistoricalReplayMemoryBank.POLICIES:
+            raise ValueError(
+                "historical_gen_replay_policy must be one of "
+                f"{HistoricalReplayMemoryBank.POLICIES}, got "
+                f"{historical_replay_policy!r}"
+            )
+        if historical_replay_update_count <= 0:
+            raise ValueError("historical_gen_replay_update_count must be positive")
+        if historical_replay_update_count > int(cfg.get("gen_per_label", 64)):
+            raise ValueError(
+                "historical_gen_replay_update_count cannot exceed gen_per_label"
+            )
+        if historical_replay_update_interval_steps <= 0:
+            raise ValueError(
+                "historical_gen_replay_update_interval_steps must be positive"
+            )
+        if historical_replay_usage_budget <= 0:
+            raise ValueError("historical_gen_replay_usage_budget must be positive")
         if not math.isfinite(historical_replay_start_epochs) or historical_replay_start_epochs <= 0.0:
             raise ValueError(
                 "historical_gen_replay_start_generated_epochs must be finite and positive"
@@ -5310,17 +5373,23 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             epochs=historical_replay_start_epochs,
         )
         if historical_replay_source == "frozen_snapshot":
-            historical_replay_bank = ArrayMemoryBank(
+            historical_replay_bank = HistoricalReplayMemoryBank(
                 num_classes=int(cfg.get("num_classes", 1000)),
                 max_size=historical_replay_bank_count,
                 dtype=storage_dtypes[storage_dtype_name],
+                policy=historical_replay_policy,
+                usage_budget=historical_replay_usage_budget,
             )
         if is_main_process(rank):
             print(
                 "[historical-replay] enabled "
                 f"source={historical_replay_source} "
+                f"policy={historical_replay_policy} "
                 f"ratio={historical_replay_ratio:g} count={historical_replay_count} "
                 f"bank_count={historical_replay_bank_count} "
+                f"update_count={historical_replay_update_count} "
+                f"update_interval_steps={historical_replay_update_interval_steps} "
+                f"usage_budget={historical_replay_usage_budget} "
                 f"snapshot_epoch={historical_replay_start_epochs:g} "
                 f"snapshot_step={historical_replay_start_step} "
                 f"storage_dtype={storage_dtype_name}; "
@@ -5399,19 +5468,28 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     if is_main_process(rank):
         print(f"Resuming from step {start_step}")
     if historical_replay_bank is not None and start_step >= historical_replay_start_step:
+        state_path = Path(workdir) / (
+            f"historical_gen_replay_state_step{start_step:07d}_rank{rank:02d}.npz"
+        )
+        # Old frozen checkpoints predate per-step telemetry snapshots. Their
+        # immutable bank remains valid; rolling policies require paired state.
+        if state_path.is_file() or historical_replay_policy != "frozen":
+            historical_replay_path = state_path
         if not historical_replay_path.is_file():
             raise FileNotFoundError(
                 "Cannot resume historical replay after its snapshot boundary; "
                 f"missing {historical_replay_path}"
             )
-        historical_replay_bank.load_npz(historical_replay_path)
+        historical_replay_bank.load_npz(
+            historical_replay_path, default_step=historical_replay_start_step
+        )
         if not historical_replay_bank.is_ready(historical_replay_count):
             raise RuntimeError(
                 f"Historical replay snapshot is incomplete: {historical_replay_path}"
             )
         if is_main_process(rank):
             print(
-                f"[historical-replay] restored frozen snapshot from {historical_replay_path}",
+                f"[historical-replay] restored {historical_replay_policy} bank from {historical_replay_path}",
                 flush=True,
             )
 
@@ -5423,7 +5501,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             raise FileNotFoundError(
                 f"Cannot resume replay capture before its freeze boundary; missing {capture_path}"
             )
-        historical_replay_bank.load_npz(capture_path)
+        historical_replay_bank.load_npz(capture_path, default_step=start_step)
         if is_main_process(rank):
             print(f"[historical-replay] restored capture at step {start_step}", flush=True)
 
@@ -5732,6 +5810,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             historical_replay_bank.add(
                 snapshot_samples.detach().to(device="cpu", dtype=torch.float32),
                 snapshot_labels,
+                step=step + 1,
             )
             if step + 1 == historical_replay_start_step:
                 if not historical_replay_bank.is_ready(historical_replay_bank_count):
@@ -5752,6 +5831,47 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                         f"{historical_replay_path}",
                         flush=True,
                     )
+        elif (
+            historical_replay_bank is not None
+            and step >= historical_replay_start_step
+            and historical_replay_policy != "frozen"
+            and _historical_replay_update_due(
+                step=step,
+                start_step=historical_replay_start_step,
+                interval_steps=historical_replay_update_interval_steps,
+            )
+        ):
+            local_label_count = int(labels_t.shape[0])
+            generated = step_extras["gen_samples_detached"].reshape(
+                local_label_count,
+                int(cfg.get("gen_per_label", 64)),
+                *step_extras["gen_samples_detached"].shape[1:],
+            )
+            update_samples = generated[:, -historical_replay_update_count:].reshape(
+                local_label_count * historical_replay_update_count,
+                *generated.shape[2:],
+            )
+            update_labels = labels_t[:, None].expand(
+                -1, historical_replay_update_count
+            ).reshape(-1)
+            historical_replay_bank.update(
+                update_samples.detach().to(device="cpu", dtype=torch.float32),
+                update_labels,
+                step=step + 1,
+                rng=np.random.default_rng(
+                    np.random.SeedSequence(
+                        [
+                            int(cfg.get("seed", 42)),
+                            int(rank),
+                            int(step) & 0xFFFFFFFF,
+                            (int(step) >> 32) & 0xFFFFFFFF,
+                            0x55504454,
+                        ]
+                    )
+                ),
+            )
+        if historical_replay_bank is not None:
+            metrics.update(historical_replay_bank.metrics(step=step + 1))
         if benchmark_profile and device.type == "cuda":
             torch.cuda.synchronize(device)
             metrics["profile/peak_allocated_gib"] = (
@@ -5822,6 +5942,18 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 capture_temp = capture_path.with_suffix(".tmp.npz")
                 historical_replay_bank.save_npz(capture_temp)
                 os.replace(capture_temp, capture_path)
+            if (
+                historical_replay_bank is not None
+                and step + 1 >= historical_replay_start_step
+            ):
+                # Pair bank state and usage telemetry with this model checkpoint;
+                # publishing a later bank must not corrupt an earlier resume.
+                state_path = Path(workdir) / (
+                    f"historical_gen_replay_state_step{step + 1:07d}_rank{rank:02d}.npz"
+                )
+                state_temp = state_path.with_suffix(".tmp.npz")
+                historical_replay_bank.save_npz(state_temp)
+                os.replace(state_temp, state_path)
             if historical_replay_bank is not None and world_size > 1:
                 # Also wait for both final frozen snapshots at the epoch boundary.
                 dist.barrier()
@@ -6053,6 +6185,120 @@ def main() -> None:
     parser.add_argument("--double_drift_c0", type=float, default=None)
     parser.add_argument("--double_drift_c1", type=float, default=None)
     parser.add_argument("--double_drift_sample_step_rms", type=float, default=None)
+    parser.add_argument(
+        "--seed_host_rng",
+        type=str,
+        default="keep",
+        choices=("keep", "on", "off"),
+        help="Override deterministic NumPy host sampling; keep uses YAML.",
+    )
+    parser.add_argument(
+        "--generator_remat",
+        type=str,
+        default="keep",
+        choices=("keep", "on", "off"),
+        help="Override generator gradient rematerialization; keep uses YAML.",
+    )
+    parser.add_argument(
+        "--mae_remat",
+        type=str,
+        default="keep",
+        choices=("keep", "on", "off"),
+        help="Override MAE gradient rematerialization; keep uses YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay",
+        type=str,
+        default="keep",
+        choices=("keep", "on", "off"),
+        help="Override frozen historical generated replay; keep uses YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_ratio",
+        type=float,
+        default=-1.0,
+        help="Override historical generated-repulsion mass; negative keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_count",
+        type=int,
+        default=0,
+        help="Override historical anchors per label; 0 keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_bank_count",
+        type=int,
+        default=-1,
+        help="Override stored anchors per label; negative keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_start_generated_epochs",
+        type=float,
+        default=0.0,
+        help="Override the frozen-snapshot capture epoch; 0 keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_source",
+        type=str,
+        default="keep",
+        choices=("keep", "frozen_snapshot", "fresh_current"),
+        help="Override the historical anchor source; keep uses YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_current_weight",
+        type=float,
+        default=None,
+        help="Override current-generated per-particle weight; omitted keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_history_weight",
+        type=float,
+        default=None,
+        help="Override historical per-particle weight; omitted keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_ratio_start",
+        type=float,
+        default=None,
+        help="Override replay-mass ramp start ratio; omitted keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_ratio_ramp_start_step",
+        type=int,
+        default=None,
+        help="Override replay-mass ramp start step; omitted keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_ratio_ramp_end_step",
+        type=int,
+        default=None,
+        help="Override replay-mass ramp end step; omitted keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_policy",
+        type=str,
+        default="keep",
+        choices=("keep",) + HistoricalReplayMemoryBank.POLICIES,
+        help="Override historical memory replacement; keep uses YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_update_count",
+        type=int,
+        default=0,
+        help="Current detached anchors streamed per class visit; 0 keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_update_interval_steps",
+        type=int,
+        default=0,
+        help="Rolling-bank update cadence in training steps; 0 keeps YAML.",
+    )
+    parser.add_argument(
+        "--historical_gen_replay_usage_budget",
+        type=int,
+        default=0,
+        help="Replay uses before usage-budget retirement; 0 keeps YAML.",
+    )
     args = parser.parse_args()
 
     cfg = load_yaml_config(args.config)
@@ -6061,8 +6307,74 @@ def main() -> None:
         cfg["name"] = wandb_name_override
     if int(args.throughput_opt_level) >= 0:
         cfg["throughput_opt_level"] = int(args.throughput_opt_level)
+    if args.generator_remat != "keep":
+        generator_remat = args.generator_remat == "on"
+        cfg["use_remat"] = generator_remat
+        cfg["_raw"]["model"]["use_remat"] = generator_remat
+    if args.mae_remat != "keep":
+        cfg["mae_use_remat"] = args.mae_remat == "on"
+    if args.historical_gen_replay != "keep":
+        cfg["historical_gen_replay"] = args.historical_gen_replay == "on"
+    if args.historical_gen_replay_ratio >= 0.0:
+        cfg["historical_gen_replay_ratio"] = float(
+            args.historical_gen_replay_ratio
+        )
+    if args.historical_gen_replay_count > 0:
+        cfg["historical_gen_replay_count"] = int(
+            args.historical_gen_replay_count
+        )
+    if args.historical_gen_replay_bank_count >= 0:
+        cfg["historical_gen_replay_bank_count"] = int(
+            args.historical_gen_replay_bank_count
+        )
+    if args.historical_gen_replay_start_generated_epochs > 0.0:
+        cfg["historical_gen_replay_start_generated_epochs"] = float(
+            args.historical_gen_replay_start_generated_epochs
+        )
+    if args.historical_gen_replay_source != "keep":
+        cfg["historical_gen_replay_source"] = str(
+            args.historical_gen_replay_source
+        )
+    if args.historical_gen_current_weight is not None:
+        cfg["historical_gen_current_weight"] = float(
+            args.historical_gen_current_weight
+        )
+    if args.historical_gen_history_weight is not None:
+        cfg["historical_gen_history_weight"] = float(
+            args.historical_gen_history_weight
+        )
+    if args.historical_gen_replay_ratio_start is not None:
+        cfg["historical_gen_replay_ratio_start"] = float(
+            args.historical_gen_replay_ratio_start
+        )
+    if args.historical_gen_replay_ratio_ramp_start_step is not None:
+        cfg["historical_gen_replay_ratio_ramp_start_step"] = int(
+            args.historical_gen_replay_ratio_ramp_start_step
+        )
+    if args.historical_gen_replay_ratio_ramp_end_step is not None:
+        cfg["historical_gen_replay_ratio_ramp_end_step"] = int(
+            args.historical_gen_replay_ratio_ramp_end_step
+        )
+    if args.historical_gen_replay_policy != "keep":
+        cfg["historical_gen_replay_policy"] = str(
+            args.historical_gen_replay_policy
+        )
+    if args.historical_gen_replay_update_count > 0:
+        cfg["historical_gen_replay_update_count"] = int(
+            args.historical_gen_replay_update_count
+        )
+    if args.historical_gen_replay_update_interval_steps > 0:
+        cfg["historical_gen_replay_update_interval_steps"] = int(
+            args.historical_gen_replay_update_interval_steps
+        )
+    if args.historical_gen_replay_usage_budget > 0:
+        cfg["historical_gen_replay_usage_budget"] = int(
+            args.historical_gen_replay_usage_budget
+        )
     if int(args.seed) >= 0:
         cfg["seed"] = int(args.seed)
+    if args.seed_host_rng != "keep":
+        cfg["seed_host_rng"] = args.seed_host_rng == "on"
     if args.benchmark_throughput:
         cfg["profile_train_step"] = True
         cfg["log_every_k"] = 1

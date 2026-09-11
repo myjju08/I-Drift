@@ -1148,6 +1148,9 @@ def _drift_loss_imagenet_single(
     fuse_fnorm_across_R: bool = False,
     _fixed_distance_scale: Optional[float] = None,
     _return_field: bool = False,
+    attraction_scale: float = 1.0,
+    repulsion_scale: float = 1.0,
+    balance_diagnostics: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Official drift loss (ImageNet version) ported from JAX to PyTorch.
@@ -1161,6 +1164,9 @@ def _drift_loss_imagenet_single(
     per-temperature force tensors remain resident until their FP64 sum-square
     and count pairs can be reduced in one packed vector.
     """
+    attraction_scale, repulsion_scale = float(attraction_scale), float(repulsion_scale)
+    if not all(math.isfinite(v) and v > 0 for v in (attraction_scale, repulsion_scale)):
+        raise ValueError("attraction and repulsion scales must be finite and positive")
     B, C_g, S = gen.shape
     C_p = fixed_pos.shape[1]
     (
@@ -1270,9 +1276,9 @@ def _drift_loss_imagenet_single(
             use_global_stats=global_scale_stats,
         )
     else:
-        scale = gen.new_tensor(float(_fixed_distance_scale))
-        if not torch.isfinite(scale) or scale <= 0:
-            raise ValueError("fixed_distance_scale must be finite and positive")
+        if not math.isfinite(_fixed_distance_scale) or _fixed_distance_scale < 0:
+            raise ValueError("fixed_distance_scale must be finite and non-negative")
+        scale = gen.new_tensor(_fixed_distance_scale)
 
     scale_inputs = (scale / (S ** 0.5)).clamp(min=1e-3)
     old_gen_scaled = old_gen / scale_inputs
@@ -1362,6 +1368,13 @@ def _drift_loss_imagenet_single(
         sum_neg = aff_neg.sum(dim=2, keepdim=True)           # [B, C_g, 1]
         r_coeff_pos = aff_pos * sum_neg                      # attract toward pos
 
+        # Apply AFTER mutual mass coupling: scaling the affinity groups before
+        # coupling would multiply both forces by the same product instead.
+        if attraction_scale != 1.0:
+            r_coeff_pos = r_coeff_pos * attraction_scale
+        if repulsion_scale != 1.0:
+            r_coeff_neg = r_coeff_neg * repulsion_scale
+
         if collect_diagnostics and compute_wpos_stats and R == R_list[0]:
             with torch.no_grad():
                 info.update(
@@ -1415,6 +1428,29 @@ def _drift_loss_imagenet_single(
         )
         total_force_R.div_(scale_inputs)
 
+        if collect_diagnostics and balance_diagnostics:
+            # Bound diagnostic memory: first 16 class/token rows per rank.
+            # These are sampled diagnostics, not full-population estimates.
+            n = min(16, B)
+            x_diag = old_gen[:n]
+            center = fixed_pos[:n].mean(dim=1, keepdim=True)
+            radius = x_diag - center
+            raw_force = total_force_R[:n]
+            info[f"balance/radial_cosine_sampled_{R}"] = float(
+                F.cosine_similarity(raw_force.flatten(), radius.flatten(), dim=0).item()
+            )
+            info[f"balance/feature_centered_rms_sampled_{R}"] = float(radius.square().mean().sqrt().item())
+            for label, coeff, indices, current, fixed in (
+                ("attraction", r_coeff_pos, pos_indices, fixed_pos, None),
+                ("repulsion", r_coeff_neg, neg_indices, old_gen, fixed_repulsive),
+            ):
+                part = _accumulate_weighted_targets(
+                    coeff[:n], None if indices is None else indices[:n],
+                    current[:n], None if fixed is None else fixed[:n],
+                )
+                part.addcmul_(x_diag, coeff[:n].sum(dim=2, keepdim=True), value=-1.0)
+                info[f"balance/{label}_rms_sampled_{R}"] = float(part.square().mean().sqrt().item())
+
         if fuse_global_fnorm:
             forces_pending_fnorm.append(total_force_R)
         else:
@@ -1451,6 +1487,9 @@ def _drift_loss_imagenet_single(
         force_across_R.mul_(force_multiplier_f)
     if collect_diagnostics:
         info["force_multiplier"] = force_multiplier_f
+        if balance_diagnostics:
+            info["balance/attraction_scale"] = attraction_scale
+            info["balance/repulsion_scale"] = repulsion_scale
     if _return_field:
         # Composition needs the first distance scale even when diagnostics are
         # disabled. The original single-step path does not add this work.
@@ -1498,6 +1537,9 @@ def reverse_drift_field(
     collect_diagnostics: bool = True,
     fuse_fnorm_across_R: bool = False,
     fixed_distance_scale: Optional[float] = None,
+    attraction_scale: float = 1.0,
+    repulsion_scale: float = 1.0,
+    balance_diagnostics: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """Detached normalized reverse field, matching cosmosjhj/I-Drift 27a0e4f.
 
@@ -1537,6 +1579,9 @@ def reverse_drift_field(
         fuse_fnorm_across_R=fuse_fnorm_across_R,
         _fixed_distance_scale=fixed_distance_scale,
         _return_field=True,
+        attraction_scale=attraction_scale,
+        repulsion_scale=repulsion_scale,
+        balance_diagnostics=balance_diagnostics,
     )
 
 
@@ -1572,6 +1617,9 @@ def drift_loss_imagenet(
     fuse_fnorm_across_R: bool = False,
     double_drift_c0: float = 1.0,
     double_drift_c1: float = 0.0,
+    attraction_scale: float = 1.0,
+    repulsion_scale: float = 1.0,
+    balance_diagnostics: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Original loss with optional upstream feature-space Double Drift.
 
@@ -1583,7 +1631,8 @@ def drift_loss_imagenet(
     Defaults (1,0) run the original target loss and preserve its operations.
 
     Ported from cosmosjhj/I-Drift commit 27a0e4f; target diagnostics and fused
-    normalization remain supported. No force-balance ablations are enabled.
+    normalization remain supported. Attraction/repulsion scales apply after
+    mutual mass coupling in each field; their defaults preserve the field.
     """
     from .double_drift import validate_double_drift_coefficients
 
@@ -1617,6 +1666,9 @@ def drift_loss_imagenet(
         weight_history=weight_history,
         collect_diagnostics=collect_diagnostics,
         fuse_fnorm_across_R=fuse_fnorm_across_R,
+        attraction_scale=attraction_scale,
+        repulsion_scale=repulsion_scale,
+        balance_diagnostics=balance_diagnostics,
     )
     if c0 == 1.0 and c1 == 0.0:
         return _drift_loss_imagenet_single(gen, **kwargs)

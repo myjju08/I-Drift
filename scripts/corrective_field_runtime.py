@@ -68,11 +68,19 @@ def validate_checkpoint(workdir, config):
     run_id = workdir / "wandb_run_id.txt"
     if not run_id.is_file() or not run_id.read_text().strip():
         raise ValueError("Resume requires the original W&B run ID")
-    if cfg["historical_gen_replay"]:
+    replay_source = str(cfg.get("historical_gen_replay_source", "frozen_snapshot")).lower().strip()
+    if cfg["historical_gen_replay"] and replay_source == "frozen_snapshot":
         freeze_step = math.ceil(DATASET_ROWS * cfg["historical_gen_replay_start_generated_epochs"] / GENERATED_PER_STEP)
+        policy = str(cfg.get("historical_gen_replay_policy", "frozen")).lower().strip()
         for rank in range(2):
-            filename = (f"historical_gen_replay_capture_step{step:07d}_rank{rank:02d}.npz"
-                        if step < freeze_step else f"historical_gen_replay_rank{rank:02d}.npz")
+            if step < freeze_step:
+                filename = f"historical_gen_replay_capture_step{step:07d}_rank{rank:02d}.npz"
+            else:
+                filename = f"historical_gen_replay_state_step{step:07d}_rank{rank:02d}.npz"
+                # Match the trainer: prefer checkpoint-paired bank/telemetry,
+                # with legacy immutable-bank fallback only for frozen replay.
+                if policy == "frozen" and not (workdir / filename).is_file():
+                    filename = f"historical_gen_replay_rank{rank:02d}.npz"
             path = workdir / filename
             if not path.is_file() or path.stat().st_size == 0:
                 raise ValueError(f"Resume requires matching replay state: {filename}")

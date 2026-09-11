@@ -1,0 +1,23 @@
+{
+  "cases": 16,
+  "comparisons": 9184,
+  "max_absolute_error": 0,
+  "class_source_identical": true,
+  "original_target_bank_classes_unchanged": true,
+  "policies": [
+    "frozen",
+    "fifo",
+    "reservoir",
+    "usage_budget"
+  ],
+  "source_repository": "https://github.com/cosmosjhj/I-Drift",
+  "source_commit": "27a0e4fb54c8ed04e2538831a9df86a85c8c25ef",
+  "target_repository": "https://github.com/myjju08/I-Drift",
+  "target_base_commit": "4c26125a6acdd1cff488b6904025996bbb6b8dc5",
+  "hashes": {
+    "source_memory_bank_sha256": "ac447634503c2e69ace256bcfdcdc4567d6d2d0bc2f858eff7f1c8750b38ebd4",
+    "target_memory_bank_sha256": "2d6d04e9531313d82fc227e6577f671366a57ed70df979d1aaecfe6087431fb3",
+    "historical_replay_class_sha256": "3cd2d3e5b9f25fab734d45a7cd52b4375bb61b37013b1193f0d56ca1089f510a"
+  },
+  "scope": "CPU state/sample/telemetry parity, four policies, float16/float32 storage, global/isolated RNG, 30 streaming steps with midpoint NPZ resume"
+}

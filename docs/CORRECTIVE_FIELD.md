@@ -2,7 +2,7 @@
 
 ## Source and objective
 
-Double Drift is ported from
+Replay policies, Double Drift, and attraction/repulsion balance are ported from
 [`cosmosjhj/I-Drift`, commit `27a0e4fb54c8ed04e2538831a9df86a85c8c25ef`](https://github.com/cosmosjhj/I-Drift/commit/27a0e4fb54c8ed04e2538831a9df86a85c8c25ef).
 Its source files are `drifting_core/double_drift.py`,
 `drifting_core/imagenet_loss.py`, and the integration in
@@ -72,7 +72,10 @@ first ten generated-sample epochs and freezes its bank at that boundary.
 After activation, current generated repulsion has weight `1-rho=0.65`;
 historical particles have weight `rho*G/H=0.7`, with `G=32`, `H=16`.
 The same replay references and weights are used in both field evaluations.
-MAE parameters remain frozen.
+MAE parameters remain frozen. The three suite configs explicitly use
+`historical_gen_replay_policy: frozen` and `rev_drift_balance_delta: 0.0`.
+The optional rolling policies and force schedule are documented in
+[the upstream comparison](UPSTREAM_PARITY.md) and the main README.
 
 All three arms set `feature_gan: false` and `adversarial_mode: none`.
 No discriminator is built or updated by this suite.
@@ -134,8 +137,12 @@ The second command prints the submission plan. On a Slurm host, after the
 final source is committed, submit the checked suite:
 
 ```bash
-python scripts/submit_corrective_field.py --submit
+python scripts/submit_corrective_field.py --submit --variants replay_only replay_double
 ```
+
+This selection queues the two requested replay experiments and leaves the
+baseline unsubmitted. Omit `--variants` to explicitly select the full three-arm
+suite. Validation always covers all three configurations.
 
 The default worker Python is
 `/home/juhyeong/.venvs/replay-drift/bin/python`. Override `--python`,
@@ -145,10 +152,11 @@ asset paths/configurations together when moving the experiment.
 Submission writes a read-only Git archive under
 `runs/corrective-field-submissions/<UTC-uuid>/source`, with per-file SHA-256
 hashes and a submission record. It queues a bounded two-GPU validation job
-and three production jobs with `afterok` dependencies. Production also
+and the selected production jobs with `afterok` dependencies. Production also
 checks the successful validation report's exact source and config hashes.
 Each arm receives two Slurm-assigned RTX 3090 GPUs, six CPUs, 80 GB RAM,
-and a three-day time limit on `srv02`. Production can use six GPUs in total;
+and a three-day time limit on `srv02`. The selected pair uses four GPUs;
+the full suite uses six GPUs in total;
 validation finishes before any production arm starts.
 
 The GPU gate runs six full-batch updates per arm, activates an `H=16` frozen
@@ -167,23 +175,32 @@ artifacts, and `run_metadata/`. The immutable submission directory contains
 Five minutes before a time limit, the job stops its worker process group,
 validates its last completed checkpoint and matching replay state, and
 requeues the same job/workdir/W&B identity. Up to half an epoch can repeat.
-Generator/EMA/optimizer and historical replay state are restored. As in the
+Generator/EMA/optimizer and historical replay state are restored. Replay
+state and usage telemetry are saved per completed checkpoint and per rank,
+using atomic publication before the matching model checkpoint. Older frozen
+checkpoints may use their immutable epoch-boundary bank; rolling policies
+require the exact step sidecar. As in the
 existing trainer, real-data banks are rebuilt and all sampler/RNG state is
 not checkpointed, so this is not a bitwise trajectory-resume guarantee.
 
 ## Port verification
 
 The independent [numerical parity report](DOUBLE_DRIFT_PARITY.json) records
-72 cases and 1,880 exact scalar/tensor comparisons against the upstream
+360 cases and 25,080 exact scalar/tensor comparisons against the upstream
 commit, with maximum absolute difference zero. Cases cover loss, fields,
 input gradients, weighted multi-feature aggregation, sample-space probing,
-replay off/`rho=0.35`, and coefficients `(1,0)`, `(1,1)`, `(0.75,0.25)`.
+replay off/`rho=0.35`, coefficients `(1,0)`, `(1,1)`, `(0.75,0.25)`, and five
+static/annealed attraction-repulsion settings including nonunit balance.
 The production feature dtype is FP32; outer sample graphs also cover FP64.
-The pre-submission CPU suite passed **469 tests and 175 subtests**, with
-15 skips for CUDA or unavailable external reference assets. On `srv02`,
-32 cache rows matched their original FP32 sources bitwise, the MAE and VAE
-weight hashes matched, and authenticated access to `Corrective Field` was
-confirmed without creating a training run.
+[Replay state parity](REPLAY_PARITY.json) covers all four memory policies,
+FP16/FP32 storage, isolated/global host RNG, and midpoint snapshot restoration
+with 9,184 exact comparisons. The current CPU regression result and remaining
+source differences are recorded in [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md).
+These CPU results do not replace the queued two-GPU validation gate.
+
+The existing srv02 asset preflight verified 32 original FP32 cache rows
+bitwise, MAE/VAE weight hashes, and authenticated access to `Corrective Field`
+without creating a training run.
 
 To repeat the comparison with a checkout of the referenced upstream commit:
 

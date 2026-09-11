@@ -79,6 +79,22 @@ class _NpyFlatLatentDataset(torch.utils.data.Dataset):
         return feat, label
 
 
+def _resolve_npy_flat_split(cache_path: str, split: str) -> str:
+    """Resolve either ``cache/<split>/...`` or a direct split directory."""
+    split_root = os.path.join(cache_path, split)
+    for candidate in (split_root, cache_path):
+        if (
+            os.path.isdir(os.path.join(candidate, "imagenet256_features"))
+            and os.path.isdir(os.path.join(candidate, "imagenet256_labels"))
+        ):
+            return candidate
+    raise FileNotFoundError(
+        f"Flat latent cache split not found for split={split!r} under {cache_path}. "
+        "Expected imagenet256_features/ and imagenet256_labels/ either in "
+        f"{split_root} or directly in {cache_path}."
+    )
+
+
 class _ConcurrencyLimitedImageLoader:
     """Run the physical image open/decode under a process-shared semaphore.
 
@@ -163,6 +179,7 @@ def create_imagenet_split(
     use_cache: bool = False,
     cache_path: str = "",
     cache_format: str = "pt_imagefolder",   # "pt_imagefolder" | "npy_flat"
+    vae_variant: str = "mse",
     latent_mmap_cache_path: str = "",
     latent_decoder_path: str = "",
     latent_scaling_factor: float = 0.18215,
@@ -175,7 +192,7 @@ def create_imagenet_split(
     rank: int = 0,
     world_size: int = 1,
     latent_device: Optional[torch.device | str] = None,
-    vae_model_id: str = "stabilityai/sd-vae-ft-mse",
+    vae_model_id: Optional[str] = None,
     vae_revision: Optional[str] = None,
     return_uint8: bool = False,
     raw_image_io_concurrency: int = 0,
@@ -188,6 +205,9 @@ def create_imagenet_split(
         - preprocess_fn: (images, labels) batch → {"images": BCHW, "labels": B}
         - postprocess_fn: generated latents/pixels → pixel images in [0, 1]
     """
+    from vae_imagenet import resolve_vae_model_id
+
+    vae_model_id = resolve_vae_model_id(vae_model_id, vae_variant)
     # Explicit local-cache/decoder paths opt into byte-preserving latent inputs.
     # The existing online-VAE and .pt cache interfaces keep their defaults.
     exact_latent_inputs = bool(latent_mmap_cache_path or latent_decoder_path)
@@ -235,9 +255,9 @@ def create_imagenet_split(
                 "Set `cache_path` in config or IMAGENET_CACHE_PATH."
             )
         if cache_format == "npy_flat":
-            # Flat-index .npy layout: cache_path/imagenet256_features & imagenet256_labels
-            # (no train/val subdirectory — full train set only)
-            ds = _NpyFlatLatentDataset(cache_root=cache_path)
+            ds = _NpyFlatLatentDataset(
+                cache_root=_resolve_npy_flat_split(cache_path, split)
+            )
         else:
             split_root = os.path.join(cache_path, split)
             if not os.path.isdir(split_root):

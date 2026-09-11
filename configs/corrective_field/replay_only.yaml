@@ -105,6 +105,9 @@ train:
   rev_drift_kernel_adaptive_k_pos: 0
   rev_drift_kernel_adaptive_k_neg: 0
   rev_drift_force_multiplier: 1.0
+  rev_drift_balance_delta: 0.0
+  rev_drift_balance_anneal_steps: 0
+  rev_drift_balance_diagnostics: false
   rev_drift_top_p: 1.0
   drift_top_p_min_keep: 1
   drift_top_k_pos: 0
@@ -164,6 +167,10 @@ train:
   historical_gen_replay_start_generated_epochs: 10.0
   historical_gen_replay_storage_dtype: float16
   historical_gen_replay_source: frozen_snapshot
+  historical_gen_replay_policy: frozen
+  historical_gen_replay_update_count: 2
+  historical_gen_replay_update_interval_steps: 1
+  historical_gen_replay_usage_budget: 4
   throughput_opt_level: 4
   allow_tf32: true
   cudnn_benchmark: false

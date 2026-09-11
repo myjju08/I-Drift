@@ -1,5 +1,9 @@
 # I-Drift implementation port — 2026-09-10
 
+This is the historical DINO/GAN port report. The subsequent 2026-09-11
+Replay, Double Drift, force-balance changes and current source comparison
+are documented in [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md).
+
 The port targets the implementation and effective configurations on the
 running instance, including runtime code that was outside the original
 repository. It does not copy datasets, model weights, run directories or
