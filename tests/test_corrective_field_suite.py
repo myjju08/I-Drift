@@ -2,8 +2,11 @@
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -327,6 +330,7 @@ class CorrectiveFieldSuiteTests(unittest.TestCase):
         self.assertEqual(captured["suite_dir"], "configs/corrective_field_srv06")
         self.assertEqual(captured["python"], "/data/juhyeong/venvs/replay-drift/bin/python")
         self.assertEqual(captured["run_root"], "/data/juhyeong/corrective-field-runs")
+        self.assertIs(captured["nccl_p2p_disable"], True)
         self.assertEqual(len(commands), 4)
         for command in commands:
             self.assertIn("--partition=srv06", command)
@@ -348,6 +352,77 @@ class CorrectiveFieldSuiteTests(unittest.TestCase):
             preflight.validate_hardware_binding(binding, "srv06", ["NVIDIA RTX A5000"] * 4)
         with self.assertRaisesRegex(ValueError, "binding is inconsistent"):
             preflight.snapshot_execution({"execution": {**binding, "gpu_type": "rtx3090"}})
+
+    def test_nccl_transport_is_bound_to_the_node_with_legacy_srv02_compatibility(self):
+        for node, disabled in (("srv02", False), ("srv06", True)):
+            binding = preflight.execution_binding(node)
+            self.assertIs(binding["nccl_p2p_disable"], disabled)
+            self.assertEqual(preflight.snapshot_execution({"execution": binding}), binding)
+            with self.assertRaisesRegex(ValueError, "binding is inconsistent"):
+                preflight.snapshot_execution({"execution": {**binding, "nccl_p2p_disable": not disabled}})
+            with self.assertRaisesRegex(ValueError, "must be boolean"):
+                preflight.snapshot_execution({"execution": {**binding, "nccl_p2p_disable": int(disabled)}})
+            del binding["nccl_p2p_disable"]
+            if node == "srv02":
+                self.assertEqual(preflight.snapshot_execution({"execution": binding}), binding)
+            else:
+                with self.assertRaisesRegex(ValueError, "binding is inconsistent"):
+                    preflight.snapshot_execution({"execution": binding})
+        self.assertIs(preflight.snapshot_execution({})["nccl_p2p_disable"], False)
+
+    def test_runtime_rejects_unbound_transport_before_gpu_queries_and_wrong_node(self):
+        binding = preflight.execution_binding("srv06", python=sys.executable)
+        fake_cuda = Mock(device_count=Mock(return_value=2),
+                         get_device_name=Mock(return_value="NVIDIA RTX A5000"))
+        env = {"SLURM_JOB_ID": "123", "SLURMD_NODENAME": "srv06"}
+        with (patch.dict("sys.modules", {"torch": Mock(cuda=fake_cuda)}),
+              patch.dict(os.environ, env, clear=True)):
+            with self.assertRaisesRegex(ValueError, "NCCL_P2P_DISABLE.*expected 1"):
+                preflight.validate_allocated_hardware({"execution": binding})
+            fake_cuda.device_count.assert_not_called()
+            with patch.dict(os.environ, {"NCCL_P2P_DISABLE": "1"}):
+                self.assertEqual(preflight.validate_allocated_hardware({"execution": binding}),
+                                 ["NVIDIA RTX A5000"] * 2)
+                with patch.dict(os.environ, {"SLURMD_NODENAME": "srv02"}):
+                    with self.assertRaisesRegex(ValueError, "Expected allocated node srv06"):
+                        preflight.validate_allocated_hardware({"execution": binding})
+        binding = preflight.execution_binding("srv02", python=sys.executable)
+        del binding["nccl_p2p_disable"]
+        fake_cuda.get_device_name.return_value = "NVIDIA GeForce RTX 3090"
+        with (patch.dict("sys.modules", {"torch": Mock(cuda=fake_cuda)}),
+              patch.dict(os.environ, {"SLURM_JOB_ID": "123", "SLURMD_NODENAME": "srv02"}, clear=True)):
+            self.assertEqual(len(preflight.validate_allocated_hardware({"execution": binding})), 2)
+            with patch.dict(os.environ, {"NCCL_P2P_DISABLE": "1"}):
+                with self.assertRaisesRegex(ValueError, "NCCL_P2P_DISABLE.*expected 0"):
+                    preflight.validate_allocated_hardware({"execution": binding})
+
+    def test_both_wrapper_bootstraps_override_inherited_p2p_from_the_manifest(self):
+        # Execute only the real shell bootstrap through its environment export;
+        # no torch import, job submission, or GPU access occurs in this test.
+        export = 'export NCCL_P2P_DISABLE="$CF_NCCL_P2P_DISABLE"'
+        for node, expected in (("srv02", "0"), ("srv06", "1")):
+            snapshot = self.root / (node + "_transport")
+            source = snapshot / "source"
+            (source / "scripts").mkdir(parents=True)
+            shutil.copy(preflight.__file__, source / "scripts/preflight_corrective_field.py")
+            (snapshot / "source-manifest.json").write_text(json.dumps({
+                "execution": preflight.execution_binding(node),
+            }))
+            for name in ("run_corrective_field.sbatch", "validate_corrective_field.sbatch"):
+                with self.subTest(node=node, wrapper=name):
+                    script = (preflight.ROOT / "scripts/slurm" / name).read_text()
+                    prefix, _ = script.split(export, 1)
+                    bootstrap = prefix + export + '\nprintf "%s\\n" "$NCCL_P2P_DISABLE"\n'
+                    run_root = self.root / (node + "_runs")
+                    arguments = ([str(snapshot), "baseline", str(run_root), sys.executable]
+                                 if name.startswith("run_") else
+                                 [str(snapshot), sys.executable, str(run_root)])
+                    env = {**os.environ, "SLURM_JOB_ID": "123", "CUDA_VISIBLE_DEVICES": "0,1",
+                           "NCCL_P2P_DISABLE": "0" if expected == "1" else "1"}
+                    env.pop("CORRECTIVE_VALIDATION_ROOT", None)
+                    result = subprocess.run(["bash", "-c", bootstrap, name, *arguments],
+                                            env=env, capture_output=True, text=True, check=True)
+                    self.assertEqual(result.stdout.strip(), expected)
 
     def test_srv06_workdir_and_resume_use_manifest_suite_instead_of_srv02_config(self):
         snapshot = self.root / "srv06_snapshot"

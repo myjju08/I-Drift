@@ -31,7 +31,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TORCH_NCCL_ASYNC_ERROR_H
 export WANDB_MODE=disabled
 unset WANDB_DISABLED WANDB_RUN_ID WANDB_RESUME
 CF_SUITE_REL=$("$CF_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("execution", {}).get("suite_dir", "configs/corrective_field"))' "$CF_SNAPSHOT/source-manifest.json")
-echo "[validation] source=$CF_SOURCE suite=$CF_SUITE_REL workdir=$CF_WORKDIR job=$SLURM_JOB_ID CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+CF_NCCL_P2P_DISABLE=$("$CF_PYTHON" -c 'import json,sys; sys.path.insert(0,sys.argv[1]); from scripts.preflight_corrective_field import snapshot_execution; binding=snapshot_execution(json.load(open(sys.argv[2]))); print(int(binding.get("nccl_p2p_disable", False)))' "$CF_SOURCE" "$CF_SNAPSHOT/source-manifest.json")
+export NCCL_P2P_DISABLE="$CF_NCCL_P2P_DISABLE"
+echo "[validation] source=$CF_SOURCE suite=$CF_SUITE_REL workdir=$CF_WORKDIR job=$SLURM_JOB_ID CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE"
 cd "$CF_SOURCE"
 exec "$CF_PYTHON" -u -m torch.distributed.run --standalone --nproc_per_node=2 \
   scripts/validate_corrective_field.py --snapshot-root "$CF_SNAPSHOT" --workdir "$CF_WORKDIR" \

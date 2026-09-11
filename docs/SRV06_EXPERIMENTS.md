@@ -66,6 +66,13 @@ python scripts/submit_corrective_field.py \
 
 The immutable source manifest binds the selected node, GPU type and suite.
 Slurm requests two A5000 GPUs, six CPUs and 80 GiB RAM per production arm.
+On srv06 the snapshot also binds `NCCL_P2P_DISABLE=1`. A controlled two-rank
+Slurm probe on GPU 0/1 reproduced a first-collective timeout with default
+PCIe P2P transport and passed both all-reduce and object gathering with P2P
+disabled. The wrappers apply this transport setting before CUDA/NCCL starts;
+model, loss, batch size, and optimizer settings remain unchanged. The srv02
+profile retains its default transport. GPU 4/5 passed the default probe, so
+single-GPU computation or another GPU pair alone is insufficient validation.
 A two-GPU validation job first checks all three arms using the actual copied
 MAE/cache/decoder, before the three dependent production jobs may start.
 Validation includes finite losses/gradients, rank agreement, unchanged MAE

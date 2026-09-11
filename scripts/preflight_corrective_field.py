@@ -26,10 +26,12 @@ MAE_SHA256 = "59c269f99d83645b6c7bb2bf832711aa83d894998259a1ada16c0c9ed7836081"
 VAE_SHA256 = "a1d993488569e928462932c8c38a0760b874d166399b14414135bd9c42df5815"
 NODE_PROFILES = {
     "srv02": {"gpu_type": "rtx3090", "gpu_name_token": "3090",
+              "nccl_p2p_disable": False,
               "suite_dir": "configs/corrective_field",
               "python": "/home/juhyeong/.venvs/replay-drift/bin/python",
               "run_root": "/home/juhyeong/corrective-field-runs"},
     "srv06": {"gpu_type": "a5000", "gpu_name_token": "a5000",
+              "nccl_p2p_disable": True,
               "suite_dir": "configs/corrective_field_srv06",
               "python": "/data/juhyeong/venvs/replay-drift/bin/python",
               "run_root": "/data/juhyeong/corrective-field-runs"},
@@ -39,6 +41,7 @@ NODE_PROFILES = {
 def execution_binding(node="srv02", *, suite_dir=None, python=None, run_root=None):
     profile = NODE_PROFILES[node]
     return {"node": node, "partition": node, "gpu_type": profile["gpu_type"],
+            "nccl_p2p_disable": profile["nccl_p2p_disable"],
             "gpus_per_arm": 2, "cpus_per_arm": 6, "memory_per_arm": "80G",
             "time_limit": "3-00:00:00", "suite_dir": str(suite_dir or profile["suite_dir"]),
             "python": str(python or profile["python"]), "run_root": str(run_root or profile["run_root"])}
@@ -52,6 +55,12 @@ def snapshot_execution(manifest):
         raise ValueError(f"Unsupported snapshot node: {node}")
     expected = execution_binding(node, suite_dir=binding.get("suite_dir"),
                                  python=binding.get("python"), run_root=binding.get("run_root"))
+    # Older srv02 manifests used NCCL's default P2P behavior. Preserve that
+    # schema; srv06 must explicitly bind the transport verified on GPUs 0/1.
+    if node == "srv02" and "nccl_p2p_disable" not in binding:
+        expected.pop("nccl_p2p_disable")
+    if "nccl_p2p_disable" in binding and type(binding["nccl_p2p_disable"]) is not bool:
+        raise ValueError("Snapshot nccl_p2p_disable binding must be boolean")
     if binding != expected:
         raise ValueError("Snapshot hardware/resource binding is inconsistent")
     suite_path = Path(binding["suite_dir"])
@@ -86,6 +95,13 @@ def validate_allocated_hardware(manifest=None):
     if not os.environ.get("SLURM_JOB_ID"):
         raise ValueError("An allocated Slurm job is required")
     binding = snapshot_execution(manifest or {})
+    expected_p2p = "1" if binding.get("nccl_p2p_disable", False) else "0"
+    actual_p2p = os.environ.get("NCCL_P2P_DISABLE", "0")
+    if actual_p2p != expected_p2p:
+        raise ValueError(
+            f"NCCL_P2P_DISABLE must match the {binding['node']} execution binding: "
+            f"expected {expected_p2p}, got {actual_p2p!r}"
+        )
     if manifest and "execution" in manifest:
         if os.path.abspath(sys.executable) != os.path.abspath(binding["python"]):
             raise ValueError("Worker interpreter does not match the immutable execution binding")

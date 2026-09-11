@@ -28,6 +28,8 @@ test -r "$CF_SNAPSHOT/source-manifest.json"
 test -x "$CF_PYTHON"
 export PYTHONDONTWRITEBYTECODE=1
 CF_SUITE_REL=$("$CF_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("execution", {}).get("suite_dir", "configs/corrective_field"))' "$CF_SNAPSHOT/source-manifest.json")
+CF_NCCL_P2P_DISABLE=$("$CF_PYTHON" -c 'import json,sys; sys.path.insert(0,sys.argv[1]); from scripts.preflight_corrective_field import snapshot_execution; binding=snapshot_execution(json.load(open(sys.argv[2]))); print(int(binding.get("nccl_p2p_disable", False)))' "$CF_SOURCE" "$CF_SNAPSHOT/source-manifest.json")
+export NCCL_P2P_DISABLE="$CF_NCCL_P2P_DISABLE"
 CF_CONFIG="$CF_SOURCE/$CF_SUITE_REL/$CF_VARIANT.yaml"
 CF_RESTART_COUNT=${SLURM_RESTART_COUNT:-0}
 CF_WORKDIR=$("$CF_PYTHON" "$CF_SOURCE/scripts/corrective_field_runtime.py" workdir \
@@ -49,7 +51,7 @@ export WANDB_JOB_TYPE=training
 export WANDB_DIR="$CF_WORKDIR"
 unset WANDB_DISABLED WANDB_RUN_ID WANDB_RESUME IDRIFT_WANDB_NAME
 
-echo "[launch] variant=$CF_VARIANT job=$SLURM_JOB_ID host=$(hostname) CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "[launch] variant=$CF_VARIANT job=$SLURM_JOB_ID host=$(hostname) CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE"
 echo "[launch] source=$CF_SOURCE config=$CF_CONFIG workdir=$CF_WORKDIR"
 "$CF_PYTHON" - "$CF_SNAPSHOT" "$CF_VARIANT" "$CF_WORKDIR" <<'PY'
 import json, os, pathlib, socket, sys
@@ -58,6 +60,7 @@ metadata = {
     "snapshot": snapshot, "variant": variant, "workdir": workdir,
     "host": socket.gethostname(), "slurm_job_id": os.environ["SLURM_JOB_ID"],
     "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
+    "nccl_p2p_disable": os.environ["NCCL_P2P_DISABLE"] == "1",
     "wandb_group": os.environ["WANDB_RUN_GROUP"],
     "restart_count": int(os.environ.get("SLURM_RESTART_COUNT", "0")),
 }
