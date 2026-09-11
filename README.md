@@ -1,6 +1,6 @@
-# ReplayDrift
+# I-Drift
 
-### Learning from Its Own Past through Repulsive Generative Replay
+### MAE drift, historical replay, Double Drift, and adversarial supervision
 
 ReplayDrift is a follow-up to [Drifting](https://github.com/lambertae/drifting)
 and DualDrift. It lets a generator learn not only from real data, but also from
@@ -16,11 +16,41 @@ experiment runtimes used by the source I-Drift instance on **2026-09-10**.
 The implementation is local to this checkout; datasets, pretrained weights
 and checkpoints are supplied separately.
 
+Double Drift is ported from
+[`cosmosjhj/I-Drift` at `27a0e4f`](https://github.com/cosmosjhj/I-Drift/commit/27a0e4fb54c8ed04e2538831a9df86a85c8c25ef).
+The [Corrective Field experiment guide](docs/CORRECTIVE_FIELD.md) describes
+the matched S4 / MAE-256 comparison, exact assets, equations, and launch steps.
+
+## Corrective Field: three S4 experiments
+
+All three configurations train from scratch for 40 generated-sample epochs
+with the same FP32 latent cache, frozen MAE-256 checkpoint, seed 43, and
+global generated batch 512. Each job uses two GPUs on `srv02`.
+
+| Configuration | Historical replay | Double Drift | GAN |
+| --- | --- | --- | --- |
+| [baseline](configs/corrective_field/baseline.yaml) | Off | Off | Off |
+| [replay_double](configs/corrective_field/replay_double.yaml) | `rho=0.35`, bank frozen at epoch 10 | Feature, `c0=c1=1` | Off |
+| [replay_only](configs/corrective_field/replay_only.yaml) | Same | Off | Off |
+
+For the selected feature-space method, normalized features move according to
+`u1 = u + V(u)` and `u2 = u1 + V(u1)`. Both generated queries and generated
+negative particles move for the second field evaluation; real and historical
+references stay fixed. The final displacement is not normalized again.
+All three arms have GAN supervision disabled.
+
+The repository also exposes the upstream sample-space gradient-probe method
+through `double_drift_mode: sample`; its coefficients and latent probe RMS
+have a different interpretation. See the guide before changing modes.
+New run metrics are logged online to W&B project **Corrective Field**.
+The historical result tables below are separate experiments.
+
 ## Implemented experiment families
 
 | Family | Generator supervision | Entry point |
 | --- | --- | --- |
 | Reverse / forward / dual drift and historical replay | Frozen encoder drift, optional detached historical repulsion | `train_imagenet_gen.py` and `scripts/` |
+| Double Drift with replay | Two detached feature-field evaluations with fixed real/history references | `configs/corrective_field/`, `drifting_core/double_drift.py` |
 | DINO raw conditional GAN | Frozen DINO drift + non-saturating logistic GAN loss | `experiments.dino.train` |
 | DINO adversarial feature drift | Frozen DINO drift + drift in learned discriminator coordinates | `experiments.dino.train` |
 | DINO mixed objective | Frozen DINO drift + GAN loss + learned-feature drift | `experiments.dino.train --config ...` |
@@ -34,8 +64,8 @@ Read [the objective and update definitions](docs/ADVERSARIAL_METHODS.md),
 [port validation](docs/PORT_VALIDATION.md) for details.
 
 The active DINO recipe applies replay only to frozen DINO drift; its learned
-CNN drift receives neither replay samples nor replay weights. Current MAE
-recipes have replay disabled. Their latent discriminator and loss weights
+CNN drift receives neither replay samples nor replay weights. The archived
+MAE presets under `experiments/mae/configs/` have replay disabled. Their latent discriminator and loss weights
 are different from the RGB DINO discriminator. The supplied experiment
 presets preserve these distinctions.
 

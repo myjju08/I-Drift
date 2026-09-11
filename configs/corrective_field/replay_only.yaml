@@ -1,0 +1,194 @@
+# Matched S4 / MAE256 / original FP32 cache / 40 generated epochs.
+# Double Drift comes from cosmosjhj/I-Drift 27a0e4f; all GAN objectives disabled.
+
+logging:
+  project: Corrective Field
+  entity: a01065522071-kaist-digital-humanities-and-social-science
+  name: S4 / MAE + Replay rho0.35 e10 frozen / P32 N32 G32 / B512 s43
+  use_wandb: true
+  require_wandb: true
+  log_every_k: 10
+  wandb_rewind_on_resume: false
+  wandb_log_min_step: 0
+env:
+  latent_mmap_cache_path: /home/juhyeong/replay-drift-cache/imagenet-latents-f32-v1
+  imagenet_path: /data/juhyeong/imagenet/ILSVRC2012
+  cache_path: /data/juhyeong/imagenet/imagenet_latents
+dataset:
+  cache_format: npy_flat
+  latent_scaling_factor: 0.18215
+  latent_decoder_path: /home/juhyeong/.cache/huggingface/hub/models--stabilityai--sd-vae-ft-mse/snapshots/31f26fdeee1355a5c34592e401dd41e45d25a493
+  resolution: 256
+  use_aug: false
+  use_latent: true
+  use_cache: true
+  require_complete_raw_imagenet: false
+  num_classes: 1000
+  batch_size: 8
+  eval_batch_size: 8
+  num_workers: 2
+  pin_memory: true
+  prefetch_factor: 2
+  eval_prefetch_factor: 2
+  persistent_workers: true
+  eval_persistent_workers: false
+  raw_train_uint8: false
+  raw_image_io_concurrency_per_rank: 0
+model:
+  cond_dim: 384
+  input_size: 32
+  in_channels: 4
+  patch_size: 4
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  out_channels: 4
+  use_qk_norm: true
+  use_swiglu: true
+  use_rope: true
+  use_rmsnorm: true
+  n_cls_tokens: 16
+  noise_classes: 64
+  noise_coords: 32
+  use_bf16: true
+  attn_fp32: false
+  use_remat: false
+  use_sdpa: true
+optimizer:
+  lr: 0.0004
+  weight_decay: 0.0
+  adam_b1: 0.9
+  adam_b2: 0.95
+  warmup_steps: 2000
+  lr_schedule: const
+train:
+  require_eval_metrics: true
+  preserve_rng_during_eval: true
+  seed: 43
+  seed_host_rng: true
+  total_steps: 100092
+  total_generated_epochs: 40.0
+  save_per_step: 5000
+  save_per_generated_epochs: 0.5
+  eval_per_step: 400000
+  eval_per_generated_epochs: 10.0
+  eval_samples: 1024
+  eval_at_start: true
+  ema_decay: 0.999
+  max_grad_norm: 2.0
+  keep_every: 50000
+  keep_last: 4
+  checkpoint_latest_hardlink: true
+  pos_per_sample: 32
+  neg_per_sample: 32
+  positive_bank_size: 128
+  negative_bank_size: 1000
+  memory_bank_storage_mode: raw
+  positive_memory_bank_backend: dense
+  banks_per_rank: 1
+  push_per_step: 256
+  loader_batch_size: 256
+  push_at_resume: 0
+  gen_per_label: 32
+  cfg_min: 1.0
+  cfg_max: 4.0
+  neg_cfg_pw: 3.0
+  no_cfg_frac: 0.0
+  drift_matching: rev-drift
+  R_list:
+  - 0.2
+  - 0.05
+  - 0.02
+  rev_drift_affinity_kernel: exponential
+  rev_drift_kernel_shape: 1.0
+  rev_drift_kernel_adaptive_k_pos: 0
+  rev_drift_kernel_adaptive_k_neg: 0
+  rev_drift_force_multiplier: 1.0
+  rev_drift_top_p: 1.0
+  drift_top_p_min_keep: 1
+  drift_top_k_pos: 0
+  drift_top_k_neg: 0
+  drift_top_k_groups: all
+  layer_temperature_profile: uniform
+  require_raw_temperature_calibration: false
+  layer_temperature_profiles:
+    uniform:
+      default: 1.0
+      stage1: 1.0
+      stage2: 1.0
+      stage3: 1.0
+      stage4: 1.0
+  feature_loss_profile: no_stage12_norm_x2
+  feature_loss_group_normalize: true
+  prune_skipped_feature_tensors: true
+  feature_loss_profiles:
+    no_stage12_norm_x2:
+      default: 1.0
+      norm_x: 2.0
+      stage1: 0.0
+      stage2: 0.0
+  global_scale_stats: true
+  global_fnorm_stats: true
+  compute_wpos_stats: true
+  compute_wpos_stats_every_k: 1000
+  activation_kwargs:
+    active_stages:
+    - stage3
+    - stage4
+    patch_mean_size:
+    - 2
+    - 4
+    patch_std_size:
+    - 2
+    - 4
+    use_std: true
+    use_mean: true
+    with_global: true
+    with_norm_x: true
+    every_k_block: 2
+    exclude_terminal_block: false
+  cfg_list:
+  - 1.0
+  - 2.0
+  - 3.0
+  historical_gen_replay: true
+  historical_gen_replay_ratio: 0.35
+  historical_gen_replay_ratio_start: null
+  historical_gen_replay_ratio_ramp_start_step: 0
+  historical_gen_replay_ratio_ramp_end_step: 0
+  historical_gen_current_weight: null
+  historical_gen_history_weight: null
+  historical_gen_replay_count: 16
+  historical_gen_replay_bank_count: 16
+  historical_gen_replay_start_generated_epochs: 10.0
+  historical_gen_replay_storage_dtype: float16
+  historical_gen_replay_source: frozen_snapshot
+  throughput_opt_level: 4
+  allow_tf32: true
+  cudnn_benchmark: false
+  diagnostics_every_k: 100
+  double_drift_mode: 'off'
+  double_drift_c0: 1.0
+  double_drift_c1: 0.0
+feature:
+  mae_use_remat: false
+  feature_precast_conv_weights: true
+  feature_extractor: mae
+  feature_encoder_only: true
+  feature_checkpoint: /home/juhyeong/idrift-data/imagenet/mae_latent_256/ckpt_latest.pt
+  feature_use_bf16: true
+  feature_use_remat: false
+  feature_channels_last: false
+  feature_compile_backbone: false
+  feature_compile_dynamic: false
+  feature_compile_emulate_precision_casts: true
+  feature_microbatch_size: 8
+  feature_real_microbatch_size: 64
+  feature_generated_microbatch_size: 32
+  feature_include_norm_x: true
+  feature_clip_decoded_pixels: false
+  feature_adapter: false
+  feature_gan: false
+  adversarial_mode: none
+  adversarial_loss_weight: 0.0

@@ -1116,7 +1116,7 @@ def reverse_drift_raw_fields(
     return tuple(fields)
 
 
-def drift_loss_imagenet(
+def _drift_loss_imagenet_single(
     gen: torch.Tensor,                    # [B, C_g, S]
     fixed_pos: torch.Tensor,              # [B, C_p, S]
     fixed_neg: Optional[torch.Tensor] = None,  # [B, C_n, S]
@@ -1146,6 +1146,8 @@ def drift_loss_imagenet(
     weight_history: Optional[torch.Tensor] = None,  # [B, C_h]
     collect_diagnostics: bool = True,
     fuse_fnorm_across_R: bool = False,
+    _fixed_distance_scale: Optional[float] = None,
+    _return_field: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Official drift loss (ImageNet version) ported from JAX to PyTorch.
@@ -1261,11 +1263,16 @@ def drift_loss_imagenet(
         # The original generated pool has unit mass for scale estimation even
         # when part of its force mass is reassigned to historical particles.
         weighted_dist = dist_base * scale_targets_w.unsqueeze(1)
-    scale = _ratio_of_means(
-        weighted_dist,
-        scale_targets_w,
-        use_global_stats=global_scale_stats,
-    )
+    if _fixed_distance_scale is None:
+        scale = _ratio_of_means(
+            weighted_dist,
+            scale_targets_w,
+            use_global_stats=global_scale_stats,
+        )
+    else:
+        scale = gen.new_tensor(float(_fixed_distance_scale))
+        if not torch.isfinite(scale) or scale <= 0:
+            raise ValueError("fixed_distance_scale must be finite and positive")
 
     scale_inputs = (scale / (S ** 0.5)).clamp(min=1e-3)
     old_gen_scaled = old_gen / scale_inputs
@@ -1444,12 +1451,192 @@ def drift_loss_imagenet(
         force_across_R.mul_(force_multiplier_f)
     if collect_diagnostics:
         info["force_multiplier"] = force_multiplier_f
+    if _return_field:
+        # Composition needs the first distance scale even when diagnostics are
+        # disabled. The original single-step path does not add this work.
+        info["scale"] = float(scale.item())
+        return force_across_R, scale_inputs_goal, info
     goal_scaled = (old_gen_scaled_goal + force_across_R).detach()
     gen_scaled = gen / scale_inputs_goal
     diff = gen_scaled - goal_scaled
     # Match JAX interface: return per-batch loss, caller decides reduction.
     loss = (diff ** 2).mean(dim=(-1, -2))
 
+    return loss, info
+
+
+
+@torch.no_grad()
+def reverse_drift_field(
+    gen: torch.Tensor,                    # [B, C_g, S]
+    fixed_pos: torch.Tensor,              # [B, C_p, S]
+    fixed_neg: Optional[torch.Tensor] = None,  # [B, C_n, S]
+    weight_gen: Optional[torch.Tensor] = None,  # [B, C_g]
+    weight_pos: Optional[torch.Tensor] = None,  # [B, C_p]
+    weight_neg: Optional[torch.Tensor] = None,  # [B, C_n]
+    R_list: Tuple[float, ...] = (0.02, 0.05, 0.2),
+    compute_wpos_stats: bool = False,
+    active_mask_pos: Optional[torch.Tensor] = None,  # [B, C_p] 1=active, 0=excluded
+    active_mask_neg: Optional[torch.Tensor] = None,  # [B, C_n] 1=active, 0=excluded
+    global_scale_stats: bool = True,
+    global_fnorm_stats: bool = True,
+    top_p: float = 1.0,
+    top_p_min_keep: int = 1,
+    top_k_pos: int = 0,
+    top_k_neg: int = 0,
+    force_multiplier: float = 1.0,
+    affinity_kernel: str = "exponential",
+    kernel_shape: float = 1.0,
+    kernel_adaptive_k_pos: int = 0,
+    kernel_adaptive_k_neg: int = 0,
+    kernel_adaptive_margin: float = 1.05,
+    kernel_mix_weight: float = 0.5,
+    kernel_temperature_mix: Tuple[float, ...] = (),
+    kernel_temperature_mix_weights: Tuple[float, ...] = (),
+    historical_gen: Optional[torch.Tensor] = None,  # [B, C_h, S], detached replay
+    weight_history: Optional[torch.Tensor] = None,  # [B, C_h]
+    collect_diagnostics: bool = True,
+    fuse_fnorm_across_R: bool = False,
+    fixed_distance_scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """Detached normalized reverse field, matching cosmosjhj/I-Drift 27a0e4f.
+
+    Return (field, input_scale, info). The current negative pool is rebuilt
+    from ``gen`` each call; real/history banks remain fixed. A second field
+    reuses the first distance scale while recomputing per-temperature RMS.
+    """
+    return _drift_loss_imagenet_single(
+        gen=gen,
+        fixed_pos=fixed_pos,
+        fixed_neg=fixed_neg,
+        weight_gen=weight_gen,
+        weight_pos=weight_pos,
+        weight_neg=weight_neg,
+        R_list=R_list,
+        compute_wpos_stats=compute_wpos_stats,
+        active_mask_pos=active_mask_pos,
+        active_mask_neg=active_mask_neg,
+        global_scale_stats=global_scale_stats,
+        global_fnorm_stats=global_fnorm_stats,
+        top_p=top_p,
+        top_p_min_keep=top_p_min_keep,
+        top_k_pos=top_k_pos,
+        top_k_neg=top_k_neg,
+        force_multiplier=force_multiplier,
+        affinity_kernel=affinity_kernel,
+        kernel_shape=kernel_shape,
+        kernel_adaptive_k_pos=kernel_adaptive_k_pos,
+        kernel_adaptive_k_neg=kernel_adaptive_k_neg,
+        kernel_adaptive_margin=kernel_adaptive_margin,
+        kernel_mix_weight=kernel_mix_weight,
+        kernel_temperature_mix=kernel_temperature_mix,
+        kernel_temperature_mix_weights=kernel_temperature_mix_weights,
+        historical_gen=historical_gen,
+        weight_history=weight_history,
+        collect_diagnostics=collect_diagnostics,
+        fuse_fnorm_across_R=fuse_fnorm_across_R,
+        _fixed_distance_scale=fixed_distance_scale,
+        _return_field=True,
+    )
+
+
+def drift_loss_imagenet(
+    gen: torch.Tensor,                    # [B, C_g, S]
+    fixed_pos: torch.Tensor,              # [B, C_p, S]
+    fixed_neg: Optional[torch.Tensor] = None,  # [B, C_n, S]
+    weight_gen: Optional[torch.Tensor] = None,  # [B, C_g]
+    weight_pos: Optional[torch.Tensor] = None,  # [B, C_p]
+    weight_neg: Optional[torch.Tensor] = None,  # [B, C_n]
+    R_list: Tuple[float, ...] = (0.02, 0.05, 0.2),
+    compute_wpos_stats: bool = False,
+    active_mask_pos: Optional[torch.Tensor] = None,  # [B, C_p] 1=active, 0=excluded
+    active_mask_neg: Optional[torch.Tensor] = None,  # [B, C_n] 1=active, 0=excluded
+    global_scale_stats: bool = True,
+    global_fnorm_stats: bool = True,
+    top_p: float = 1.0,
+    top_p_min_keep: int = 1,
+    top_k_pos: int = 0,
+    top_k_neg: int = 0,
+    force_multiplier: float = 1.0,
+    affinity_kernel: str = "exponential",
+    kernel_shape: float = 1.0,
+    kernel_adaptive_k_pos: int = 0,
+    kernel_adaptive_k_neg: int = 0,
+    kernel_adaptive_margin: float = 1.05,
+    kernel_mix_weight: float = 0.5,
+    kernel_temperature_mix: Tuple[float, ...] = (),
+    kernel_temperature_mix_weights: Tuple[float, ...] = (),
+    historical_gen: Optional[torch.Tensor] = None,  # [B, C_h, S], detached replay
+    weight_history: Optional[torch.Tensor] = None,  # [B, C_h]
+    collect_diagnostics: bool = True,
+    fuse_fnorm_across_R: bool = False,
+    double_drift_c0: float = 1.0,
+    double_drift_c1: float = 0.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Original loss with optional upstream feature-space Double Drift.
+
+    For coefficients c0,c1 the target is x+c0*V(x)+c1*V(x+c0*V(x)).
+    Both queries and the current generated negative pool move at the second
+    evaluation. Real/history pools stay fixed, distance scale is reused, and
+    each field receives its own per-temperature RMS normalization. The final
+    displacement is not renormalized. Coefficients (1,1) give x+V(x)+V(x+V(x)).
+    Defaults (1,0) run the original target loss and preserve its operations.
+
+    Ported from cosmosjhj/I-Drift commit 27a0e4f; target diagnostics and fused
+    normalization remain supported. No force-balance ablations are enabled.
+    """
+    from .double_drift import validate_double_drift_coefficients
+
+    c0, c1 = validate_double_drift_coefficients(double_drift_c0, double_drift_c1)
+    kwargs = dict(
+        fixed_pos=fixed_pos,
+        fixed_neg=fixed_neg,
+        weight_gen=weight_gen,
+        weight_pos=weight_pos,
+        weight_neg=weight_neg,
+        R_list=R_list,
+        compute_wpos_stats=compute_wpos_stats,
+        active_mask_pos=active_mask_pos,
+        active_mask_neg=active_mask_neg,
+        global_scale_stats=global_scale_stats,
+        global_fnorm_stats=global_fnorm_stats,
+        top_p=top_p,
+        top_p_min_keep=top_p_min_keep,
+        top_k_pos=top_k_pos,
+        top_k_neg=top_k_neg,
+        force_multiplier=force_multiplier,
+        affinity_kernel=affinity_kernel,
+        kernel_shape=kernel_shape,
+        kernel_adaptive_k_pos=kernel_adaptive_k_pos,
+        kernel_adaptive_k_neg=kernel_adaptive_k_neg,
+        kernel_adaptive_margin=kernel_adaptive_margin,
+        kernel_mix_weight=kernel_mix_weight,
+        kernel_temperature_mix=kernel_temperature_mix,
+        kernel_temperature_mix_weights=kernel_temperature_mix_weights,
+        historical_gen=historical_gen,
+        weight_history=weight_history,
+        collect_diagnostics=collect_diagnostics,
+        fuse_fnorm_across_R=fuse_fnorm_across_R,
+    )
+    if c0 == 1.0 and c1 == 0.0:
+        return _drift_loss_imagenet_single(gen, **kwargs)
+    field0, input_scale, info = reverse_drift_field(gen, **kwargs)
+    with torch.no_grad():
+        displacement = c0 * field0
+        if c1 > 0:
+            moved = gen.detach().float() + input_scale * displacement
+            field1, _, second_info = reverse_drift_field(
+                moved, **kwargs, fixed_distance_scale=info["scale"]
+            )
+            displacement = displacement + c1 * field1
+            if collect_diagnostics:
+                info.update({f"double_drift/second/{k}": v for k, v in second_info.items()})
+                info["double_drift/field_cosine"] = float(F.cosine_similarity(
+                    field0.flatten(), field1.flatten(), dim=0
+                ).item())
+                info["double_drift/displacement_rms"] = float(displacement.square().mean().sqrt().item())
+        goal_scaled = gen.detach().float() / input_scale + displacement
+    loss = (gen.float() / input_scale - goal_scaled).square().mean(dim=(-1, -2))
     return loss, info
 
 
@@ -2499,6 +2686,7 @@ def compute_raw_winner_stats(dist_pos: torch.Tensor) -> Dict[str, float]:
 
 
 __all__ = [
+    "reverse_drift_field",
     "drift_loss_imagenet",
     "drift_loss_imagenet_colwise",
     "drift_loss_imagenet_mixed",
