@@ -31,6 +31,43 @@ def _directory_signature(path):
     return [stat.st_dev, stat.st_ino, stat.st_mtime_ns]
 
 
+def _file_signature(path):
+    stat = Path(path).stat()
+    return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
+
+
+def _validate_relocation(cache_path, source_root, metadata):
+    """Validate an explicitly relocated, fully checksum-verified mmap copy.
+
+    The original packing manifest stays unchanged. The relocation certificate
+    binds its payload hashes to local file identities and a small collection
+    of authentic source rows used for the existing startup bitwise audit.
+    """
+    path = cache_path / "relocation.json"
+    certificate = json.loads(path.read_text())
+    rows = sorted(set(np.linspace(0, int(metadata["count"]) - 1,
+                                  min(32, int(metadata["count"])), dtype=np.int64).tolist()))
+    expected = {
+        "schema_version": 1,
+        "kind": "verified_exact_latent_cache_relocation",
+        "original_metadata_sha256": _sha256(cache_path / "metadata.json"),
+        "original_source_root": metadata["source_root"],
+        "source_evidence_root": source_root,
+        "source_evidence_rows": rows,
+        "source_evidence_is_full_dataset": False,
+    }
+    if any(certificate.get(key) != value for key, value in expected.items()):
+        raise ValueError("Relocated latent cache provenance does not match its manifest/source evidence")
+    files = certificate.get("files", {})
+    if set(files) != {"latents.npy", "labels.npy", "source_stats.npy"}:
+        raise ValueError("Relocated latent cache requires all three verified payloads")
+    for name, evidence in files.items():
+        if (evidence.get("sha256") != metadata["files"][name]["sha256"]
+                or evidence.get("signature") != _file_signature(cache_path / name)):
+            raise ValueError(f"Relocated latent payload changed after full checksum verification: {name}")
+    return certificate
+
+
 def flat_latent_count(source_root):
     """Verify both explicitly selected source directories have all numeric IDs."""
     source_root = Path(source_root).resolve(strict=True)
@@ -116,15 +153,22 @@ class MmapLatentDataset(Dataset):
         metadata = self.metadata
         if (metadata.get("schema_version") != 1 or metadata.get("complete") is not True
                 or metadata.get("recipe") != LATENT_CACHE_RECIPE
-                or metadata.get("source_root") != self.root
                 or metadata.get("num_classes") != int(num_classes)):
             raise ValueError("Latent mmap manifest is incomplete or source/recipe/classes do not match")
         self.count = int(metadata["count"])
         self.num_classes = int(num_classes)
         if self.count <= 0 or len(metadata.get("label_counts", [])) != self.num_classes:
             raise ValueError("Invalid latent mmap count or label inventory")
+        self.relocation = None
+        if (self.cache_path / "relocation.json").is_file():
+            self.relocation = _validate_relocation(self.cache_path, self.root, metadata)
+            source_directories = self.relocation.get("source_directories", {})
+        else:
+            if metadata.get("source_root") != self.root:
+                raise ValueError("Latent mmap source does not match its original manifest")
+            source_directories = metadata["source_directories"]
         for directory in (FEATURE_DIRECTORY, LABEL_DIRECTORY):
-            if _directory_signature(Path(self.root) / directory) != metadata["source_directories"][directory]:
+            if _directory_signature(Path(self.root) / directory) != source_directories.get(directory):
                 raise ValueError(f"Latent source directory inventory changed: {directory}")
         self._features = None
         self._labels = None

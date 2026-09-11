@@ -3,6 +3,9 @@
 Source: [`cosmosjhj/I-Drift` at `27a0e4fb54c8ed04e2538831a9df86a85c8c25ef`](https://github.com/cosmosjhj/I-Drift/commit/27a0e4fb54c8ed04e2538831a9df86a85c8c25ef).
 Target base: `myjju08/I-Drift` at `4c26125a6acdd1cff488b6904025996bbb6b8dc5`.
 Both remote main branches were fetched and checked on 2026-09-11.
+This report records the completed algorithm port in target commit `92b803f`.
+The later [srv06 migration](SRV06_EXPERIMENTS.md) extends launch and cache
+transport support; it preserves the audited loss/trainer implementation.
 The target file hashes in [the complete inventory](UPSTREAM_PARITY.json)
 identify the final port contents independently of the commit containing this report.
 

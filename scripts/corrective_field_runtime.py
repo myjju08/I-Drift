@@ -10,16 +10,23 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from scripts.preflight_corrective_field import DATASET_ROWS, GENERATED_PER_STEP, VARIANTS, read_config, sha256
+from scripts.preflight_corrective_field import (
+    DATASET_ROWS, GENERATED_PER_STEP, VARIANTS, read_config, selected_suite_dir, sha256, snapshot_execution,
+)
 
 
 def prepare_workdir(snapshot, variant, run_root, job_id, restart_count):
     snapshot = Path(snapshot).resolve(strict=True)
     source = snapshot / "source"
     manifest = json.loads((snapshot / "source-manifest.json").read_text())
-    config = source / "configs/corrective_field" / f"{variant}.yaml"
+    config = selected_suite_dir(source, manifest) / f"{variant}.yaml"
     identity = {"commit": manifest["commit"], "config_sha256": sha256(config),
                 "variant": variant, "job_id": str(job_id), "snapshot": str(snapshot)}
+    if "execution" in manifest:
+        binding = snapshot_execution(manifest)
+        if Path(run_root).resolve() != Path(binding["run_root"]).resolve():
+            raise ValueError("Run root does not match the immutable execution binding")
+        identity["execution"] = binding
     pointer = snapshot / "workdirs" / f"job{job_id}-{variant}.json"
     arm_root = Path(run_root).resolve() / variant
     if restart_count:

@@ -1,5 +1,10 @@
 # S4 / MAE-256 Corrective Field experiments
 
+The current deployment uses all three arms on **srv06 / six A5000 GPUs**.
+See [SRV06_EXPERIMENTS.md](SRV06_EXPERIMENTS.md) for its copied assets and
+Slurm command. The srv02 profile below remains available with the same
+scientific settings.
+
 ## Source and objective
 
 Replay policies, Double Drift, and attraction/repulsion balance are ported from

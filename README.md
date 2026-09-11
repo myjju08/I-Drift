@@ -25,9 +25,13 @@ and the remaining differences beyond DINO/GAN.
 
 ## Corrective Field: three S4 experiments
 
+The current six-GPU deployment uses **srv06 / RTX A5000**, with the same
+scientific settings and copied assets. See [the srv06 guide](docs/SRV06_EXPERIMENTS.md)
+and `configs/corrective_field_srv06/`. The srv02 configuration remains available.
+
 All three configurations train from scratch for 40 generated-sample epochs
 with the same FP32 latent cache, frozen MAE-256 checkpoint, seed 43, and
-global generated batch 512. Each job uses two GPUs on `srv02`.
+global generated batch 512. Each job uses two GPUs on the selected Slurm node.
 
 | Configuration | Historical replay | Double Drift | GAN |
 | --- | --- | --- | --- |

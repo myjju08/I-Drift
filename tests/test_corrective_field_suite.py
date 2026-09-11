@@ -99,7 +99,7 @@ class CorrectiveFieldSuiteTests(unittest.TestCase):
                 preflight.validate_runtime_environment(cfg)
 
     def test_production_jobs_depend_on_successful_validation(self):
-        def fake_snapshot(root, destination, suite_id):
+        def fake_snapshot(root, destination, suite_id, execution=None):
             destination.mkdir(parents=True)
             return {"commit": "a" * 40}
 
@@ -128,7 +128,7 @@ class CorrectiveFieldSuiteTests(unittest.TestCase):
         self.assertEqual(record["validation"]["variants"], list(preflight.VARIANTS))
 
     def test_selected_replay_arms_never_submit_baseline_and_keep_full_validation(self):
-        def fake_snapshot(root, destination, suite_id):
+        def fake_snapshot(root, destination, suite_id, execution=None):
             destination.mkdir(parents=True)
             return {"commit": "a" * 40}
 
@@ -302,6 +302,68 @@ class CorrectiveFieldSuiteTests(unittest.TestCase):
         report_path.write_text(json.dumps(report))
         with self.assertRaisesRegex(ValueError, "does not match the production suite"):
             preflight.validate_gate_result(snapshot, manifest, self.suite)
+
+    def test_srv06_submits_typed_a5000_jobs_from_the_bound_suite_and_environment(self):
+        shutil.copytree(self.suite, self.root / "configs/corrective_field_srv06")
+        captured = {}
+
+        def fake_snapshot(root, destination, suite_id, execution=None):
+            destination.mkdir(parents=True)
+            captured.update(execution)
+            return {"commit": "a" * 40, "execution": execution}
+
+        commands = []
+
+        def fake_sbatch(command, **kwargs):
+            commands.append(command)
+            return str(9300 + len(commands)) + "\n"
+
+        with (patch.object(submit, "ROOT", self.root),
+              patch.object(submit, "make_snapshot", side_effect=fake_snapshot),
+              patch.object(submit.subprocess, "check_output", side_effect=fake_sbatch),
+              patch("sys.argv", ["submit_corrective_field.py", "--submit", "--node", "srv06"]),
+              redirect_stdout(io.StringIO())):
+            submit.main()
+        self.assertEqual(captured["suite_dir"], "configs/corrective_field_srv06")
+        self.assertEqual(captured["python"], "/data/juhyeong/venvs/replay-drift/bin/python")
+        self.assertEqual(captured["run_root"], "/data/juhyeong/corrective-field-runs")
+        self.assertEqual(len(commands), 4)
+        for command in commands:
+            self.assertIn("--partition=srv06", command)
+            self.assertIn("--nodelist=srv06", command)
+            self.assertIn("--gres=gpu:a5000:2", command)
+        for command in commands[1:]:
+            self.assertIn("--dependency=afterok:9301", command)
+        record = json.loads(next(self.root.rglob("submission.json")).read_text())
+        self.assertEqual(record["execution"], captured)
+
+    def test_hardware_binding_rejects_wrong_nodes_and_gpu_models(self):
+        binding = preflight.execution_binding("srv06")
+        preflight.validate_hardware_binding(binding, "srv06.osilab.work", ["NVIDIA RTX A5000"] * 2)
+        with self.assertRaisesRegex(ValueError, "Expected allocated node srv06"):
+            preflight.validate_hardware_binding(binding, "srv02", ["NVIDIA RTX A5000"] * 2)
+        with self.assertRaisesRegex(ValueError, "Expected srv06 a5000 GPUs"):
+            preflight.validate_hardware_binding(binding, "srv06", ["NVIDIA GeForce RTX 3090"] * 2)
+        with self.assertRaisesRegex(ValueError, "exactly 2 allocated GPUs"):
+            preflight.validate_hardware_binding(binding, "srv06", ["NVIDIA RTX A5000"] * 4)
+        with self.assertRaisesRegex(ValueError, "binding is inconsistent"):
+            preflight.snapshot_execution({"execution": {**binding, "gpu_type": "rtx3090"}})
+
+    def test_srv06_workdir_and_resume_use_manifest_suite_instead_of_srv02_config(self):
+        snapshot = self.root / "srv06_snapshot"
+        suite = snapshot / "source/configs/corrective_field_srv06"
+        shutil.copytree(self.suite, suite)
+        runs = self.root / "srv06_runs"
+        binding = preflight.execution_binding("srv06", run_root=runs)
+        manifest = {"commit": "a" * 40, "execution": binding}
+        (snapshot / "source-manifest.json").write_text(json.dumps(manifest))
+        workdir = runtime.prepare_workdir(snapshot, "replay_only", runs, "9401", 0)
+        self.assertEqual(workdir, runtime.prepare_workdir(snapshot, "replay_only", runs, "9401", 1))
+        self.assertEqual((workdir / "run_metadata/config.yaml").read_bytes(), (suite / "replay_only.yaml").read_bytes())
+        with self.assertRaisesRegex(ValueError, "Run root does not match"):
+            runtime.prepare_workdir(snapshot, "replay_only", self.root / "wrong_runs", "9401", 1)
+        with self.assertRaisesRegex(ValueError, "does not match the immutable execution"):
+            preflight.selected_suite_dir(snapshot / "source", manifest, self.suite)
 
 
 if __name__ == "__main__":

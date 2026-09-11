@@ -24,10 +24,11 @@ case "$CF_VARIANT" in baseline|replay_double|replay_only) ;; *) echo "Unknown va
 : "${SLURM_JOB_ID:?A Slurm allocation is required}"
 : "${CUDA_VISIBLE_DEVICES:?Slurm must assign the requested two GPUs}"
 CF_SOURCE="$CF_SNAPSHOT/source"
-CF_CONFIG="$CF_SOURCE/configs/corrective_field/$CF_VARIANT.yaml"
 test -r "$CF_SNAPSHOT/source-manifest.json"
 test -x "$CF_PYTHON"
 export PYTHONDONTWRITEBYTECODE=1
+CF_SUITE_REL=$("$CF_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("execution", {}).get("suite_dir", "configs/corrective_field"))' "$CF_SNAPSHOT/source-manifest.json")
+CF_CONFIG="$CF_SOURCE/$CF_SUITE_REL/$CF_VARIANT.yaml"
 CF_RESTART_COUNT=${SLURM_RESTART_COUNT:-0}
 CF_WORKDIR=$("$CF_PYTHON" "$CF_SOURCE/scripts/corrective_field_runtime.py" workdir \
   --snapshot "$CF_SNAPSHOT" --variant "$CF_VARIANT" --run-root "$CF_RUN_ROOT" \
@@ -65,7 +66,7 @@ PY
 cd "$CF_SOURCE"
 "$CF_PYTHON" scripts/preflight_corrective_field.py \
   --variant "$CF_VARIANT" --config "$CF_CONFIG" \
-  --suite-dir "$CF_SOURCE/configs/corrective_field" \
+  --suite-dir "$CF_SOURCE/$CF_SUITE_REL" \
   --runtime-source "$CF_SOURCE" --snapshot-manifest "$CF_SNAPSHOT/source-manifest.json" \
   --output "$CF_WORKDIR/run_metadata/input-preflight-restart${CF_RESTART_COUNT}.json"
 if (( CF_RESTART_COUNT > 0 )); then

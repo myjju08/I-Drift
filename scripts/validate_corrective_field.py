@@ -196,7 +196,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot-root", type=Path, required=True)
     parser.add_argument("--workdir", type=Path, required=True)
-    parser.add_argument("--suite-dir", type=Path, default=ROOT / "configs/corrective_field")
+    parser.add_argument("--suite-dir", type=Path, help="Defaults to the suite bound in the immutable source manifest.")
     parser.add_argument("--steps", type=int, default=6)
     args = parser.parse_args()
     if args.steps < 4:
@@ -205,8 +205,12 @@ def main():
         raise RuntimeError("Run only inside a two-GPU Slurm allocation using two-rank torchrun")
     if os.environ.get("WANDB_MODE") != "disabled":
         raise RuntimeError("The bounded validation must use WANDB_MODE=disabled")
-    from scripts.preflight_corrective_field import validate_snapshot, validate_suite, validate_assets, sha256, VARIANTS
+    from scripts.preflight_corrective_field import (
+        selected_suite_dir, snapshot_execution, validate_allocated_hardware,
+        validate_snapshot, validate_suite, validate_assets, sha256, VARIANTS,
+    )
     manifest = validate_snapshot(ROOT, args.snapshot_root / "source-manifest.json")
+    args.suite_dir = selected_suite_dir(ROOT, manifest, args.suite_dir)
     validate_suite(args.suite_dir)
     # Snapshot validation precedes importing the training implementation.
     import torch
@@ -217,8 +221,7 @@ def main():
     rank, world_size, device = trainer.setup_distributed()
     if world_size != 2 or device.type != "cuda" or torch.cuda.device_count() != 2:
         raise RuntimeError("The validation requires exactly two allocated CUDA devices")
-    if "3090" not in torch.cuda.get_device_name(device):
-        raise RuntimeError("Expected an allocated srv02 RTX3090")
+    validate_allocated_hardware(manifest)
     configs = {name: trainer.load_yaml_config(str(args.suite_dir / f"{name}.yaml")) for name in VARIANTS}
     cfg = configs["baseline"]
     # The same assertions are inexpensive enough on local SSD to check per rank.
@@ -277,6 +280,7 @@ def main():
             "kind": "corrective_field_gpu_validation", "status": "passed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "commit": manifest["commit"], "suite_id": manifest["suite_id"],
+            "execution": snapshot_execution(manifest),
             "source_manifest_sha256": sha256(args.snapshot_root / "source-manifest.json"),
             "source_files_sha256": manifest["files_sha256"],
             "config_sha256": {name: sha256(args.suite_dir / f"{name}.yaml") for name in VARIANTS},

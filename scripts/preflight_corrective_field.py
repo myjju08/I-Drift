@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import socket
 import sys
 
 import yaml
@@ -23,6 +24,75 @@ DATASET_ROWS = 1_281_168
 GENERATED_PER_STEP = 512
 MAE_SHA256 = "59c269f99d83645b6c7bb2bf832711aa83d894998259a1ada16c0c9ed7836081"
 VAE_SHA256 = "a1d993488569e928462932c8c38a0760b874d166399b14414135bd9c42df5815"
+NODE_PROFILES = {
+    "srv02": {"gpu_type": "rtx3090", "gpu_name_token": "3090",
+              "suite_dir": "configs/corrective_field",
+              "python": "/home/juhyeong/.venvs/replay-drift/bin/python",
+              "run_root": "/home/juhyeong/corrective-field-runs"},
+    "srv06": {"gpu_type": "a5000", "gpu_name_token": "a5000",
+              "suite_dir": "configs/corrective_field_srv06",
+              "python": "/data/juhyeong/venvs/replay-drift/bin/python",
+              "run_root": "/data/juhyeong/corrective-field-runs"},
+}
+
+
+def execution_binding(node="srv02", *, suite_dir=None, python=None, run_root=None):
+    profile = NODE_PROFILES[node]
+    return {"node": node, "partition": node, "gpu_type": profile["gpu_type"],
+            "gpus_per_arm": 2, "cpus_per_arm": 6, "memory_per_arm": "80G",
+            "time_limit": "3-00:00:00", "suite_dir": str(suite_dir or profile["suite_dir"]),
+            "python": str(python or profile["python"]), "run_root": str(run_root or profile["run_root"])}
+
+
+def snapshot_execution(manifest):
+    # Older immutable srv02 snapshots predate explicit hardware metadata.
+    binding = manifest.get("execution", execution_binding())
+    node = binding.get("node")
+    if node not in NODE_PROFILES:
+        raise ValueError(f"Unsupported snapshot node: {node}")
+    expected = execution_binding(node, suite_dir=binding.get("suite_dir"),
+                                 python=binding.get("python"), run_root=binding.get("run_root"))
+    if binding != expected:
+        raise ValueError("Snapshot hardware/resource binding is inconsistent")
+    suite_path = Path(binding["suite_dir"])
+    if suite_path.is_absolute() or ".." in suite_path.parts:
+        raise ValueError("Snapshot suite_dir must remain inside the source archive")
+    return binding
+
+
+def selected_suite_dir(source_root, manifest, requested=None):
+    source_root = Path(source_root).resolve()
+    expected = (source_root / snapshot_execution(manifest)["suite_dir"]).resolve(strict=True)
+    if not expected.is_relative_to(source_root):
+        raise ValueError("Suite directory escapes the source archive")
+    if requested is not None and Path(requested).resolve() != expected:
+        raise ValueError("Requested suite directory does not match the immutable execution binding")
+    return expected
+
+
+def validate_hardware_binding(binding, node, gpu_names):
+    expected_node = binding["node"]
+    if str(node).split(".", 1)[0] != expected_node:
+        raise ValueError(f"Expected allocated node {expected_node}, got {node}")
+    if len(gpu_names) != binding["gpus_per_arm"]:
+        raise ValueError(f"Expected exactly {binding['gpus_per_arm']} allocated GPUs, got {len(gpu_names)}")
+    token = NODE_PROFILES[expected_node]["gpu_name_token"]
+    if any(token not in name.lower() for name in gpu_names):
+        raise ValueError(f"Expected {expected_node} {binding['gpu_type']} GPUs, got {gpu_names}")
+
+
+def validate_allocated_hardware(manifest=None):
+    import torch
+    if not os.environ.get("SLURM_JOB_ID"):
+        raise ValueError("An allocated Slurm job is required")
+    binding = snapshot_execution(manifest or {})
+    if manifest and "execution" in manifest:
+        if os.path.abspath(sys.executable) != os.path.abspath(binding["python"]):
+            raise ValueError("Worker interpreter does not match the immutable execution binding")
+    gpu_names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+    node = os.environ.get("SLURMD_NODENAME") or socket.gethostname()
+    validate_hardware_binding(binding, node, gpu_names)
+    return gpu_names
 
 
 class UniqueKeyLoader(yaml.SafeLoader):
@@ -137,6 +207,7 @@ def validate_snapshot(source_root, manifest_path):
         raise ValueError("Unexpected source snapshot manifest")
     if not manifest.get("commit") or len(manifest["commit"]) != 40:
         raise ValueError("Snapshot must identify a full Git commit")
+    snapshot_execution(manifest)
     for relative, expected in manifest["files_sha256"].items():
         path = source_root / relative
         if not path.resolve(strict=True).is_relative_to(source_root):
@@ -149,7 +220,7 @@ def validate_snapshot(source_root, manifest_path):
     return manifest
 
 
-def validate_runtime_environment(cfg):
+def validate_runtime_environment(cfg, manifest=None):
     if os.environ.get("WANDB_MODE") != "online":
         raise ValueError("Production requires WANDB_MODE=online")
     for name, expected in (("WANDB_PROJECT", cfg["project"]), ("WANDB_ENTITY", cfg["entity"])):
@@ -157,13 +228,7 @@ def validate_runtime_environment(cfg):
             raise ValueError(f"{name} must match the checked configuration")
     if os.environ.get("WANDB_DISABLED") or os.environ.get("WANDB_RUN_ID"):
         raise ValueError("Production requires a fresh online W&B run")
-    import torch
-    if torch.cuda.device_count() != 2:
-        raise ValueError(f"Each suite arm requires exactly 2 visible GPUs, got {torch.cuda.device_count()}")
-    names = [torch.cuda.get_device_name(i) for i in range(2)]
-    if any("3090" not in name for name in names):
-        raise ValueError(f"Expected the requested srv02 RTX3090 GPUs, got {names}")
-    return names
+    return validate_allocated_hardware(manifest)
 
 
 def validate_gate_result(snapshot_root, manifest, suite_dir):
@@ -181,6 +246,8 @@ def validate_gate_result(snapshot_root, manifest, suite_dir):
         "config_sha256": expected_configs, "world_size": 2,
         "geometry_per_rank": {"B": 8, "P": 32, "N": 32, "G": 32, "H_if_replay": 16},
     }
+    if "execution" in manifest:
+        expected["execution"] = snapshot_execution(manifest)
     changed = [key for key, value in expected.items() if report.get(key) != value]
     if changed or int(report.get("steps_per_variant", 0)) < 4:
         raise ValueError(f"Validation report does not match the production suite: {changed}")
@@ -232,7 +299,8 @@ def validate_assets(cfg):
         "feature_checkpoint": str(checkpoint), "feature_checkpoint_sha256": MAE_SHA256,
         "evaluation_decoder": {"path": str(decoder), "weights_sha256": VAE_SHA256,
                                "config_sha256": sha256(decoder / "config.json")},
-        "data": dataset.metadata, "exact_bitwise_source_rows_checked": rows,
+        "data": dataset.metadata, "cache_relocation": getattr(dataset, "relocation", None),
+        "exact_bitwise_source_rows_checked": rows,
     }
 
 
@@ -257,9 +325,11 @@ def main():
         raise ValueError("Launched config does not match its named suite arm")
     manifest = (validate_snapshot(args.runtime_source, args.snapshot_manifest)
                 if args.snapshot_manifest else None)
+    if manifest:
+        selected_suite_dir(args.runtime_source, manifest, args.suite_dir)
     gate = (validate_gate_result(args.snapshot_manifest.parent, manifest, args.suite_dir)
             if manifest else None)
-    gpu_names = validate_runtime_environment(cfg)
+    gpu_names = validate_runtime_environment(cfg, manifest)
     report = {
         "kind": "corrective_field_preflight", "variant": args.variant,
         "checked_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -267,6 +337,7 @@ def main():
         "config_sha256": sha256(args.config),
         "suite_config_sha256": {name: sha256(args.suite_dir / f"{name}.yaml") for name in VARIANTS},
         "source_sha256": manifest["files_sha256"] if manifest else None,
+        "execution": snapshot_execution(manifest or {}),
         "two_gpu_validation": gate,
         "allowed_arm_differences": sorted(ALLOWED_DIFFERENCES),
         "gpu_names": gpu_names, "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
