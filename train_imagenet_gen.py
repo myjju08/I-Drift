@@ -922,7 +922,7 @@ def save_checkpoint(
     if adversarial_system is not None:
         payload["adversarial_system"] = adversarial_system.state_dict()
     latest = ckpt_dir / "ckpt_latest.pt"
-    if adversarial_system is not None and bool(cfg.get("checkpoint_latest_hardlink", False)):
+    if bool(cfg.get("checkpoint_latest_hardlink", False)):
         # Publish a new inode before replacing either name: a previous latest
         # can be hardlinked to a retained numbered checkpoint and must never
         # be truncated in place, including a repeated save of the same step.
@@ -1019,18 +1019,26 @@ def load_checkpoint(
 def build_adversarial_system(
     cfg: dict, device: torch.device
 ) -> Optional[AdversarialDriftSystem]:
-    """Build the optional raw-image branch without consuming the generator RNG."""
+    """Build the optional sample-space GAN without consuming generator RNG."""
     mode = str(cfg.get("adversarial_mode", "none")).strip().lower()
     if mode in {"", "none", "off"}:
         return None
     if mode not in {"raw_gan", "feature_drift", "mixed"}:
         raise ValueError(f"Unknown adversarial_mode={mode!r}")
-    if bool(cfg.get("use_latent", True)) or int(cfg.get("in_channels", 3)) != 3:
-        raise ValueError("The adversarial branch requires raw RGB generator outputs")
+    feature_name = resolve_feature_extractor_name(cfg)
+    latent = bool(cfg.get("use_latent", True))
+    channels = int(cfg.get("in_channels", 3))
+    output_channels = int(cfg.get("out_channels", channels))
+    rgb_branch = not latent and channels == output_channels == 3
+    latent_mae_branch = (latent and channels == output_channels == 4
+                        and feature_name == "mae" and mode == "raw_gan")
+    if not (rgb_branch or latent_mae_branch):
+        raise ValueError("The adversarial branch requires raw RGB outputs or "
+                         "four-channel latent MAE outputs with raw_gan mode")
     if bool(cfg.get("feature_adapter", False)) or bool(cfg.get("feature_gan", False)):
         raise ValueError("The adversarial branch requires the unchanged frozen encoder")
-    if resolve_feature_extractor_name(cfg) != "dino_resnet50":
-        raise ValueError("The adversarial experiments require the frozen DINO baseline")
+    if feature_name != "dino_resnet50" and mode != "raw_gan":
+        raise ValueError("Adversarial feature drift requires the frozen DINO structure teacher")
     samples_per_class = int(cfg.get("adversarial_samples_per_class", 8))
     if samples_per_class <= 0:
         raise ValueError("adversarial_samples_per_class must be positive")
@@ -1071,6 +1079,9 @@ class Logger:
         self.rank = rank
         self.log_file = Path(workdir) / "train_log.jsonl"
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        require_wandb = bool(cfg.get("require_wandb", False))
+        if require_wandb and not bool(cfg.get("use_wandb", False)):
+            raise ValueError("require_wandb=true requires use_wandb=true")
         self.use_wandb = bool(cfg.get("use_wandb", False)) and rank == 0
         self.console_log = bool(cfg.get("console_log", True)) and rank == 0
         self.wandb_log_min_step = int(cfg.get("wandb_log_min_step", 0) or 0)
@@ -1140,6 +1151,10 @@ class Logger:
                         wandb.init(**init_kwargs)
                         forked = True
                     elif run_id is not None and ("previously created and deleted" in err_text or "try a new run id" in err_text):
+                        if require_wandb:
+                            raise RuntimeError(
+                                f"Cannot resume required W&B run {run_id}; refusing to split the experiment"
+                            ) from init_err
                         print(f"[W&B] stored run id {run_id} is invalid; starting a fresh run.")
                         try:
                             run_id_file.unlink()
@@ -1155,6 +1170,17 @@ class Logger:
                         )
                     else:
                         raise
+                if require_wandb:
+                    run = getattr(wandb, "run", None)
+                    if run is None:
+                        raise RuntimeError("W&B initialization returned no active run")
+                    mode = getattr(getattr(run, "settings", None), "mode", None)
+                    if mode != "online":
+                        raise RuntimeError(
+                            f"Required W&B run is not online (mode={mode!r})"
+                        )
+                    if run.url:
+                        print(f"[W&B] Online run: {run.url}", flush=True)
                 # Save run_id for future resumes (overwrite if we just forked into a new run).
                 if forked or not run_id_file.exists():
                     run_id_file.write_text(wandb.run.id)
@@ -1167,6 +1193,10 @@ class Logger:
             except Exception as e:
                 print(f"[W&B] init failed: {e}.")
                 self.use_wandb = False
+                if require_wandb:
+                    raise RuntimeError(
+                        "Online W&B logging is required; initialization failed."
+                    ) from e
 
     @staticmethod
     def _fmt_console_value(value: Any) -> str:
@@ -1189,6 +1219,7 @@ class Logger:
             "lr",
             "time/step",
             "time/per_step",
+            "time/iteration_recent100",
             "kimg",
             "mix_alpha_tracker/versionb_coef",
         ]
@@ -1340,8 +1371,34 @@ def _resolve_mae_cfg(cfg: dict, state: Any) -> dict:
     return mae_cfg
 
 
+from models.frozen_mae import FrozenMAEFeatureExtractor
+
+
+def _load_mae_encoder(checkpoint_path: str, cfg: dict, device: torch.device) -> FrozenMAEFeatureExtractor:
+    """Strictly validate the full MAE, then place only its frozen encoder."""
+    if not checkpoint_path:
+        raise ValueError("Frozen MAE feature extraction requires a pretrained checkpoint")
+    if not Path(checkpoint_path).is_file():
+        raise FileNotFoundError(f"MAE checkpoint not found: {checkpoint_path}")
+    # Load/validate on CPU so checkpoint tensors do not double GPU residency.
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)
+    mae_cfg = _resolve_mae_cfg(cfg, state)
+    with torch.device("meta"):
+        mae = build_mae_from_config(mae_cfg)
+    sd, source = _extract_mae_state_dict(state)
+    # Partial/random metrics would silently change the scientific objective.
+    mae.load_state_dict(sd, strict=True, assign=True)
+    # Canonical loading retains FP32 stored parameters, using autocast only for
+    # feature compute. Encoder-only residency does not alter those weights.
+    mae = FrozenMAEFeatureExtractor(mae.float().eval().requires_grad_(False), cfg).to(device)
+    print(f"[MAE] Loaded {source} from {checkpoint_path}; config={mae_cfg}")
+    return mae
+
+
 def load_mae(checkpoint_path: str, cfg: dict, device: torch.device) -> MAEResNet:
-    """Load a pre-trained MAEResNet and freeze it."""
+    """Load a pretrained MAE, optionally retaining only its frozen encoder."""
+    if bool(cfg.get("feature_encoder_only", False)):
+        return _load_mae_encoder(checkpoint_path, cfg, device)
     state: Any = None
     if checkpoint_path:
         # This converted checkpoint contains both model and EMA trees.  Keep the
@@ -1853,6 +1910,7 @@ def compute_drift_loss_from_features(
     historical_count: int = 0,
     weight_gen: Optional[torch.Tensor] = None,
     weight_history: Optional[torch.Tensor] = None,
+    double_drift: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute total drift loss by summing over all feature maps.
 
@@ -1881,6 +1939,8 @@ def compute_drift_loss_from_features(
     _raw_collected = False
 
     mode = str(drift_matching).lower().strip()
+    if double_drift and mode != "rev-drift":
+        raise ValueError("double_drift requires rev-drift")
     use_version_b   = mode in ("fwd-drift",)
     use_mixed_bv    = mode in ("dual-drift",)
     if not any([use_version_b, use_mixed_bv]) and mode not in ("rev-drift",):
@@ -2080,6 +2140,7 @@ def compute_drift_loss_from_features(
                 top_k_pos=feature_top_k_pos,
                 top_k_neg=feature_top_k_neg,
                 force_multiplier=rev_drift_force_multiplier,
+                double_drift=double_drift,
                 affinity_kernel=rev_drift_affinity_kernel,
                 kernel_shape=rev_drift_kernel_shape,
                 kernel_adaptive_k_pos=rev_drift_kernel_adaptive_k_pos,
@@ -2998,6 +3059,7 @@ def train_step(
         rev_drift_kernel_mix_weight=rev_drift_kernel_mix_weight,
         rev_drift_kernel_temperature_mix=rev_drift_kernel_temperature_mix,
         rev_drift_kernel_temperature_mix_weights=rev_drift_kernel_temperature_mix_weights,
+        double_drift=bool(cfg.get("double_drift", False)),
         historical_feats=historical_feats,
         historical_count=H,
         weight_gen=weight_gen_replay,
@@ -3687,6 +3749,125 @@ def train_step(
 # ---------------------------------------------------------------------------
 # FID evaluation (lightweight: saves generated images + uses torchmetrics)
 # ---------------------------------------------------------------------------
+
+from train.evaluation_runtime import run_rank_zero_evaluation, validate_evaluation_metrics
+
+
+def _run_generator_evaluation(
+    *, cfg, rank, world_size, device, step, generated_epochs, generator,
+    feature_extractor, ema, pos_banks, eval_loader, eval_postprocess_fn,
+    cfg_list, eval_samples, workdir, logger, feature_discriminator=None,
+):
+    """Common step-0/periodic evaluation with optional all-rank strictness."""
+    required = bool(cfg.get("require_eval_metrics", False))
+
+    def evaluate():
+        if eval_loader is None or eval_postprocess_fn is None:
+            message = "eval_loader/eval_postprocess_fn is None"
+            if required:
+                raise RuntimeError(f"Required evaluation at step {step}: {message}")
+            print(f"[eval] {message}. Skipping eval.")
+            return
+        scales = cfg_list[:3]  # Keep the established during-training protocol.
+        if required and not scales:
+            raise RuntimeError(f"Required evaluation at step {step} has no CFG scales")
+        print(f"[eval] Preparing rank-0 eval at step {step}...")
+        suspended_banks = []
+        try:
+            for bank in pos_banks:
+                if isinstance(bank, CompressedPixelMemoryBank):
+                    suspended_banks.append(bank)
+                    bank.suspend_codec_workers()
+            # Never move a rank-0-only DDP module: its reducer retains device-
+            # specific parameter/bucket references needed by the next backward.
+            if world_size == 1:
+                generator.to("cpu")
+            feature_extractor.to("cpu")
+            if feature_discriminator is not None and world_size == 1:
+                feature_discriminator.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            ema.shadow.to(device)
+            ema.shadow.eval()
+            log_eval = {"eval/generated_epochs": float(generated_epochs)}
+            for eval_cfg_scale in scales:
+                stats = eval_fid_is(
+                    ema.shadow, eval_postprocess_fn, eval_loader, device,
+                    cfg_scale=eval_cfg_scale, n_samples=eval_samples,
+                    workdir=workdir, step=step, label=f"CFG{eval_cfg_scale}",
+                )
+                validate_evaluation_metrics(
+                    stats, required=required, step=step, cfg_scale=eval_cfg_scale,
+                )
+                if stats.get("fid") is not None:
+                    fid = float(stats["fid"])
+                    log_eval[f"fid/cfg{eval_cfg_scale}"] = fid
+                    print(f"[step {step}] FID@CFG{eval_cfg_scale} = {fid:.4f}")
+                if stats.get("is_mean") is not None:
+                    is_mean = float(stats["is_mean"])
+                    is_std = float(stats.get("is_std", 0.0) or 0.0)
+                    log_eval[f"is/cfg{eval_cfg_scale}"] = is_mean
+                    print(f"[step {step}] IS@CFG{eval_cfg_scale} = {is_mean:.4f} +/- {is_std:.4f}")
+                    if stats.get("is_std") is not None:
+                        log_eval[f"is_std/cfg{eval_cfg_scale}"] = float(stats["is_std"])
+            # Merge step-0 eval with the first committed training row as before.
+            if step == 0:
+                logger.log(log_eval, step=step, commit=False)
+            else:
+                logger.log(log_eval, step=step)
+        finally:
+            # Attempt every restoration even if one fails. The outer guard
+            # reports cleanup failures collectively rather than hanging peers.
+            print("[eval] Reloading training models back to training device...")
+            cleanup_errors = []
+
+            def restore(action):
+                try:
+                    action()
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+
+            # Latent evaluation keeps a decoder-only model on GPU temporarily.
+            # Offload it before restoring the training feature encoder; the
+            # callback is absent for direct RGB postprocessing.
+            release_decoder = getattr(eval_postprocess_fn, "release", None)
+            if callable(release_decoder):
+                restore(release_decoder)
+            restore(gc.collect)
+            if torch.cuda.is_available():
+                restore(torch.cuda.empty_cache)
+            if step != 0:
+                for bank in suspended_banks:
+                    restore(bank.resume_codec_workers)
+            restore(lambda: ema.shadow.to(device))
+            restore(lambda: feature_extractor.to(device))
+            if feature_discriminator is not None and world_size == 1:
+                restore(lambda: feature_discriminator.to(device))
+            if world_size == 1:
+                restore(lambda: generator.to(device))
+            restore(gc.collect)
+            if torch.cuda.is_available():
+                if step == 0 and device.type == "cuda":
+                    restore(lambda: torch.cuda.synchronize(device))
+                restore(torch.cuda.empty_cache)
+            if step == 0:
+                for bank in suspended_banks:
+                    restore(bank.resume_codec_workers)
+            restore(generator.train)
+            if cleanup_errors:
+                raise RuntimeError(
+                    f"Evaluation cleanup failed at step {step}: "
+                    + "; ".join(str(exc) for exc in cleanup_errors)
+                ) from cleanup_errors[0]
+
+    run_rank_zero_evaluation(
+        evaluate, rank=rank, world_size=world_size, device=device, step=step,
+        require_eval_metrics=required,
+        preserve_rng_during_eval=bool(cfg.get("preserve_rng_during_eval", False)),
+    )
+    if rank != 0:
+        generator.train()
+
 
 def _build_eval_metric(metric_cls, **kwargs):
     # In DDP, rank-0-only eval must not trigger torchmetrics all_gather sync.
@@ -4495,7 +4676,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     if adversarial_system is not None and is_main_process(rank):
         print(
             f"[adversarial] mode={adversarial_system.mode} "
-            "frozen DINO drift unchanged; generator uses the previous target snapshot",
+            "frozen encoder drift plus adversarial supervision; previous target snapshot",
             flush=True,
         )
 
@@ -4604,6 +4785,11 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         use_latent=use_latent,
         use_cache=use_cache,
         cache_path=cache_path,
+        cache_format=str(cfg.get("cache_format", "pt_imagefolder")),
+        latent_mmap_cache_path=str(cfg.get("latent_mmap_cache_path", "")),
+        latent_decoder_path=str(cfg.get("latent_decoder_path", "")),
+        latent_scaling_factor=float(cfg.get("latent_scaling_factor", 0.18215)),
+        num_classes=int(cfg.get("num_classes", 1000)),
         num_workers=int(cfg.get("num_workers", 8)),
         prefetch_factor=prefetch_factor,
         pin_memory=bool(cfg.get("pin_memory", True)),
@@ -4636,6 +4822,11 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             use_latent=use_latent,
             use_cache=use_cache,
             cache_path=cache_path,
+            cache_format=str(cfg.get("cache_format", "pt_imagefolder")),
+            latent_mmap_cache_path=str(cfg.get("latent_mmap_cache_path", "")),
+            latent_decoder_path=str(cfg.get("latent_decoder_path", "")),
+            latent_scaling_factor=float(cfg.get("latent_scaling_factor", 0.18215)),
+            num_classes=int(cfg.get("num_classes", 1000)),
             num_workers=int(cfg.get("num_workers", 8)),
             prefetch_factor=eval_prefetch_factor,
             pin_memory=bool(cfg.get("pin_memory", True)),
@@ -5183,6 +5374,18 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 flush=True,
             )
 
+    if historical_replay_bank is not None and 0 < start_step < historical_replay_start_step:
+        capture_path = Path(workdir) / (
+            f"historical_gen_replay_capture_step{start_step:07d}_rank{rank:02d}.npz"
+        )
+        if not capture_path.is_file():
+            raise FileNotFoundError(
+                f"Cannot resume replay capture before its freeze boundary; missing {capture_path}"
+            )
+        historical_replay_bank.load_npz(capture_path)
+        if is_main_process(rank):
+            print(f"[historical-replay] restored capture at step {start_step}", flush=True)
+
     total_steps  = int(cfg.get("total_steps", 200000))
     save_per     = int(cfg.get("save_per_step", 2000))
     eval_per     = int(cfg.get("eval_per_step", 5000))
@@ -5208,89 +5411,14 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     # --- Optional step-0 eval (baseline before any training) ---
     eval_at_start = bool(cfg.get("eval_at_start", False))
     if start_step == 0 and eval_at_start:
-        if world_size > 1:
-            dist.barrier()
-        if is_main_process(rank):
-            if eval_loader is None or eval_postprocess_fn is None:
-                print("[eval] Step-0 eval skipped: eval_loader/eval_postprocess_fn is None.")
-            else:
-                print("[eval] Running step-0 baseline eval...")
-                for bank in pos_banks:
-                    if isinstance(bank, CompressedPixelMemoryBank):
-                        bank.suspend_codec_workers()
-                try:
-                    # DDP reducers retain parameter/bucket references created
-                    # at construction time. Moving a rank-0-only DDP module
-                    # CPU -> CUDA invalidates those references and desynchronizes
-                    # the next backward pass from the waiting rank(s). Keep DDP
-                    # modules on their construction device; 48 GiB A6000 jobs
-                    # have ample headroom for the temporary eval models.
-                    if world_size == 1:
-                        generator.to("cpu")
-                    feature_extractor.to("cpu")
-                    if feature_discriminator is not None and world_size == 1:
-                        feature_discriminator.to("cpu")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    ema.shadow.to(device)
-                    ema.shadow.eval()
-                    # Keep an explicit generated-epoch axis beside the W&B
-                    # step so baseline/10-epoch evaluations are unambiguous.
-                    log_eval: Dict[str, float] = {"eval/generated_epochs": 0.0}
-                    for eval_cfg_scale in cfg_list[:3]:
-                        eval_stats = eval_fid_is(
-                            ema.shadow, eval_postprocess_fn, eval_loader, device,
-                            cfg_scale=eval_cfg_scale,
-                            n_samples=eval_samples,
-                            workdir=workdir,
-                            step=0,
-                            label=f"CFG{eval_cfg_scale}",
-                        )
-                        if eval_stats.get("fid") is not None:
-                            fid = float(eval_stats["fid"])
-                            log_eval[f"fid/cfg{eval_cfg_scale}"] = fid
-                            print(f"[step 0] FID@CFG{eval_cfg_scale} = {fid:.4f}")
-                        if eval_stats.get("is_mean") is not None:
-                            is_mean = float(eval_stats["is_mean"])
-                            log_eval[f"is/cfg{eval_cfg_scale}"] = is_mean
-                            is_std = float(eval_stats.get("is_std", 0.0) or 0.0)
-                            print(f"[step 0] IS@CFG{eval_cfg_scale} = {is_mean:.4f} +/- {is_std:.4f}")
-                            if eval_stats.get("is_std") is not None:
-                                log_eval[f"is_std/cfg{eval_cfg_scale}"] = float(eval_stats["is_std"])
-                    if log_eval:
-                        # Merge baseline metrics into the first training row;
-                        # the step-0 train log below commits the combined row.
-                        logger.log(log_eval, step=0, commit=False)
-                except Exception as e:
-                    print(f"[eval] Step-0 eval failed: {e}")
-                    traceback.print_exc()
-                finally:
-                    # Mirror the step-N eval cleanup: gc.collect before reload so
-                    # eval-time references (Inception V3 inside torchmetrics,
-                    # generated/real image tensors) actually free GPU memory
-                    # before train models are loaded back.
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    ema.shadow.to(device)
-                    feature_extractor.to(device)
-                    if world_size == 1:
-                        generator.to(device)
-                    if feature_discriminator is not None and world_size == 1:
-                        feature_discriminator.to(device)
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize(device)
-                        torch.cuda.empty_cache()
-                    for bank in pos_banks:
-                        if isinstance(bank, CompressedPixelMemoryBank):
-                            bank.resume_codec_workers()
-        if world_size > 1:
-            dist.barrier()
-        if torch.cuda.is_available() and device.type == "cuda":
-            torch.cuda.synchronize(device)
-            torch.cuda.empty_cache()
-        generator.train()
+        _run_generator_evaluation(
+            cfg=cfg, rank=rank, world_size=world_size, device=device,
+            step=0, generated_epochs=0.0, generator=generator,
+            feature_extractor=feature_extractor, ema=ema, pos_banks=pos_banks,
+            eval_loader=eval_loader, eval_postprocess_fn=eval_postprocess_fn,
+            cfg_list=cfg_list, eval_samples=eval_samples, workdir=workdir,
+            logger=logger, feature_discriminator=feature_discriminator,
+        )
     elif start_step == 0 and is_main_process(rank):
         print("[eval] Skipping step-0 eval (eval_at_start=false).")
 
@@ -5573,7 +5701,9 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                         "Historical replay snapshot warmup missed classes: "
                         f"{missing_classes[:20].tolist()}"
                     )
-                historical_replay_bank.save_npz(historical_replay_path)
+                frozen_temp = historical_replay_path.with_suffix(".tmp.npz")
+                historical_replay_bank.save_npz(frozen_temp)
+                os.replace(frozen_temp, historical_replay_path)
                 if is_main_process(rank):
                     print(
                         "[historical-replay] froze epoch "
@@ -5642,6 +5772,18 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         else:
             save_due = (step + 1) % save_per == 0
         if save_due or (step + 1) == total_steps:
+            # Capture is rank-local. Publish it before the matching model
+            # checkpoint so a time-limit restart cannot lose pre-freeze history.
+            if historical_replay_bank is not None and step + 1 < historical_replay_start_step:
+                capture_path = Path(workdir) / (
+                    f"historical_gen_replay_capture_step{step + 1:07d}_rank{rank:02d}.npz"
+                )
+                capture_temp = capture_path.with_suffix(".tmp.npz")
+                historical_replay_bank.save_npz(capture_temp)
+                os.replace(capture_temp, capture_path)
+            if historical_replay_bank is not None and world_size > 1:
+                # Also wait for both final frozen snapshots at the epoch boundary.
+                dist.barrier()
             if is_main_process(rank):
                 save_checkpoint(
                     workdir,
@@ -5672,91 +5814,16 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         else:
             eval_due = (step + 1) % eval_per == 0
         if eval_due or (step + 1) == total_steps:
-            # Barrier: ensure all ranks finish the current training step before
-            # rank 0 starts eval. Without this, other ranks proceed to the next
-            # train_step (which triggers a DDP all_reduce) while rank 0 is still
-            # in eval → deadlock.
-            if world_size > 1:
-                dist.barrier()
-            if is_main_process(rank):
-                if eval_loader is None or eval_postprocess_fn is None:
-                    print("[eval] eval_loader/eval_postprocess_fn is None. Skipping eval.")
-                else:
-                    # Keep DDP modules on the devices where their reducers were
-                    # constructed. Rank-0-only CPU round trips corrupt reducer
-                    # bucket state and deadlock the following backward pass.
-                    print(f"[eval] Preparing rank-0 eval at step {step+1}...")
-                    for bank in pos_banks:
-                        if isinstance(bank, CompressedPixelMemoryBank):
-                            bank.suspend_codec_workers()
-                    try:
-                        if world_size == 1:
-                            generator.to("cpu")
-                        feature_extractor.to("cpu")
-                        if feature_discriminator is not None and world_size == 1:
-                            feature_discriminator.to("cpu")
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        ema.shadow.to(device)
-                        ema.shadow.eval()
-                        log_eval: Dict[str, float] = {
-                            "eval/generated_epochs": (
-                                (step + 1) * generated_per_step
-                                / generated_epoch_size
-                            )
-                        }
-                        for eval_cfg_scale in cfg_list[:3]:  # limit to first 3 during training
-                            eval_stats = eval_fid_is(
-                                ema.shadow, eval_postprocess_fn, eval_loader, device,
-                                cfg_scale=eval_cfg_scale,
-                                n_samples=eval_samples,
-                                workdir=workdir,
-                                step=step + 1,
-                                label=f"CFG{eval_cfg_scale}",
-                            )
-                            if eval_stats.get("fid") is not None:
-                                fid = float(eval_stats["fid"])
-                                log_eval[f"fid/cfg{eval_cfg_scale}"] = fid
-                                print(f"[step {step+1}] FID@CFG{eval_cfg_scale} = {fid:.4f}")
-                            if eval_stats.get("is_mean") is not None:
-                                is_mean = float(eval_stats["is_mean"])
-                                log_eval[f"is/cfg{eval_cfg_scale}"] = is_mean
-                                is_std = float(eval_stats.get("is_std", 0.0) or 0.0)
-                                print(f"[step {step+1}] IS@CFG{eval_cfg_scale} = {is_mean:.4f} +/- {is_std:.4f}")
-                                if eval_stats.get("is_std") is not None:
-                                    log_eval[f"is_std/cfg{eval_cfg_scale}"] = float(eval_stats["is_std"])
-                        if log_eval:
-                            logger.log(log_eval, step=step + 1)
-                    except Exception as e:
-                        print(f"[eval] Eval failed at step {step+1}: {e}")
-                        traceback.print_exc()
-                    finally:
-                        # Reload training models back to GPU.
-                        print(f"[eval] Reloading training models back to GPU...")
-                        # Drop any eval-time references (Inception V3 inside torchmetrics,
-                        # generated/real image tensors) before they collide with the
-                        # reloaded train models. empty_cache alone won't free memory
-                        # held by live Python references — we need gc.collect first.
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        for bank in pos_banks:
-                            if isinstance(bank, CompressedPixelMemoryBank):
-                                bank.resume_codec_workers()
-                        ema.shadow.to(device)
-                        feature_extractor.to(device)
-                        if world_size == 1:
-                            generator.to(device)
-                        if feature_discriminator is not None and world_size == 1:
-                            feature_discriminator.to(device)
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-            # Barrier: make other ranks wait here until rank 0 finishes eval,
-            # so the next train_step's DDP all_reduce can proceed safely.
-            if world_size > 1:
-                dist.barrier()
-            generator.train()
+            _run_generator_evaluation(
+                cfg=cfg, rank=rank, world_size=world_size, device=device,
+                step=step + 1,
+                generated_epochs=(step + 1) * generated_per_step / generated_epoch_size,
+                generator=generator, feature_extractor=feature_extractor, ema=ema,
+                pos_banks=pos_banks, eval_loader=eval_loader,
+                eval_postprocess_fn=eval_postprocess_fn, cfg_list=cfg_list,
+                eval_samples=eval_samples, workdir=workdir, logger=logger,
+                feature_discriminator=feature_discriminator,
+            )
 
     if is_main_process(rank):
         logger.finish()

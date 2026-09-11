@@ -1,4 +1,33 @@
-# ReplayDrift
+# I-Drift
+
+## Corrective Field: S4 / MAE256
+
+The active three-run suite uses this repository's reverse drift with the same
+existing ImageNet latent cache and frozen MAE256 checkpoint on `srv02`.
+
+| Run | Generator supervision |
+| --- | --- |
+| `baseline` | MAE reverse drift |
+| `replay_double` | MAE + frozen epoch-10 replay (`rho=0.35`) + double drift |
+| `replay_double_gan` | The same replay and double drift + `0.1` non-saturating GAN loss |
+
+Double drift constructs the detached feature target `x + V(x) + V(x + V(x))`.
+The second field evaluation uses the same reference particles and calibration.
+Each run trains S4 for 40 generated epochs, with P32/N32/G32, seed43, and two
+RTX3090 GPUs. W&B records all three under **Corrective Field**.
+
+[Run instructions, exact settings, validation and evaluation limits](docs/CORRECTIVE_FIELD.md)
+are kept together with the [three matched configs](configs/corrective_field).
+Submission freezes the committed code, queues a two-GPU validation job, and
+starts the three training jobs only after that validation succeeds.
+
+```bash
+python scripts/preflight_corrective_field.py --config-only
+python scripts/submit_corrective_field.py          # inspect the commands
+python scripts/submit_corrective_field.py --submit # queue validation and training
+```
+
+The earlier experiment families and their original presets are documented below.
 
 ### Learning from Its Own Past through Repulsive Generative Replay
 

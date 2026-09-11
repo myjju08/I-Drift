@@ -1,8 +1,8 @@
 """CPU checks for the live DINO replay and MAE structure-teacher contracts.
 
 Behavioral tests run in any checkout. Optional source comparisons additionally
-run when IDRIFT_LIVE_WORKSPACE (default: this checkout's parent) contains the
-original experiment directories; no checkpoints, data, or GPUs are required.
+run only when IDRIFT_LIVE_WORKSPACE explicitly selects the original
+archived experiment directories; no checkpoints, data, or GPUs are required.
 """
 from __future__ import annotations
 
@@ -172,7 +172,7 @@ class LivePortBehaviorTest(unittest.TestCase):
                 self.assertEqual(metrics["adversarial/structure_loss"], 0)
                 self.assertTrue(all(p.grad is None for p in teacher.parameters()))
 
-    @unittest.skipUnless(LIVE_DINO.is_file(), "Live DINO source is unavailable")
+    @unittest.skipUnless(os.environ.get("IDRIFT_LIVE_WORKSPACE") and LIVE_DINO.is_file(), "Live DINO source is unavailable")
     def test_live_dino_and_port_match_loss_gradients_and_next_states_exactly(self):
         live_step = _live_train_step()
         for mode, structure, replay in (
@@ -201,7 +201,7 @@ class LivePortBehaviorTest(unittest.TestCase):
 
 
 class LiveSourceParityTest(unittest.TestCase):
-    @unittest.skipUnless(LIVE_DINO.is_file(), "Live DINO source is unavailable")
+    @unittest.skipUnless(os.environ.get("IDRIFT_LIVE_WORKSPACE") and LIVE_DINO.is_file(), "Live DINO source is unavailable")
     def test_train_step_is_live_dino_with_only_the_mae_teacher_guards(self):
         source = ast.parse(LIVE_DINO.read_text())
         expected = next(node for node in source.body
@@ -227,7 +227,7 @@ class LiveSourceParityTest(unittest.TestCase):
         self.assertEqual(normalizer.count, 2)
         self.assertEqual(ast.dump(normalized), ast.dump(expected))
 
-    @unittest.skipUnless((LIVE_WORKSPACE / "I-Drift/models/adversarial_drift.py").is_file(),
+    @unittest.skipUnless(os.environ.get("IDRIFT_LIVE_WORKSPACE") and (LIVE_WORKSPACE / "I-Drift/models/adversarial_drift.py").is_file(),
                          "Original shared source is unavailable")
     def test_shared_training_math_matches_original_files(self):
         # Direct comparison supplements numerical tests: these helpers are also

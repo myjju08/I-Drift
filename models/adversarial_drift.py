@@ -267,7 +267,7 @@ class AdversarialDriftSystem:
                 "fuse_grad_reduce": False,
             }.items()
         }
-        system = cls(device, num_classes=int(cfg.get("num_classes", 1000)), in_channels=3, **arguments)
+        system = cls(device, num_classes=int(cfg.get("num_classes", 1000)), in_channels=int(cfg.get("in_channels", 3)), **arguments)
         # Include trainer-owned weights/sampling policy in resume validation.
         system._config_fields = copy.deepcopy({key: value for key, value in cfg.items() if key.startswith("adversarial_")})
         return system

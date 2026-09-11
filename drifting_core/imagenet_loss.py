@@ -1116,6 +1116,89 @@ def reverse_drift_raw_fields(
     return tuple(fields)
 
 
+@torch.no_grad()
+def _reverse_drift_force_at_query(
+    query: torch.Tensor,
+    current_reference: torch.Tensor,
+    fixed_pos: torch.Tensor,
+    fixed_repulsive: Optional[torch.Tensor],
+    *,
+    targets_w: torch.Tensor,
+    self_mask: torch.Tensor,
+    scale: torch.Tensor,
+    scale_inputs: torch.Tensor,
+    force_scales: Tuple[torch.Tensor, ...],
+    R_list: Tuple[float, ...],
+    local_bandwidth: Optional[torch.Tensor],
+    top_p: float,
+    top_p_min_keep: int,
+    top_k_pos: int,
+    top_k_neg: int,
+    affinity_kernel: str,
+    kernel_shape: float,
+    kernel_mix_weight: float,
+    kernel_temperature_mix: Tuple[float, ...],
+    kernel_temperature_mix_weights: Tuple[float, ...],
+) -> torch.Tensor:
+    """Evaluate the same normalized field at shifted queries, with fixed banks.
+
+    Input/distance scales, per-temperature force RMS scales, adaptive
+    bandwidths, and the original generated-particle self indices all come
+    from the first evaluation. Only query distances and affinities change.
+    The return value is a displacement in normalized feature coordinates.
+    """
+    distances = [_cdist_batched(query, current_reference)]
+    if fixed_repulsive is not None:
+        distances.append(_cdist_batched(query, fixed_repulsive))
+    distances.append(_cdist_batched(query, fixed_pos))
+    dist_normed = torch.cat(distances, dim=2) / scale.clamp(min=1e-3)
+    del distances
+    # Preserve the canonical diagonal penalty, including exponential's
+    # existing affinity floor. Sample identities persist after the shift;
+    # independent replay entries remain outside this generated-self mask.
+    dist_normed.add_(self_mask * 100.0)
+    split_idx = targets_w.shape[1] - fixed_pos.shape[1]
+    force = torch.zeros_like(query)
+    for R, force_scale in zip(R_list, force_scales):
+        affinity = _reverse_mutual_affinity(
+            dist_normed,
+            bandwidth=R,
+            kernel=affinity_kernel,
+            shape=kernel_shape,
+            local_bandwidth=local_bandwidth,
+            self_mask=self_mask,
+            mix_weight=kernel_mix_weight,
+            temperature_mix=kernel_temperature_mix,
+            temperature_mix_weights=kernel_temperature_mix_weights,
+        )
+        affinity = affinity * targets_w.unsqueeze(1)
+        aff_pos, pos_indices = _truncate_force_group(
+            affinity[:, :, split_idx:],
+            top_p=top_p,
+            top_p_min_keep=top_p_min_keep,
+            top_k=top_k_pos,
+        )
+        aff_neg, neg_indices = _truncate_force_group(
+            affinity[:, :, :split_idx],
+            top_p=top_p,
+            top_p_min_keep=top_p_min_keep,
+            top_k=top_k_neg,
+        )
+        coeff_neg = -aff_neg * aff_pos.sum(dim=2, keepdim=True)
+        coeff_pos = aff_pos * aff_neg.sum(dim=2, keepdim=True)
+        force_R = _accumulate_weighted_targets(
+            coeff_neg, neg_indices, current_reference, fixed_repulsive,
+        )
+        _accumulate_weighted_targets(
+            coeff_pos, pos_indices, fixed_pos, out=force_R,
+        )
+        total_coeffs = coeff_neg.sum(dim=2) + coeff_pos.sum(dim=2)
+        force_R.addcmul_(query, total_coeffs.unsqueeze(-1), value=-1.0)
+        force_R.div_(scale_inputs)
+        force = force + force_R / force_scale
+    return force
+
+
 def drift_loss_imagenet(
     gen: torch.Tensor,                    # [B, C_g, S]
     fixed_pos: torch.Tensor,              # [B, C_p, S]
@@ -1146,6 +1229,7 @@ def drift_loss_imagenet(
     weight_history: Optional[torch.Tensor] = None,  # [B, C_h]
     collect_diagnostics: bool = True,
     fuse_fnorm_across_R: bool = False,
+    double_drift: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Official drift loss (ImageNet version) ported from JAX to PyTorch.
@@ -1158,7 +1242,17 @@ def drift_loss_imagenet(
     ``fuse_fnorm_across_R`` trades VRAM for fewer distributed collectives: all
     per-temperature force tensors remain resident until their FP64 sum-square
     and count pairs can be reduced in one packed vector.
+
+    ``double_drift`` changes the detached target to ``x + V(x) + V(x + V(x))``
+    in feature space. The second evaluation holds the original generated,
+    real, and replay reference banks fixed. Distance/input scales, each
+    temperature's force RMS normalizer, and optional adaptive bandwidths are
+    estimated once at ``x`` and reused, so both evaluations use the same field
+    calibration. The force multiplier applies to each displacement. The
+    default single-step loss and its numerical operations are unchanged.
     """
+    if double_drift and not R_list:
+        raise ValueError("double_drift requires at least one temperature")
     B, C_g, S = gen.shape
     C_p = fixed_pos.shape[1]
     (
@@ -1317,6 +1411,7 @@ def drift_loss_imagenet(
     force_across_R = torch.zeros_like(old_gen_scaled_goal)
     fuse_global_fnorm = bool(fuse_fnorm_across_R) and global_fnorm_stats
     forces_pending_fnorm = []
+    first_force_scales = []
 
     for R in R_list:
         affinity = _reverse_mutual_affinity(
@@ -1419,6 +1514,8 @@ def drift_loss_imagenet(
                 info[f"loss_{R}"] = float(f_norm_val.item())
 
             force_scale = f_norm_val.clamp(min=1e-8).sqrt()
+            if double_drift:
+                first_force_scales.append(force_scale)
             force_across_R = force_across_R + total_force_R / force_scale
 
     if forces_pending_fnorm:
@@ -1433,6 +1530,8 @@ def drift_loss_imagenet(
             if collect_diagnostics:
                 info[f"loss_{R}"] = float(f_norm_val.item())
             force_scale = f_norm_val.clamp(min=1e-8).sqrt()
+            if double_drift:
+                first_force_scales.append(force_scale)
             force_across_R = force_across_R + total_force_R / force_scale
 
     force_multiplier_f = float(force_multiplier)
@@ -1444,6 +1543,41 @@ def drift_loss_imagenet(
         force_across_R.mul_(force_multiplier_f)
     if collect_diagnostics:
         info["force_multiplier"] = force_multiplier_f
+    if double_drift:
+        with torch.no_grad():
+            shifted_query = old_gen + force_across_R * scale_inputs
+            second_force = _reverse_drift_force_at_query(
+                shifted_query,
+                old_gen,
+                fixed_pos,
+                fixed_repulsive,
+                targets_w=targets_w,
+                self_mask=block_mask,
+                scale=scale,
+                scale_inputs=scale_inputs,
+                force_scales=tuple(first_force_scales),
+                R_list=R_list,
+                local_bandwidth=local_bandwidth,
+                top_p=top_p,
+                top_p_min_keep=top_p_min_keep,
+                top_k_pos=top_k_pos,
+                top_k_neg=top_k_neg,
+                affinity_kernel=affinity_kernel,
+                kernel_shape=kernel_shape,
+                kernel_mix_weight=kernel_mix_weight,
+                kernel_temperature_mix=kernel_temperature_mix,
+                kernel_temperature_mix_weights=kernel_temperature_mix_weights,
+            )
+            second_force.mul_(force_multiplier_f)
+            if collect_diagnostics:
+                info["double_drift/enabled"] = 1.0
+                info["double_drift/first_force_rms"] = float(
+                    _mean_square_detached(force_across_R, False).sqrt().item()
+                )
+                info["double_drift/second_force_rms"] = float(
+                    _mean_square_detached(second_force, False).sqrt().item()
+                )
+            force_across_R = force_across_R + second_force
     goal_scaled = (old_gen_scaled_goal + force_across_R).detach()
     gen_scaled = gen / scale_inputs_goal
     diff = gen_scaled - goal_scaled

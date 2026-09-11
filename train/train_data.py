@@ -163,6 +163,10 @@ def create_imagenet_split(
     use_cache: bool = False,
     cache_path: str = "",
     cache_format: str = "pt_imagefolder",   # "pt_imagefolder" | "npy_flat"
+    latent_mmap_cache_path: str = "",
+    latent_decoder_path: str = "",
+    latent_scaling_factor: float = 0.18215,
+    num_classes: int = 1000,
     num_workers: int = 8,
     prefetch_factor: int = 2,
     pin_memory: bool = True,
@@ -184,6 +188,19 @@ def create_imagenet_split(
         - preprocess_fn: (images, labels) batch → {"images": BCHW, "labels": B}
         - postprocess_fn: generated latents/pixels → pixel images in [0, 1]
     """
+    # Explicit local-cache/decoder paths opt into byte-preserving latent inputs.
+    # The existing online-VAE and .pt cache interfaces keep their defaults.
+    exact_latent_inputs = bool(latent_mmap_cache_path or latent_decoder_path)
+    if exact_latent_inputs:
+        if not (use_latent and use_cache):
+            raise ValueError("Exact latent inputs require use_latent=true and use_cache=true")
+        if cache_format != "npy_flat" or resolution != 256:
+            raise ValueError("Exact latent inputs require cache_format='npy_flat' and resolution=256")
+        if not cache_path:
+            raise ValueError("cache_path must identify the original flat latent source")
+        if use_aug:
+            raise ValueError("Exact latent inputs contain no declared augmentations; use_aug must be false")
+
     if return_uint8 and (split != "train" or use_latent or use_cache):
         raise ValueError(
             "return_uint8 is only valid for a direct raw training split "
@@ -202,7 +219,16 @@ def create_imagenet_split(
             "raw_image_io_semaphore requires raw_image_io_concurrency > 0"
         )
 
-    if use_cache:
+    if exact_latent_inputs and split == "train":
+        from train.latent_data import FlatNpyLatentDataset, MmapLatentDataset
+
+        if latent_mmap_cache_path:
+            ds = MmapLatentDataset(
+                latent_mmap_cache_path, source_root=cache_path, num_classes=num_classes,
+            )
+        else:
+            ds = FlatNpyLatentDataset(cache_path, num_classes=num_classes)
+    elif use_cache and not exact_latent_inputs:
         if not cache_path:
             raise ValueError(
                 "cache_path must be set when use_cache=True. "
@@ -275,6 +301,26 @@ def create_imagenet_split(
         persistent_workers=keep_workers,
         worker_init_fn=lambda wid: _worker_init_fn(wid, rank),
     )
+
+    if exact_latent_inputs:
+        from train.latent_decoder import LatentDecoderPostprocessor
+
+        def preprocess_fn(batch):
+            images, label = batch
+            if not isinstance(images, torch.Tensor):
+                images = torch.from_numpy(np.asarray(images))
+            if isinstance(label, np.ndarray):
+                label = torch.from_numpy(label)
+            return {"images": images.float(), "labels": label}
+
+        # Flat npy files contain training latents only. Validation above keeps
+        # the original sorted raw RGB ImageFolder and deterministic center crop;
+        # only generated latents are decoded, with no VAE encoder calls.
+        postprocess_fn = LatentDecoderPostprocessor(
+            model_path=latent_decoder_path or vae_model_id,
+            scaling_factor=latent_scaling_factor,
+        )
+        return loader, preprocess_fn, postprocess_fn
 
     if use_latent or use_cache:
         from vae_imagenet import get_vae_enc_dec
