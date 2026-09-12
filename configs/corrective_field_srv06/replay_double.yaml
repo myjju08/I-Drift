@@ -5,7 +5,7 @@
 logging:
   project: Corrective Field
   entity: a01065522071-kaist-digital-humanities-and-social-science
-  name: S4 / MAE + Replay rho0.35 e10 frozen + Double Drift c1=1 / P32 N32 G32 / B512
+  name: S4 / MAE + Replay rho0.35 e10 frozen + Double Drift c0=0.75 c1=0.25 / P32 N32 G32 / B512
     s43
   use_wandb: true
   require_wandb: true
@@ -178,8 +178,8 @@ train:
   cudnn_benchmark: false
   diagnostics_every_k: 100
   double_drift_mode: feature
-  double_drift_c0: 1.0
-  double_drift_c1: 1.0
+  double_drift_c0: 0.75
+  double_drift_c1: 0.25
 feature:
   mae_use_remat: false
   feature_precast_conv_weights: true

@@ -19,7 +19,7 @@ The three new arms use the root trainer and a common frozen MAE-256:
 | Arm | Replay | Double Drift | Adversarial objective |
 | --- | --- | --- | --- |
 | `baseline` | Disabled | Disabled | Disabled |
-| `replay_double` | `rho=0.35`, `H=16`, freeze at generated epoch 10 | Feature, `(c0,c1)=(1,1)` | Disabled |
+| `replay_double` | `rho=0.35`, `H=16`, freeze at generated epoch 10 | Feature, `(c0,c1)=(0.75,0.25)` | Disabled |
 | `replay_only` | Same | Disabled | Disabled |
 
 Comparing `replay_only` with `baseline` measures replay's contribution.
@@ -40,8 +40,8 @@ u2 = stopgrad(u1 + c1 * V(u1))
 loss = mean((u - u2)^2)
 ```
 
-The production settings use `c0=c1=1`, matching
-`u + V(u) + V(u + V(u))`. The second evaluation rebuilds both the generated
+The production settings use `c0=0.75`, `c1=0.25`, matching
+`u + 0.75*V(u) + 0.25*V(u + 0.75*V(u))`. The second evaluation rebuilds both the generated
 queries and generated negative particles at the moved features. Real
 positive/negative features, replay particles, labels, CFG weights, and the
 first distance scale stay fixed. The second field has its own force RMS
@@ -62,13 +62,21 @@ L = sum((x0-x2)^2) / (2*a)
 
 Its sample gradient is `c0*g0+c1*g1`, and the first probe distance is
 `c0*sample_step_rms`. The upstream reported `(0.75,0.25)` sample-space
-experiments are distinct from this requested feature-space `(1,1)` suite.
+experiments use a different correction space from this feature-space
+`(0.75,0.25)` suite, despite having the same coefficients.
 
 The enabled trainer modes default to coefficients `(0.75,0.25)` and sample
-probe RMS `0.1`; the suite explicitly overrides the feature coefficients to
-`(1,1)`. Both Double Drift modes currently require reverse drift without
+probe RMS `0.1`; the suite explicitly sets the feature coefficients to
+`(0.75,0.25)`. Both Double Drift modes currently require reverse drift without
 learned feature adapters or GAN branches. Unsupported combinations raise an
 error instead of silently changing the objective.
+
+On 2026-09-12 the Double Drift arm was changed from `(1,1)` to `(0.75,0.25)`
+at the user's request and restarted from scratch with a fresh W&B run.
+The existing baseline and Replay-only runs continue from their original
+immutable snapshot. This coefficient correction does not resume the old
+Double Drift checkpoint or its epoch-10 Replay bank; the new arm recollects
+its history and freezes it after its own first ten generated epochs.
 
 ## Replay updates
 

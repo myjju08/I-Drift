@@ -47,8 +47,8 @@ def validate_step_metrics(metrics, *, variant, step):
     if not math.isclose(metrics["loss"], metrics["drift_loss"], rel_tol=1e-7, abs_tol=1e-7):
         raise AssertionError(f"Unexpected auxiliary generator objective in {variant}")
     if variant == "replay_double":
-        if metrics["double_drift/c0"] != 1.0 or metrics["double_drift/c1"] != 1.0:
-            raise AssertionError("Authentic feature Double Drift must use coefficients (1, 1)")
+        if metrics["double_drift/c0"] != 0.75 or metrics["double_drift/c1"] != 0.25:
+            raise AssertionError("The requested feature Double Drift must use coefficients (0.75, 0.25)")
     elif any("double_drift/" in key for key in metrics):
         raise AssertionError(f"Double Drift activated in {variant}")
 

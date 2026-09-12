@@ -36,11 +36,11 @@ global generated batch 512. Each job uses two GPUs on the selected Slurm node.
 | Configuration | Historical replay | Double Drift | GAN |
 | --- | --- | --- | --- |
 | [baseline](configs/corrective_field/baseline.yaml) | Off | Off | Off |
-| [replay_double](configs/corrective_field/replay_double.yaml) | `rho=0.35`, bank frozen at epoch 10 | Feature, `c0=c1=1` | Off |
+| [replay_double](configs/corrective_field/replay_double.yaml) | `rho=0.35`, bank frozen at epoch 10 | Feature, `c0=0.75`, `c1=0.25` | Off |
 | [replay_only](configs/corrective_field/replay_only.yaml) | Same | Off | Off |
 
 For the selected feature-space method, normalized features move according to
-`u1 = u + V(u)` and `u2 = u1 + V(u1)`. Both generated queries and generated
+`u1 = u + 0.75*V(u)` and `u2 = u1 + 0.25*V(u1)`. Both generated queries and generated
 negative particles move for the second field evaluation; real and historical
 references stay fixed. The final displacement is not normalized again.
 All three arms have GAN supervision disabled.
@@ -68,8 +68,8 @@ train:
   historical_gen_replay_update_interval_steps: 1
   historical_gen_replay_usage_budget: 4
   double_drift_mode: feature            # off | feature | sample
-  double_drift_c0: 1.0
-  double_drift_c1: 1.0
+  double_drift_c0: 0.75
+  double_drift_c1: 0.25
   rev_drift_balance_delta: 0.0
   rev_drift_balance_anneal_steps: 0
   rev_drift_balance_diagnostics: false

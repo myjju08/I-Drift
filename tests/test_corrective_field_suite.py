@@ -38,7 +38,8 @@ class CorrectiveFieldSuiteTests(unittest.TestCase):
         self.assertEqual(configs["baseline"]["total_steps"], 100092)
         self.assertEqual(configs["baseline"]["double_drift_mode"], "off")
         self.assertEqual(configs["replay_double"]["double_drift_mode"], "feature")
-        self.assertEqual(configs["replay_double"]["double_drift_c1"], 1.0)
+        self.assertEqual(configs["replay_double"]["double_drift_c0"], 0.75)
+        self.assertEqual(configs["replay_double"]["double_drift_c1"], 0.25)
         self.assertEqual(configs["replay_only"]["double_drift_c1"], 0.0)
         self.assertTrue(configs["replay_only"]["historical_gen_replay"])
         self.assertTrue(all(not cfg["feature_gan"] and cfg["adversarial_mode"] == "none" for cfg in configs.values()))
@@ -47,6 +48,22 @@ class CorrectiveFieldSuiteTests(unittest.TestCase):
         self.edit("replay_double", "optimizer", "lr", 0.004)
         with self.assertRaisesRegex(ValueError, "Unmatched replay_double.*lr"):
             preflight.validate_suite(self.suite)
+
+    def test_old_double_coefficients_and_changed_control_coefficients_are_rejected(self):
+        self.edit("replay_double", "train", "double_drift_c0", 1.0)
+        self.edit("replay_double", "train", "double_drift_c1", 1.0)
+        with self.assertRaisesRegex(ValueError, "Wrong double_drift_c0 for replay_double"):
+            preflight.validate_suite(self.suite)
+        self.edit("replay_double", "train", "double_drift_c0", 0.75)
+        with self.assertRaisesRegex(ValueError, "Wrong double_drift_c1 for replay_double"):
+            preflight.validate_suite(self.suite)
+        self.edit("replay_double", "train", "double_drift_c1", 0.25)
+        for variant in ("baseline", "replay_only"):
+            with self.subTest(variant=variant):
+                self.edit(variant, "train", "double_drift_c0", 0.75)
+                with self.assertRaisesRegex(ValueError, f"Wrong double_drift_c0 for {variant}"):
+                    preflight.validate_suite(self.suite)
+                self.edit(variant, "train", "double_drift_c0", 1.0)
 
     def test_wrong_named_arm_rejected(self):
         self.edit("replay_double", "train", "double_drift_mode", "off")
@@ -270,8 +287,15 @@ class CorrectiveFieldSuiteTests(unittest.TestCase):
         gate.validate_step_metrics(metrics, variant="replay_only", step=3)
         with self.assertRaisesRegex(AssertionError, "Missing gate metrics"):
             gate.validate_step_metrics(metrics, variant="replay_double", step=3)
-        doubled = {**metrics, "double_drift/c0": 1.0, "double_drift/c1": 1.0}
+        doubled = {**metrics, "double_drift/c0": 0.75, "double_drift/c1": 0.25}
         gate.validate_step_metrics(doubled, variant="replay_double", step=3)
+        for c0, c1 in ((1.0, 1.0), (1.0, 0.25), (0.75, 1.0), (0.25, 0.75)):
+            with self.subTest(c0=c0, c1=c1):
+                with self.assertRaisesRegex(AssertionError, "coefficients"):
+                    gate.validate_step_metrics(
+                        {**metrics, "double_drift/c0": c0, "double_drift/c1": c1},
+                        variant="replay_double", step=3,
+                    )
         with self.assertRaisesRegex(AssertionError, "Double Drift activated"):
             gate.validate_step_metrics(doubled, variant="replay_only", step=3)
         with self.assertRaisesRegex(AssertionError, "GAN metrics appeared"):

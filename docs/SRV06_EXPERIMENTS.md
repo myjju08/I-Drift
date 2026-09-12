@@ -9,7 +9,7 @@ frozen MAE-256, unchanged FP32 latents, and no GAN loss.
 | --- | --- | --- |
 | `baseline` | Off | Off |
 | `replay_only` | rho 0.35, frozen bank at epoch 10 | Off |
-| `replay_double` | rho 0.35, frozen bank at epoch 10 | Feature `(c0,c1)=(1,1)` |
+| `replay_double` | rho 0.35, frozen bank at epoch 10 | Feature `(c0,c1)=(0.75,0.25)` |
 
 Attraction/repulsion balance stays at delta 0 in all arms. The DINO/GAN
 implementations and optional balance/Replay policies remain available in the
@@ -65,6 +65,9 @@ python scripts/submit_corrective_field.py \
 ```
 
 The immutable source manifest binds the selected node, GPU type and suite.
+To replace only the Double Drift arm while existing controls continue, use
+`--variants replay_double`. This creates a fresh source snapshot, validation
+job, workdir and W&B run; it does not resume a previous coefficient setting.
 Slurm requests two A5000 GPUs, six CPUs and 80 GiB RAM per production arm.
 On srv06 the snapshot also binds `NCCL_P2P_DISABLE=1`. A controlled two-rank
 Slurm probe on GPU 0/1 reproduced a first-collective timeout with default

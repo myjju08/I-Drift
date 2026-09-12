@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 VARIANTS = ("baseline", "replay_double", "replay_only")
 ALLOWED_DIFFERENCES = {
-    "name", "historical_gen_replay", "double_drift_mode", "double_drift_c1",
+    "name", "historical_gen_replay", "double_drift_mode", "double_drift_c0", "double_drift_c1",
 }
 ENTITY = "a01065522071-kaist-digital-humanities-and-social-science"
 DATASET_ROWS = 1_281_168
@@ -164,7 +164,8 @@ def validate_suite(suite_dir):
         expected_variant = {
             "historical_gen_replay": variant != "baseline",
             "double_drift_mode": "feature" if variant == "replay_double" else "off",
-            "double_drift_c1": 1.0 if variant == "replay_double" else 0.0,
+            "double_drift_c0": 0.75 if variant == "replay_double" else 1.0,
+            "double_drift_c1": 0.25 if variant == "replay_double" else 0.0,
         }
         for key, value in expected_variant.items():
             if cfg.get(key) != value:
@@ -198,7 +199,6 @@ def validate_suite(suite_dir):
         "historical_gen_replay_ratio_ramp_start_step": 0,
         "historical_gen_replay_ratio_ramp_end_step": 0,
         "historical_gen_current_weight": None, "historical_gen_history_weight": None,
-        "double_drift_c0": 1.0,
         "adversarial_mode": "none", "adversarial_loss_weight": 0.0,
     }
     failed = [f"{key}: expected {value!r}, got {common.get(key)!r}"

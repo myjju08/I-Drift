@@ -42,8 +42,10 @@ continues to reject learned feature adapters and GAN/adversarial systems;
 these combinations are not newly supported by this port. Existing DINO/GAN
 entry points and the target raw/compressed bank classes are preserved.
 
-The S4 suite explicitly keeps `rho=0.35`, frozen Replay at generated epoch 10,
+The port-validation S4 suite used `rho=0.35`, frozen Replay at generated epoch 10,
 `delta=0`, and feature Double Drift `(c0,c1)=(1,1)` in the double arm only.
+The user changed the current double-arm coefficients to `(0.75,0.25)` on
+2026-09-12; both coefficient pairs are covered by the parity checks below.
 No GAN term is enabled. See [the README controls](../README.md#replay-and-attractionrepulsion-controls)
 and [the experiment guide](CORRECTIVE_FIELD.md).
 
