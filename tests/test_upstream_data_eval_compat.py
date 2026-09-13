@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.eval_official_imagenet256 import _load_imagenet_val_labels, PixelDecodeModule
+from scripts.eval_official_imagenet256 import _load_imagenet_val_labels, PixelDecodeModule, VaeDecodeModule
 from train.train_data import _resolve_npy_flat_split, create_imagenet_split
 import vae_imagenet
 
@@ -54,6 +54,30 @@ def test_vae_variant_keywords_and_legacy_positional_variant_preserve_explicit_mo
         assert load.call_args.kwargs["model_id"] == "stabilityai/sd-vae-ft-mse"
     with pytest.raises(ValueError, match="Unknown SD-VAE variant"):
         vae_imagenet.get_vae_enc_dec(variant="invalid")
+
+
+def test_offline_eval_uses_pinned_decoder_and_scaling_with_legacy_fallback():
+    from types import SimpleNamespace
+    from scripts import eval_official_imagenet256 as evaluator
+
+    class Decoder(torch.nn.Module):
+        def decode(self, value):
+            self.received = value
+            return SimpleNamespace(sample=value[:, :3])
+
+    decoder = Decoder()
+    with mock.patch.object(evaluator, "load_vae", return_value=decoder) as load:
+        module = VaeDecodeModule(torch.device("cpu"), "/pinned/sd-vae-ft-mse", 0.5)
+        result = module(torch.full((1, 4, 2, 2), 0.25))
+        load.assert_called_once_with(device=torch.device("cpu"), model_id="/pinned/sd-vae-ft-mse")
+        torch.testing.assert_close(decoder.received, torch.full((1, 4, 2, 2), 0.5))
+        torch.testing.assert_close(result, torch.full((1, 3, 2, 2), 0.75))
+    with mock.patch.object(evaluator, "_load_vae", return_value=decoder) as load:
+        assert VaeDecodeModule(torch.device("cpu")).scaling_factor == 0.18215
+        load.assert_called_once_with(torch.device("cpu"))
+    for invalid in (0, -1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="scaling factor"):
+            VaeDecodeModule(torch.device("cpu"), scaling_factor=invalid)
 
 
 def test_val_label_loading_uses_numeric_flat_order_and_environment_override(tmp_path, monkeypatch):

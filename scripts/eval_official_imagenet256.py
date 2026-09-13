@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.imagenet_generator import build_ditgen_from_config  # noqa: E402
 from train_imagenet_gen import _amp_ctx, _gen_use_bf16, load_yaml_config  # noqa: E402
 from utils import EMA  # noqa: E402
-from vae_imagenet import _load_vae  # noqa: E402
+from vae_imagenet import _load_vae, load_vae  # noqa: E402
 
 
 def _softmax_np(logits: np.ndarray) -> np.ndarray:
@@ -215,12 +215,16 @@ class NpzArrayReader:
 
 
 class VaeDecodeModule(nn.Module):
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, model_path: Optional[str] = None,
+                 scaling_factor: float = 0.18215) -> None:
         super().__init__()
-        self.vae = _load_vae(device)
+        self.scaling_factor = float(scaling_factor)
+        if not math.isfinite(self.scaling_factor) or self.scaling_factor <= 0:
+            raise ValueError("Latent scaling factor must be finite and positive")
+        self.vae = load_vae(device=device, model_id=model_path) if model_path else _load_vae(device)
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        images = self.vae.decode(latents.float() / 0.18215).sample
+        images = self.vae.decode(latents.float() / self.scaling_factor).sample
         return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
 
 
@@ -740,6 +744,14 @@ def main() -> None:
     t_start = time.time()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    # DataParallel replicas sample noise internally. Give each device its own
+    # reproducible stream so equal-sized replicas do not reuse identical noise.
+    cuda_seeds = []
+    for device_index in range(torch.cuda.device_count()):
+        device_seed = int(args.seed) + device_index
+        with torch.cuda.device(device_index):
+            torch.cuda.manual_seed(device_seed)
+        cuda_seeds.append(device_seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = load_yaml_config(args.config)
@@ -764,6 +776,7 @@ def main() -> None:
     print(f"[eval] n_samples={args.n_samples}")
     print(f"[eval] batch_size={args.batch_size}")
     print(f"[eval] seed={args.seed}")
+    print(f"[eval] cuda_seeds={cuda_seeds}")
     print(f"[eval] label_source={args.label_source}")
     print(f"[eval] metrics_batch_size={args.metrics_batch_size}")
     print(f"[eval] fid_ref_npz={fid_ref_npz}")
@@ -789,7 +802,10 @@ def main() -> None:
     generator = _maybe_dataparallel(generator)
     if bool(cfg.get("use_latent", True)):
         decoder_kind = "sd_vae"
-        decoder_module: nn.Module = VaeDecodeModule(device)
+        decoder_module: nn.Module = VaeDecodeModule(
+            device, model_path=cfg.get("latent_decoder_path"),
+            scaling_factor=float(cfg.get("latent_scaling_factor", 0.18215)),
+        )
     else:
         decoder_kind = "direct_pixel"
         decoder_module = PixelDecodeModule()
@@ -847,6 +863,14 @@ def main() -> None:
         "step": step_loaded,
         "cfg_scale": float(args.cfg_scale),
         "n_samples": int(args.n_samples),
+        "seed": int(args.seed),
+        "cuda_seeds": cuda_seeds,
+        "batch_size": int(args.batch_size),
+        "metrics_batch_size": int(args.metrics_batch_size),
+        "pr_nhood": int(args.pr_nhood),
+        "inception_backend": "torch-fidelity/inception-v3-compat",
+        "latent_decoder_path": cfg.get("latent_decoder_path") if decoder_kind == "sd_vae" else None,
+        "latent_scaling_factor": float(cfg.get("latent_scaling_factor", 0.18215)) if decoder_kind == "sd_vae" else None,
         "sample_npz": str(sample_npz_path),
         "label_source": args.label_source,
         "fid_ref_npz": fid_ref_npz,
