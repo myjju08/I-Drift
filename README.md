@@ -101,6 +101,7 @@ serialized state match upstream. The current S4 comparison uses **frozen** and
 | --- | --- | --- |
 | Reverse / forward / dual drift and historical replay | Frozen encoder drift, optional detached historical repulsion | `train_imagenet_gen.py` and `scripts/` |
 | Double Drift with replay | Two detached feature-field evaluations with fixed real/history references | `configs/corrective_field/`, `drifting_core/double_drift.py` |
+| DINO Double Drift | Frozen DINO reverse drift with upstream feature-space or sample-space correction | [Three matched configs and guide](experiments/dino/DOUBLE_DRIFT.md) |
 | DINO raw conditional GAN | Frozen DINO drift + non-saturating logistic GAN loss | `experiments.dino.train` |
 | DINO adversarial feature drift | Frozen DINO drift + drift in learned discriminator coordinates | `experiments.dino.train` |
 | DINO mixed objective | Frozen DINO drift + GAN loss + learned-feature drift | `experiments.dino.train --config ...` |

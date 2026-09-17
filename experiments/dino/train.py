@@ -1,4 +1,4 @@
-"""Run or CPU-check the portable DINO adversarial experiment snapshots.
+"""Run or CPU-check DINO drift, Double Drift and adversarial experiments.
 
 Without --train this checks configuration and lossless I/O on CPU. Full runs
 require torchrun with two workers, a fresh workdir and the calibrated assets.
@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -18,6 +19,41 @@ PRESETS = ('dino_only_replay_feature', 'replay_feature_hardcopy',
            'replay_raw_gan_d32', 'replay_raw_gan_d128')
 PATH_FIELDS = {'imagenet_path': 'env', 'feature_checkpoint': 'feature',
                'temperature_calibration_artifact': 'train', 'cache_path': 'env'}
+
+
+def validate_double_drift_config(cfg):
+    """Check the upstream Double Drift contract before loading assets or CUDA.
+
+    The generic trainer already implements both methods. This launcher keeps
+    the same coefficients and sample-space probe units, and makes incompatible
+    objectives fail during CPU preflight rather than after allocating DINO.
+    """
+    from drifting_core.double_drift import validate_double_drift_coefficients
+    from train_imagenet_gen import resolve_feature_extractor_name
+
+    mode = str(cfg.get('double_drift_mode', 'off'))
+    if mode not in ('off', 'feature', 'sample'):
+        raise ValueError('double_drift_mode must be off, feature, or sample')
+    if mode == 'off':
+        return {'mode': 'off'}
+    c0, c1 = validate_double_drift_coefficients(
+        cfg.get('double_drift_c0', .75), cfg.get('double_drift_c1', .25))
+    if str(cfg.get('drift_matching', 'rev-drift')).lower().strip() != 'rev-drift':
+        raise ValueError('DINO Double Drift requires drift_matching: rev-drift')
+    if resolve_feature_extractor_name(cfg) != 'dino_resnet50':
+        raise ValueError('The DINO Double Drift launcher requires feature_extractor: dino_resnet50')
+    if (cfg.get('feature_adapter', False) or cfg.get('feature_gan', False)
+            or str(cfg.get('adversarial_mode', 'none')).strip().lower() not in ('', 'none', 'off')):
+        raise ValueError('Double Drift with feature adapters/GAN is not supported')
+    result = {'mode': mode, 'c0': c0, 'c1': c1,
+              'generated_field_evaluations': 1 if c1 == 0 else 2}
+    if mode == 'sample':
+        step_rms = float(cfg.get('double_drift_sample_step_rms', .1))
+        if not math.isfinite(step_rms) or step_rms <= 0:
+            raise ValueError('double_drift_sample_step_rms must be finite and positive')
+        result['sample_step_rms'] = step_rms
+        result['sample_coordinates'] = 'latent' if cfg.get('use_latent', True) else 'rgb'
+    return result
 
 
 def atomic_json(path, value):
@@ -49,6 +85,7 @@ def load_config(preset='dino_only_replay_feature', config=None, **overrides):
             value = str((REPO / candidate if not candidate.is_absolute() else candidate).resolve())
             cfg[field] = value
             cfg['_raw'].setdefault(section, {})[field] = value
+    validate_double_drift_config(cfg)
     return cfg
 
 
@@ -58,6 +95,7 @@ def describe(cfg, preset=None):
         'generator_seed_per_rank': [int(cfg.get('seed', 43)), int(cfg.get('seed', 43)) + 1],
         'generated_per_step': 2 * int(cfg['batch_size']) * int(cfg['gen_per_label']),
         'feature_extractor': cfg.get('feature_extractor'),
+        'double_drift': validate_double_drift_config(cfg),
         'adversarial': {k: v for k, v in cfg.items() if k.startswith('adversarial_')},
         'replay': {k: v for k, v in cfg.items() if k.startswith('historical_gen_')},
         'samples_per_rank': {k: cfg[k] for k in ('batch_size', 'gen_per_label', 'pos_per_sample', 'neg_per_sample')},
@@ -138,6 +176,7 @@ def train(cfg, workdir, *, preset=None, io_backend='packed', decode_backend='nat
     import train_imagenet_gen as trainer
     from models.dino_rf_tuning import module_fingerprint
     from . import runtime
+    validate_double_drift_config(cfg)
     if int(os.environ.get('WORLD_SIZE', '1')) != 2:
         raise RuntimeError('Use torchrun --nproc_per_node=2 for the matched DINO experiments')
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))

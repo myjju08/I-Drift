@@ -5,6 +5,11 @@ I/O used by the September 9–10, 2026 runs. All training imports resolve inside
 this checkout. The ImageNet dataset and pretrained DINO checkpoint remain
 external assets; they are not copied into Git.
 
+For frozen-DINO reverse drift with the upstream two-step Double Drift
+method, see [DINO Double Drift](experiments/dino/DOUBLE_DRIFT.md). That guide
+provides matched baseline, feature-space, and sample-space configurations
+with replay and GAN disabled, plus the exact equations and launch commands.
+
 ## Reproduced presets
 
 | `--preset` | Generator objective in addition to DINO drift | CNN history | Width | Default I/O | Source status on September 10 |
